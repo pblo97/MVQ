@@ -144,51 +144,72 @@ def build_vfq_scores(df_universe: pd.DataFrame,
       QualityScore = mean(rank(gross_profitability, roic, roa, netMargin))
       VFQ = mean(ValueScore, QualityScore)
       VFQ_pct_sector = percentil intra-sector
+    Robusto a columnas faltantes.
     """
     dfu = df_universe.copy()
     dff = df_fund.copy()
     df = dfu.merge(dff, on="symbol", how="left")
 
+    # Unificar sector / market cap
     df = coalesce_first(df, ["sector","sector_x","sector_y"], "sector_unified", to_numeric=False)
+    df["sector_unified"] = df["sector_unified"].fillna("Unknown").astype(str)
+
     df = coalesce_first(df, ["marketCap","marketCap_x","marketCap_y","marketCap_profile"], "marketCap_unified", to_numeric=True)
 
+    # Buckets de tamaño
     r = df["marketCap_unified"].rank(method="first", na_option="keep")
     try:
         df["size_bucket"] = pd.qcut(r, size_buckets, labels=False, duplicates="drop")
     except Exception:
         df["size_bucket"] = 1
 
-    for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"]:
+    # Lista de métricas esperadas
+    val_candidates = ["fcf_yield", "inv_ev_ebitda"]
+    qlt_candidates  = ["gross_profitability", "roic", "roa", "netMargin"]
+    all_fields = val_candidates + qlt_candidates
+
+    # Winsor solo sobre columnas existentes
+    for c in all_fields:
         if c in df.columns:
             df[c] = winsorize(pd.to_numeric(df[c], errors="coerce"), 0.01)
 
+    # Grupo: sector × tamaño
     grp = df["sector_unified"].astype(str) + "|" + df["size_bucket"].astype(str)
-    def _rank(s: pd.Series, asc=False) -> pd.Series:
-        return s.groupby(grp).rank(method="average", ascending=asc, na_option="bottom")
 
-    v_parts = []
-    if "fcf_yield" in df.columns:     v_parts.append(_rank(df["fcf_yield"], asc=False))
-    if "inv_ev_ebitda" in df.columns: v_parts.append(_rank(df["inv_ev_ebitda"], asc=False))
-    df["ValueScore"] = pd.concat(v_parts, axis=1).mean(axis=1) if v_parts else np.nan
+    def _rank_if_exists(cols: list[str]) -> pd.Series:
+        present = [c for c in cols if c in df.columns]
+        if not present:
+            return pd.Series(np.nan, index=df.index, dtype="float64")
+        mat = pd.concat([df[c] for c in present], axis=1)
+        # rank por columna y luego promedio de ranks
+        ranks = pd.concat([mat[c].groupby(grp).rank(method="average", ascending=False, na_option="bottom")
+                           for c in present], axis=1)
+        return ranks.mean(axis=1)
 
-    q_parts = []
-    for c in ["gross_profitability","roic","roa","netMargin"]:
-        if c in df.columns:
-            q_parts.append(_rank(df[c], asc=False))
-    df["QualityScore"] = pd.concat(q_parts, axis=1).mean(axis=1) if q_parts else np.nan
-
+    # Scores
+    df["ValueScore"]   = _rank_if_exists(val_candidates)
+    df["QualityScore"] = _rank_if_exists(qlt_candidates)
     df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1)
-    df["VFQ_pct_sector"] = df.groupby("sector_unified")["VFQ"].rank(pct=True)
 
-    if "coverage_count" not in df.columns:
-        fields = ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"]
-        df["coverage_count"] = df[fields].notna().sum(axis=1)
+    # Percentil intra-sector
+    try:
+        df["VFQ_pct_sector"] = df.groupby("sector_unified")["VFQ"].rank(pct=True)
+    except Exception:
+        df["VFQ_pct_sector"] = np.nan
+
+    # Cobertura: cuenta cuántas métricas existen y no son NaN
+    existing = [f for f in all_fields if f in df.columns]
+    if existing:
+        df["coverage_count"] = df[existing].notna().sum(axis=1)
+    else:
+        df["coverage_count"] = 0
 
     keep = ["symbol","sector_unified","marketCap_unified","coverage_count",
             "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin",
             "ValueScore","QualityScore","VFQ","VFQ_pct_sector"]
     keep = [c for c in keep if c in df.columns]
     return df[keep].copy()
+
 
 # =========================== GUARDRAILS (CALIDAD) ===========================
 
