@@ -1,11 +1,19 @@
 # app_streamlit.py
+import sys, pathlib
+ROOT = pathlib.Path(__file__).resolve().parents[1]   # /mount/src
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 import os, streamlit as st, pandas as pd
 from datetime import date
+# --- IMPORTS ROBUSTOS (funcionan app en raíz o dentro de mvq) ---
+
+    # Caso 1: app en la raíz del proyecto (streamlit run app_streamlit.py)
 from qvm_trend.data_io import run_fmp_screener, filter_universe, load_prices_panel, load_benchmark, get_prices_fmp
-from qvm_trend.fundamentals import download_fundamentals, build_vfq_scores
+from qvm_trend.fundamentals import download_fundamentals, build_vfq_scores, download_guardrails_batch, apply_quality_guardrails
 from qvm_trend.pipeline import apply_trend_filter, enrich_with_breakout
 from qvm_trend.scoring import DEFAULT_TH
 from qvm_trend.cache_io import save_df, load_df, save_panel, load_panel
+
 
 st.set_page_config(page_title="QVM — Screener → Fundamentals → Trend → Breakout", layout="wide")
 
