@@ -1,183 +1,195 @@
-# app_streamlit.py
-import sys, pathlib
-ROOT = pathlib.Path(__file__).resolve().parents[1]   # /mount/src
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-import os, streamlit as st, pandas as pd
+# /mount/src/mvq/app_streamlit.py
+from __future__ import annotations
+import os
 from datetime import date
-# --- IMPORTS ROBUSTOS (funcionan app en raíz o dentro de mvq) ---
+import pandas as pd
+import numpy as np
+import streamlit as st
 
-    # Caso 1: app en la raíz del proyecto (streamlit run app_streamlit.py)
-from qvm_trend.data_io import run_fmp_screener, filter_universe, load_prices_panel, load_benchmark, get_prices_fmp
-from qvm_trend.fundamentals import download_fundamentals, build_vfq_scores, download_guardrails_batch, apply_quality_guardrails
-from qvm_trend.pipeline import apply_trend_filter, enrich_with_breakout
-from qvm_trend.scoring import DEFAULT_TH
-from qvm_trend.cache_io import save_df, load_df, save_panel, load_panel
+# --- Imports del proyecto (dos rutas posibles) ---
+try:
+    from qvm_trend.data_io import (
+        run_fmp_screener, filter_universe, load_prices_panel,
+        load_benchmark, get_prices_fmp, DEFAULT_START, DEFAULT_END
+    )
+    from qvm_trend.fundamentals import (
+        download_fundamentals, build_vfq_scores,
+        download_guardrails_batch, apply_quality_guardrails
+    )
+    from qvm_trend.pipeline import apply_trend_filter, enrich_with_breakout
+    from qvm_trend.scoring import DEFAULT_TH
+    from qvm_trend.cache_io import save_df, load_df, save_panel, load_panel
+except Exception:
+    # Alternativa si tu paquete se llama distinto
+    from data_io import (
+        run_fmp_screener, filter_universe, load_prices_panel,
+        load_benchmark, get_prices_fmp, DEFAULT_START, DEFAULT_END
+    )
+    from fundamentals import (
+        download_fundamentals, build_vfq_scores,
+        download_guardrails_batch, apply_quality_guardrails
+    )
+    from pipeline import apply_trend_filter, enrich_with_breakout
+    from scoring import DEFAULT_TH
+    from cache_io import save_df, load_df, save_panel, load_panel
 
+st.set_page_config(page_title="VFQ + Tendencia + Breakouts", layout="wide")
 
-st.set_page_config(page_title="QVM — Screener → Fundamentals → Trend → Breakout", layout="wide")
+# ======================== Sidebar (controles) ========================
+st.sidebar.header("Parámetros")
 
-# --- API key check ---
-fmp_key = st.secrets.get("FMP_API_KEY", os.getenv("FMP_API_KEY", ""))
-if not fmp_key:
-    st.error("Configura FMP_API_KEY en .streamlit/secrets.toml o variable de entorno.")
-    st.stop()
-os.environ["FMP_API_KEY"] = fmp_key
+# Universo (Screener)
+limit = st.sidebar.slider("Límite screener (símbolos)", 50, 500, 300, step=50)
+min_mcap = float(st.sidebar.number_input("Market Cap mínimo (USD)", 1e7, 1e12, value=5e8, step=1e8, format="%.0f"))
+ipo_days = st.sidebar.slider("Antigüedad IPO mínima (días)", 0, 2000, 365, step=30)
 
-# --- Sidebar: Universo base ---
-st.sidebar.header("Universo (Screener)")
-limit = st.sidebar.number_input("Tamaño screener", 50, 1000, 300, step=50)
-min_mcap = st.sidebar.number_input("Min MarketCap", 1e7, 1e12, 5e8, step=1e8, format="%.0f")
-ipo_days = st.sidebar.number_input("IPO ≥ días", 0, 2000, 365, step=30)
-start = st.sidebar.date_input("Start", value=date(2020,1,1))
-end = st.sidebar.date_input("End", value=date.today())
-bench_ticker = st.sidebar.selectbox("Benchmark", ["SPY","QQQ","^IPSA"], index=0)
+# Guardrails
+st.sidebar.subheader("Guardrails (calidad)")
+profit_floor_hits = st.sidebar.slider("Pisos de rentabilidad (hits de {EBIT, CFO, FCF})", 0, 3, 2, step=1)
+max_issuance = st.sidebar.slider("Dilución máx. (Net issuance)", 0.0, 0.20, 0.03, step=0.01)
+max_asset_g = st.sidebar.slider("Asset growth máx. (abs)", 0.0, 1.0, 0.20, step=0.05)
+max_accruals = st.sidebar.slider("Accruals/TA máx. (abs)", 0.0, 0.5, 0.10, step=0.01)
+max_ndeb = st.sidebar.slider("Net Debt / EBITDA máx.", 0.0, 10.0, 3.0, step=0.5)
 
-# botones de refresco
-colb1, colb2, colb3 = st.sidebar.columns(3)
-refresh_scr = colb1.button("Refrescar\nScreener")
-refresh_funda = colb2.button("Refrescar\nFundamentales")
-refresh_px = colb3.button("Refrescar\nPrecios")
+# VFQ (no tienen sliders; se calcula y se usa % intra-sector)
+st.sidebar.subheader("VFQ")
+top_pct = st.sidebar.slider("Top % intra-sector (VFQ)", 0.05, 1.0, 0.35, step=0.05)
 
-cache_tag = f"{start.isoformat()}_{end.isoformat()}_{limit}_{int(min_mcap)}_{ipo_days}"
+# Tendencia + Breakout
+st.sidebar.subheader("Tendencia / Señales")
+start = st.sidebar.date_input("Inicio precios", value=pd.to_datetime(DEFAULT_START).date())
+end = st.sidebar.date_input("Fin precios", value=pd.to_datetime(DEFAULT_END).date())
+use_and = st.sidebar.checkbox("Requerir (MA200 AND Mom 12–1>0)", value=False)
+bench = st.sidebar.text_input("Benchmark RS (SPY/QQQ/IPSA)", value="SPY")
 
-# 1) Screener (descarga y cache)
-st.subheader("1) Screener")
-if refresh_scr:
+# Breakout thresholds (mínimo potente)
+st.sidebar.subheader("Breakout (mínimo potente)")
+rvol_th = st.sidebar.slider("RVOL 20d (umbral)", 1.0, 3.0, 1.5, step=0.1)
+closepos_th = st.sidebar.slider("ClosePos (0–1)", 0.0, 1.0, 0.6, step=0.05)
+p52_th = st.sidebar.slider("P52 (proximidad a 52W high)", 0.80, 1.05, 0.95, step=0.01)
+updown_vol_th = st.sidebar.slider("Up/Down Vol Ratio (20d)", 0.5, 3.0, 1.2, step=0.1)
+
+# Cache / Acciones
+st.sidebar.subheader("Acciones")
+cache_tag = st.sidebar.text_input("Cache key", value="run1")
+force_universe = st.sidebar.checkbox("Refrescar universo", value=False)
+force_guard = st.sidebar.checkbox("Refrescar guardrails", value=False)
+force_fund = st.sidebar.checkbox("Refrescar fundamentals", value=False)
+
+# ======================== App title ========================
+st.title("Screener VFQ + Tendencia + Breakouts")
+
+# ======================== Paso 1: Universo ========================
+st.header("1) Universo (Screener FMP → Limpieza)")
+try:
     uni_raw = run_fmp_screener(limit=limit)
-    save_df(uni_raw, f"uni_raw_{cache_tag}")
-else:
-    uni_raw = load_df(f"uni_raw_{cache_tag}")
-    if uni_raw is None:
-        uni_raw = run_fmp_screener(limit=limit)
-        save_df(uni_raw, f"uni_raw_{cache_tag}")
+    uni = filter_universe(uni_raw, min_mcap=min_mcap, ipo_min_days=ipo_days)
+    st.write(f"Universo limpio: {len(uni)} símbolos")
+    st.dataframe(uni.head(50), width="stretch")
+except Exception as e:
+    st.error(f"Error en screener: {e}")
+    st.stop()
 
-uni = filter_universe(uni_raw, min_mcap=min_mcap, ipo_min_days=ipo_days)
-st.write(f"Universo tras filtros de exchange/mcap/IPO: **{len(uni)}** símbolos")
-st.dataframe(uni[["symbol","sector","marketCap","exchange"]].head(500), use_container_width=True)
+# ======================== Paso 2: Guardrails ========================
+st.header("2) Guardrails (calidad contable / disciplina)")
+try:
+    syms = uni["symbol"].tolist()
+    df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=force_guard)
+    df_merge = uni.merge(df_guard, on="symbol", how="left")
 
-# 2) Fundamentales (set mínimo) + VFQ (cache)
-# 2) Fundamentales (set mínimo) + GUARDRAILS + VFQ (cache)
-st.subheader("2) Fundamentales (set mínimo) → Guardrails → VFQ")
-
-symbols = uni["symbol"].tolist()
-mc_map = {r["symbol"]: float(r["marketCap"]) for _, r in uni[["symbol","marketCap"]].dropna().iterrows()}
-
-# Descarga/carga cache — set mínimo
-if refresh_funda:
-    df_fund = download_fundamentals(symbols, mc_map, cache_key=cache_tag, force=True)
-else:
-    df_fund = download_fundamentals(symbols, mc_map, cache_key=cache_tag, force=False)
-
-# Descarga/carga cache — guardrails (anuales + ttm)
-from qvm_trend.fundamentals import download_guardrails_batch, apply_quality_guardrails
-if refresh_funda:
-    df_guard = download_guardrails_batch(symbols, cache_key=cache_tag, force=True)
-else:
-    df_guard = download_guardrails_batch(symbols, cache_key=cache_tag, force=False)
-
-# Controles de guardrails (UI)
-with st.expander("Opciones de Guardrails (calidad)"):
-    c1, c2, c3 = st.columns(3)
-    use_guard = c1.checkbox("Aplicar guardrails de calidad", True)
-    profit_hits_min = c1.slider("Pisos de rentabilidad (hits de 3)", 0, 3, 2, 1)  # EBIT>0, CFO>0, FCF>0
-    max_issu = c2.slider("Dilución máx. 12–24m (Δshares)", 0.0, 0.20, 0.03, 0.01)
-    max_ag   = c2.slider("Asset growth máx. (y/y)", 0.0, 0.60, 0.20, 0.01)
-    max_acc  = c3.slider("Accruals/TA máx.", 0.0, 0.50, 0.10, 0.01)
-    max_ndeb = c3.slider("NetDebt/EBITDA máx.", 0.0, 6.0, 3.0, 0.5)
-
-# Merge y aplica guardrails
-df_merge = uni[["symbol","sector","marketCap"]].merge(df_fund, on="symbol", how="left").merge(df_guard, on="symbol", how="left")
-
-if use_guard:
     kept, diag = apply_quality_guardrails(
         df_merge,
-        require_profit_floor=True,
-        profit_floor_min_hits=profit_hits_min,
-        max_net_issuance=max_issu,
-        max_asset_growth=max_ag,
-        max_accruals_ta=max_acc,
+        require_profit_floor=(profit_floor_hits > 0),
+        profit_floor_min_hits=profit_floor_hits,
+        max_net_issuance=max_issuance,
+        max_asset_growth=max_asset_g,
+        max_accruals_ta=max_accruals,
         max_netdebt_ebitda=max_ndeb
     )
-    st.write(f"Tras guardrails: **{len(kept)}** / {len(df_merge)}")
-    with st.expander("Diagnóstico guardrails"):
-        st.dataframe(diag[["symbol","profit_hits","guard_profit","net_issuance","guard_issuance",
-                           "asset_growth","guard_assets","accruals_ta","guard_accruals",
-                           "netdebt_ebitda","guard_leverage","guard_all"]].sort_values("guard_all", ascending=True),
-                     use_container_width=True)
-    base_for_vfq = kept
-else:
-    st.info("Guardrails desactivados (se usará todo el universo del screener).")
-    base_for_vfq = df_merge
+    st.write(f"Tras guardrails: {len(kept)} / {len(uni)}")
+    st.dataframe(diag.sort_values("guard_all", ascending=False).head(50), width="stretch")
+except Exception as e:
+    st.error(f"Error en guardrails: {e}")
+    st.stop()
 
-# Ahora calcula VFQ sobre el subset resultante (y cacheado)
-df_vfq = build_vfq_scores(base_for_vfq, base_for_vfq)  # pasa universo+fundas ya fusionado
+# ======================== Paso 3: Fundamentals VFQ ========================
+st.header("3) Fundamentals mínimos (VFQ) + Scores")
+try:
+    kept_syms = kept["symbol"].tolist()
+    mc_map = uni.set_index("symbol")["marketCap"].to_dict() if "marketCap" in uni.columns else {}
+    df_fund = download_fundamentals(kept_syms, market_caps=mc_map, cache_key=cache_tag, force=force_fund)
 
-st.write(f"Con cobertura ≥1 métrica VFQ: **{(df_vfq['ValueScore'].notna()).sum()}**")
-c1, c2 = st.columns(2)
-min_cov = c1.slider("Cobertura fundamentales (≥ métricas)", 1, 6, 2, step=1)
-min_vfq_pct = c2.slider("VFQ pct (intra-sector) mínimo", 0.00, 1.00, 0.65, 0.05)
+    base_for_vfq = uni[uni["symbol"].isin(kept_syms)].copy()
+    df_vfq = build_vfq_scores(base_for_vfq, df_fund)
 
-df_vfq_filt = df_vfq[
-    (df_vfq["coverage_count"] >= min_cov) &
-    (df_vfq["VFQ_pct_sector"] >= min_vfq_pct)
-].copy()
+    # Top % intra-sector
+    cutoff = df_vfq.groupby("sector")["VFQ"].transform(lambda s: s.quantile(1 - top_pct))
+    df_vfq_sel = df_vfq[df_vfq["VFQ"] >= cutoff].copy()
 
-st.write(f"Elegibles por VFQ & cobertura: **{len(df_vfq_filt)}**")
-st.dataframe(
-    df_vfq_filt[["symbol","sector_unified","marketCap_unified","coverage_count",
-                 "ValueScore","QualityScore","VFQ","VFQ_pct_sector"]]
-    .sort_values(["VFQ","coverage_count"], ascending=[False,False]),
-    use_container_width=True
-)
+    st.write(f"Elegibles por VFQ & cobertura: {len(df_vfq_sel)} "
+             f"(Con cobertura ≥1 métrica VFQ: {(df_vfq['coverage_count']>0).sum()})")
+    st.dataframe(df_vfq_sel.sort_values("VFQ", ascending=False).head(100), width="stretch")
+except Exception as e:
+    st.error(f"Error en VFQ: {e}")
+    st.stop()
 
-# 3) Precios + tendencia (cache de panel)
-st.subheader("3) Tendencia (MA200 OR Mom 12–1)")
-syms_vfq = df_vfq_filt["symbol"].tolist()
+# ======================== Paso 4: Tendencia & Breakout ========================
+st.header("4) Tendencia (MA200 / Mom 12–1) + Señal de Breakout")
+try:
+    syms_vfq = df_vfq_sel["symbol"].tolist()
+    if len(syms_vfq) == 0:
+        st.warning("No hay símbolos tras VFQ; relaja guardrails/VFQ o amplía universo.")
+        st.stop()
 
-if refresh_px:
-    panel = load_prices_panel(syms_vfq, start.isoformat(), end.isoformat(), cache_key=cache_tag, force=True)
-else:
+    # Precios panel
     panel = load_prices_panel(syms_vfq, start.isoformat(), end.isoformat(), cache_key=cache_tag, force=False)
+    bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
 
-eligibles = apply_trend_filter(panel, use_and=False)  # OR al inicio
-cartera = pd.DataFrame({"symbol": eligibles})
-st.write(f"Finalistas por tendencia: **{len(cartera)}**")
+    # Señales de tendencia
+    trend = apply_trend_filter(panel, use_and_condition=use_and)  # debe devolver df con flags por símbolo/fecha o al menos flag actual
+    # Breakout enrich (usa tus métricas: RVOL, ClosePos, P52, Up/Down Vol Ratio…)
+    brk = enrich_with_breakout(
+        panel,
+        rvol_lookback=20,
+        rvol_th=rvol_th,
+        closepos_th=closepos_th,
+        p52_th=p52_th,
+        updown_vol_th=updown_vol_th,
+        bench_series=bench_px["close"] if isinstance(bench_px, pd.DataFrame) and "close" in bench_px.columns else None
+    )
 
-# 4) Breakout (RVOL/ClosePos/P52/…)
-st.subheader("4) Breakout — Score y Señal")
-# parámetros de breakout
-colt1, colt2, colt3 = st.columns(3)
-rvol_min = colt1.slider("RVOL mínimo", 1.0, 5.0, DEFAULT_TH["rvol_min"], 0.1)
-closepos_min = colt1.slider("ClosePos mínimo", 0.0, 1.0, DEFAULT_TH["closepos_min"], 0.05)
-p52_min = colt1.slider("P52 mínimo", 0.80, 1.05, 0.95, 0.01)
-ud_min = colt2.slider("Up/Down Vol Ratio 20d", 0.5, 3.0, 1.2, 0.05)
-atr_pct_min = colt2.slider("ATR pct rank (12m)", 0.0, 1.0, 0.6, 0.05)
-rs_slope_min = colt2.slider("Pendiente RS(MA20)", -1.0, 1.0, 0.0, 0.05)
-float_vel_min = colt3.slider("FloatVelocity (%/día)", 0.0, 0.05, 0.01, 0.001)
-min_score = colt3.slider("Score de entrada mínimo", 0.0, 1.0, 0.6, 0.05)
+    # Join señales a los scores
+    df_sig = df_vfq_sel.merge(trend, on="symbol", how="left").merge(brk, on="symbol", how="left")
 
-TH = dict(DEFAULT_TH)
-TH.update(dict(rvol_min=rvol_min, closepos_min=closepos_min, p52_min=p52_min,
-               ud_vol_min=ud_min, atr_pct_min=atr_pct_min, rs_slope_min=rs_slope_min,
-               float_vel_min=float_vel_min))
+    # Señales de entrada (ejemplo: todas deben ser True)
+    # Ajusta con tus nombres de columnas devueltos en apply_trend_filter / enrich_with_breakout
+    trend_col = "signal_trend"          # <- asegúrate que pipeline.py exporta esta col
+    breakout_col = "signal_breakout"    # <- idem
+    if trend_col not in df_sig.columns:
+        df_sig[trend_col] = False
+    if breakout_col not in df_sig.columns:
+        df_sig[breakout_col] = False
 
-# benchmark y enriquecimiento
-bench = load_benchmark(bench_ticker, start.isoformat(), end.isoformat(), cache_key=cache_tag, force=False)
-float_map = {}  # puedes agregar shares_float si lo deseas
-enriched = enrich_with_breakout(cartera, panel, benchmark_series=bench, float_map=float_map, th=TH, min_score=min_score)
+    df_sig["ENTRY"] = df_sig[trend_col].fillna(False) & df_sig[breakout_col].fillna(False)
 
-if enriched is None or enriched.empty:
-    st.info("No hay señales con los umbrales actuales.")
-else:
-    merged = df_vfq[["symbol","ValueScore","QualityScore","VFQ","VFQ_pct_sector"]].merge(enriched, on="symbol", how="right")
+    st.subheader("Candidatas (ENTRY = True)")
+    st.dataframe(df_sig[df_sig["ENTRY"]].sort_values("VFQ", ascending=False), width="stretch")
 
-    st.dataframe(merged.sort_values(["EntrySignal","BreakoutScore","VFQ"], ascending=[False,False,False]),
-                 use_container_width=True)
+    st.subheader("Diagnóstico de señales (top 100)")
+    st.dataframe(df_sig.sort_values(["ENTRY", "VFQ"], ascending=[False, False]).head(100), width="stretch")
 
-    # gráfico rápido
-    sym = st.selectbox("Ver símbolo", merged["symbol"].tolist())
-    if sym:
-        dfp = panel.get(sym)
-        if dfp is not None and not dfp.empty:
-            st.line_chart(dfp[["close"]])
+except Exception as e:
+    st.error(f"Error en señales: {e}")
+    st.stop()
+
+# ======================== Paso 5 (opcional): Export ========================
+st.header("5) Export / Guardar corrida")
+if st.button("Guardar tablas (cache_io)"):
+    try:
+        save_df(uni, f"uni_{cache_tag}")
+        save_df(diag, f"guard_diag_{cache_tag}")
+        save_df(df_vfq, f"vfq_{cache_tag}")
+        save_df(df_sig, f"signals_{cache_tag}")
+        st.success("Tablas guardadas en cache_io.")
+    except Exception as e:
+        st.error(f"No se pudo guardar: {e}")
