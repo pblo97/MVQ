@@ -314,26 +314,50 @@ def download_guardrails_batch(symbols: list[str], cache_key: str | None = None, 
 
 def apply_quality_guardrails(df: pd.DataFrame,
                              require_profit_floor: bool = True,
-                             profit_floor_min_hits: int = 2,
+                             profit_floor_min_hits: int = 2,  # de {EBIT>0, CFO>0, FCF>0}
                              max_net_issuance: float = 0.03,
                              max_asset_growth: float = 0.20,
                              max_accruals_ta: float = 0.10,
-                             max_netdebt_ebitda: float = 3.0) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                             max_netdebt_ebitda: float = 3.0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Devuelve (subset_que_pasa, diagnóstico_completo_con_flags).
+    Robustez:
+      - Si falta alguna columna esperada, crea una Serie NaN alineada.
+      - Convierte a numérico antes de comparar.
+    Devuelve (subset_que_pasa, diagnóstico_con_flags).
     """
     d = df.copy()
 
-    ebit_ok = (d.get("ebit_ttm") > 0)
-    cfo_ok  = (d.get("cfo_ttm")  > 0)
-    fcf_ok  = (d.get("fcf_ttm")  > 0)
-    d["profit_hits"] = ebit_ok.astype(int) + cfo_ok.astype(int) + fcf_ok.astype(int)
-    profit_pass = (d["profit_hits"] >= int(profit_floor_min_hits)) if require_profit_floor else True
+    def col(name: str) -> pd.Series:
+        if name in d.columns:
+            return pd.to_numeric(d[name], errors="coerce")
+        # columna faltante → Serie NaN alineada
+        return pd.Series(np.nan, index=d.index, dtype="float64")
 
-    issuance_pass = (d.get("net_issuance").fillna(0) <= float(max_net_issuance))
-    asset_pass    = (d.get("asset_growth").abs() <= float(max_asset_growth))
-    accruals_pass = (d.get("accruals_ta").abs() <= float(max_accruals_ta))
-    lev_pass      = (d.get("netdebt_ebitda").fillna(0) <= float(max_netdebt_ebitda)) | d.get("netdebt_ebitda").isna()
+    # Pisos de rentabilidad (TTM)
+    ebit = col("ebit_ttm")
+    cfo  = col("cfo_ttm")
+    fcf  = col("fcf_ttm")
+
+    ebit_ok = (ebit > 0)
+    cfo_ok  = (cfo  > 0)
+    fcf_ok  = (fcf  > 0)
+
+    d["profit_hits"] = ebit_ok.fillna(False).astype(int) + \
+                       cfo_ok.fillna(False).astype(int) + \
+                       fcf_ok.fillna(False).astype(int)
+    profit_pass = (d["profit_hits"] >= int(profit_floor_min_hits)) if require_profit_floor else pd.Series(True, index=d.index)
+
+    # Otros guardrails
+    net_issuance   = col("net_issuance")
+    asset_growth   = col("asset_growth")
+    accruals_ta    = col("accruals_ta")
+    netdebt_ebitda = col("netdebt_ebitda")
+
+    issuance_pass = (net_issuance.fillna(0) <= float(max_net_issuance))
+    asset_pass    = (asset_growth.abs() <= float(max_asset_growth))
+    accruals_pass = (accruals_ta.abs() <= float(max_accruals_ta))
+    # Si no hay dato de deuda, no penalizamos (pasa)
+    lev_pass      = (netdebt_ebitda.fillna(0) <= float(max_netdebt_ebitda)) | netdebt_ebitda.isna()
 
     mask = profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
 
