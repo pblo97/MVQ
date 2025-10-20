@@ -5,6 +5,7 @@ import os
 import time
 import math
 import json
+from datetime import datetime
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -15,6 +16,8 @@ from urllib3.util.retry import Retry
 
 __all__ = [
     "_http_get",
+    "DEFAULT_START",
+    "DEFAULT_END",
     "run_fmp_screener",
     "filter_universe",
     "get_prices_fmp",
@@ -22,9 +25,14 @@ __all__ = [
     "load_benchmark",
 ]
 
+# ===================== FECHAS POR DEFECTO (usadas por pipeline) =====================
+
+DEFAULT_START: str = os.environ.get("DEFAULT_START", "2020-01-01")
+DEFAULT_END: str = os.environ.get("DEFAULT_END", datetime.today().date().isoformat())
+
 # =========================== CONFIGURACIÓN FMP ============================
 
-# API key desde entorno; si usas .streamlit/secrets.toml o dotenv, asegúrate de exportarla
+# API key desde entorno
 FMP_API_KEY = os.environ.get("FMP_API_KEY") or os.environ.get("FMP_APIKEY") or ""
 
 # Objetivo de llamadas: 4 req/s ≈ 240/min (por debajo del límite de 300/min)
@@ -79,7 +87,6 @@ def _http_get(url: str, params: dict | None = None, *, timeout: int = TIMEOUT_SE
             r = _session.get(url, params=params, timeout=timeout)
         except Exception as e:
             last_exc = e
-            # pequeño backoff y reintento
             time.sleep(0.25 * attempt)
             continue
 
@@ -92,9 +99,7 @@ def _http_get(url: str, params: dict | None = None, *, timeout: int = TIMEOUT_SE
                 raise RuntimeError(f"FMP JSON decode error: {url} | {snippet}")
 
         if code in (429, 500, 502, 503, 504):
-            # backoff exponencial con jitter
             base = 0.75 * (2 ** (attempt - 1))
-            # jitter ∈ [-0.25, 0.25] * 2^(attempt-1)
             jitter = 0.25 * (2 ** (attempt - 1)) * ((int.from_bytes(os.urandom(1), "big") / 255.0) - 0.5) * 2
             time.sleep(max(0.5, base + jitter))
             continue
@@ -102,7 +107,6 @@ def _http_get(url: str, params: dict | None = None, *, timeout: int = TIMEOUT_SE
         snippet = r.text[:200].replace("\n", " ")
         raise RuntimeError(f"FMP HTTP {code} {r.reason}: {url} | {snippet}")
 
-    # se agotaron reintentos
     if last_exc:
         raise RuntimeError(f"FMP: sin respuesta estable tras {MAX_RETRIES} intentos: {url}") from last_exc
     raise RuntimeError(f"FMP: agotados retries: {url}")
@@ -132,10 +136,12 @@ def run_fmp_screener(limit: int = 300,
                      volume_min: int = 500_000,
                      mcap_min: float = 1e7,
                      *,
-                     fetch_profiles: bool = True) -> pd.DataFrame:
+                     fetch_profiles: bool = True,
+                     cache_key: str | None = None,
+                     force: bool = False) -> pd.DataFrame:
     """
     Descarga universo base desde /stock-screener de FMP y (opcionalmente) enriquece con /profile/{sym}.
-    Devuelve DataFrame con columnas estandarizadas.
+    Los kwargs cache_key/force están por compatibilidad con la app (no se usan aquí).
     """
     url = "https://financialmodelingprep.com/api/v3/stock-screener"
     params = {
@@ -153,11 +159,8 @@ def run_fmp_screener(limit: int = 300,
     df["symbol"] = df["symbol"].astype(str).apply(_clean_symbol)
 
     if fetch_profiles:
-        # Enriquecer con perfil para sector/industry/mktcap/ipoDate/exchange/flags
         symbols = df["symbol"].dropna().unique().tolist()
-
         profiles = []
-        # procesar en lotes para respetar cuota
         batch = 40
         pause = 1.0
         for i in range(0, len(symbols), batch):
@@ -191,7 +194,6 @@ def run_fmp_screener(limit: int = 300,
         if not dfp.empty:
             df = df.merge(dfp, on="symbol", how="left")
 
-    # Normalizaciones básicas
     for col in ["marketCap", "marketCap_profile", "price", "price_profile", "beta", "beta_profile"]:
         if col not in df.columns:
             df[col] = np.nan
@@ -201,7 +203,6 @@ def run_fmp_screener(limit: int = 300,
     df["price"]     = df["price"].fillna(df.get("price_profile"))
     df["beta"]      = df["beta"].fillna(df.get("beta_profile"))
 
-    # Campos categóricos
     for c in ["sector", "industry", "exchange", "type", "country"]:
         if c not in df.columns:
             df[c] = ""
@@ -212,16 +213,13 @@ def run_fmp_screener(limit: int = 300,
             df[c] = False
         df[c] = df[c].fillna(False).astype(bool)
 
-    # IPO date
     if "ipoDate" not in df.columns:
         df["ipoDate"] = pd.NaT
     else:
         df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce")
 
-    # Quitar duplicados por símbolo, favorecer mayor mcap
     df = df.sort_values("marketCap", ascending=False).drop_duplicates(subset=["symbol"], keep="first")
 
-    # Columnas útiles que esperamos más adelante
     keep = [
         "symbol", "sector", "industry", "exchange", "type", "country",
         "marketCap", "price", "beta", "isEtf", "isFund", "isAdr", "ipoDate", "volume"
@@ -242,37 +240,30 @@ def filter_universe(df: pd.DataFrame,
       - tipo stock/equity (si existe)
     """
     d = df.copy()
-    # excluir vehículos no equity “común”
     for c in ["isEtf", "isFund", "isAdr"]:
         if c not in d.columns:
             d[c] = False
     d = d[(~d["isEtf"]) & (~d["isFund"]) & (~d["isAdr"])]
 
-    # tipo
     if "type" in d.columns:
         typ = d["type"].fillna("").str.lower()
         ok_type = typ.str.contains("stock") | typ.str.contains("equity") | (typ == "")
         d = d[ok_type]
 
-    # exchange
     if "exchange" in d.columns:
         exch = d["exchange"].fillna("")
         d = d[(exch.isin(exchanges_ok)) | (exch == "")]
 
-    # IPO
     if "ipoDate" in d.columns:
         today = pd.Timestamp.today().normalize()
         d = d[(d["ipoDate"].isna()) | (d["ipoDate"] <= today - pd.Timedelta(days=int(ipo_min_days)))]
 
-    # mcap mínimo
     if "marketCap" in d.columns:
         d = d[pd.to_numeric(d["marketCap"], errors="coerce") >= float(min_mcap)]
 
-    # orden por tamaño
     if "marketCap" in d.columns:
         d = d.sort_values("marketCap", ascending=False)
 
-    # normaliza símbolos y dedup
     d["symbol"] = d["symbol"].astype(str).apply(_clean_symbol)
     d = d.dropna(subset=["symbol"]).drop_duplicates(subset=["symbol"], keep="first")
 
@@ -298,7 +289,6 @@ def get_prices_fmp(symbol: str,
                    end: str | None = None) -> pd.DataFrame | None:
     """
     Devuelve DataFrame con columnas: ['open','high','low','close','volume'] indexado por fecha.
-    Mapea adjClose/adj_* si es necesario. Orden ascendente por fecha.
     """
     sym = _clean_symbol(symbol)
     try:
@@ -311,7 +301,6 @@ def get_prices_fmp(symbol: str,
             return None
 
         dfp = pd.DataFrame(hist)
-        # Mapear columnas alternativas
         mapping = {
             "adjClose": "close",
             "adj_open": "open",
@@ -323,10 +312,8 @@ def get_prices_fmp(symbol: str,
                 dfp[v] = dfp[k]
 
         need = ["date", "open", "high", "low", "close", "volume"]
-        # algunos endpoints traen 'volumefrom/volumeto' (crypto) — ignoramos para equities
         missing = [c for c in need if c not in dfp.columns]
         if missing:
-            # si falta 'open/high/low' pero hay 'close' y 'volume', intentamos reconstruir OHLC=close
             base_ok = all(c in dfp.columns for c in ["date", "close", "volume"])
             if base_ok:
                 for c in ["open", "high", "low"]:
@@ -339,11 +326,9 @@ def get_prices_fmp(symbol: str,
         dfp["date"] = pd.to_datetime(dfp["date"], errors="coerce")
         dfp = dfp.dropna(subset=["date"]).sort_values("date").set_index("date")
 
-        # Tipos numéricos
         for c in ["open", "high", "low", "close", "volume"]:
             dfp[c] = pd.to_numeric(dfp[c], errors="coerce")
 
-        # Filtra NaN extremos
         dfp = dfp[["open", "high", "low", "close", "volume"]].dropna(how="all")
         if dfp.empty:
             return None
@@ -368,7 +353,6 @@ def _process_symbols(symbols: List[str], fn_fetch, batch: int = 40, pause: float
                 if dfp is not None and not dfp.empty:
                     out[sym] = dfp
             except Exception:
-                # ignora símbolo que falla
                 continue
         time.sleep(pause)
     return out
@@ -383,9 +367,8 @@ def load_prices_panel(symbols: List[str],
                       pause: float = 1.0) -> Dict[str, pd.DataFrame]:
     """
     Descarga precios para lista de símbolos en un dict {symbol: DataFrame}.
-    Parám. cache_key/force están para compatibilidad con tu app; el cache real lo maneja cache_io o Streamlit.
+    Parám. cache_key/force están para compatibilidad con tu app (cache externo).
     """
-    # Si manejas cache externo, úsalo allí; aquí solo descargamos
     fetch = lambda s: get_prices_fmp(s, start, end)
     panel = _process_symbols(symbols, fetch, batch=batch, pause=pause)
     return panel
