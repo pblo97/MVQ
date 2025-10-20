@@ -95,19 +95,98 @@ def filter_universe(df: pd.DataFrame, min_mcap=5e8, ipo_min_days=IPO_MIN_DAYS_DE
 def get_prices_fmp(symbol: str, start: str = DEFAULT_START, end: str = DEFAULT_END) -> pd.DataFrame | None:
     sym = clean_symbol(symbol)
     base = f"https://financialmodelingprep.com/api/v3/historical-price-full/{sym}"
-    j = _http_get(base, params={"from": start, "to": end})
-    hist = j.get("historical", [])
-    if not isinstance(hist, list) or len(hist)==0:
-        j2 = _http_get(base)
-        hist = j2.get("historical", [])
-    if not hist: return None
+
+    # 1) intento con rango
+    try:
+        j = _http_get(base, params={"from": start, "to": end})
+        hist = j.get("historical", [])
+    except Exception:
+        hist = []
+
+    # 2) fallback sin rango
+    if not isinstance(hist, list) or len(hist) == 0:
+        try:
+            j2 = _http_get(base)
+            hist = j2.get("historical", [])
+        except Exception:
+            hist = []
+
+    if not isinstance(hist, list) or len(hist) == 0:
+        return None
+
     dfp = pd.DataFrame(hist)
-    need = ["date","open","high","low","close","volume"]
-    for c in need:
-        if c not in dfp.columns: return None
-    dfp["date"] = pd.to_datetime(dfp["date"])
-    dfp = dfp.sort_values("date").set_index("date")
-    return dfp[need]
+    if dfp.empty:
+        return None
+
+    # Normaliza nombres (lower / sin guiones) y mapea sinónimos
+    rename_map = {c: c.lower().replace("-", "_") for c in dfp.columns}
+    dfp = dfp.rename(columns=rename_map)
+
+    # sinónimos → estándar
+    synonyms = {
+        "close": ["close", "adjclose", "adj_close", "adjusted_close", "price"],
+        "open":  ["open", "adjopen", "adj_open", "adjusted_open"],
+        "high":  ["high", "adjhigh", "adj_high", "adjusted_high"],
+        "low":   ["low", "adjlow", "adj_low", "adjusted_low"],
+        "volume":["volume", "volumeto", "volumes", "qty"]
+    }
+
+    def first_present(cols: list[str]) -> str | None:
+        for c in cols:
+            if c in dfp.columns:
+                return c
+        return None
+
+    cols = {}
+    for std, cands in synonyms.items():
+        src = first_present(cands)
+        if src is not None:
+            cols[std] = src
+
+    # Debe existir al menos 'close'
+    if "close" not in cols:
+        return None
+
+    # Crea DataFrame base con 'close'
+    out = pd.DataFrame()
+    out["close"] = pd.to_numeric(dfp[cols["close"]], errors="coerce")
+
+    # Reconstruye O/H/L si faltan usando 'close' (fallback tolerante)
+    for k in ["open", "high", "low"]:
+        if k in cols:
+            out[k] = pd.to_numeric(dfp[cols[k]], errors="coerce")
+        else:
+            out[k] = out["close"]  # fallback: igual a close
+
+    # Volume: si no hay, crea 0
+    if "volume" in cols:
+        out["volume"] = pd.to_numeric(dfp[cols["volume"]], errors="coerce").fillna(0)
+    else:
+        out["volume"] = 0.0
+
+    # Fecha
+    date_col = "date" if "date" in dfp.columns else None
+    if date_col is None:
+        # algunos endpoints traen 'label'
+        if "label" in dfp.columns:
+            dfp["date"] = pd.to_datetime(dfp["label"], errors="coerce")
+        else:
+            return None
+    else:
+        dfp["date"] = pd.to_datetime(dfp["date"], errors="coerce")
+
+    out["date"] = dfp["date"]
+    out = out.dropna(subset=["date", "close"])
+    if out.empty:
+        return None
+
+    out = out.sort_values("date").set_index("date")
+
+    # Orden y tipos finales
+    out = out[["open", "high", "low", "close", "volume"]].astype(
+        {"open":"float64","high":"float64","low":"float64","close":"float64","volume":"float64"}
+    )
+    return out
 
 def load_prices_panel(symbols: List[str], start: str, end: str, cache_key: str | None = None, force: bool=False) -> Dict[str, pd.DataFrame]:
     # lee panel cacheado si existe
