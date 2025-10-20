@@ -1,216 +1,400 @@
 # qvm_trend/data_io.py
-import os, time, requests
+from __future__ import annotations
+
+import os
+import time
+import math
+import json
+from typing import Dict, List, Tuple
+
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import Dict, List, Tuple
-from .cache_io import save_df, load_df, save_panel, load_panel
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-DEFAULT_START = "2020-01-01"
-DEFAULT_END = datetime.today().strftime("%Y-%m-%d")
+__all__ = [
+    "_http_get",
+    "run_fmp_screener",
+    "filter_universe",
+    "get_prices_fmp",
+    "load_prices_panel",
+    "load_benchmark",
+]
+
+# =========================== CONFIGURACIÓN FMP ============================
+
+# API key desde entorno; si usas .streamlit/secrets.toml o dotenv, asegúrate de exportarla
+FMP_API_KEY = os.environ.get("FMP_API_KEY") or os.environ.get("FMP_APIKEY") or ""
+
+# Objetivo de llamadas: 4 req/s ≈ 240/min (por debajo del límite de 300/min)
+TARGET_RPS: float = float(os.environ.get("FMP_TARGET_RPS", 4.0))
+MAX_RETRIES: int = int(os.environ.get("FMP_MAX_RETRIES", 5))
+TIMEOUT_SECS: int = int(os.environ.get("FMP_TIMEOUT", 30))
+
+# Sesión HTTP con retries/backoff para 429/5xx
+_session = requests.Session()
+_retry = Retry(
+    total=MAX_RETRIES,
+    backoff_factor=0.5,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=32, pool_maxsize=32)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+
+_last_call_ts = 0.0
+
+def _respect_rate_limit():
+    """Limiter global simple para no superar TARGET_RPS."""
+    global _last_call_ts
+    rps = max(TARGET_RPS, 0.1)
+    min_interval = 1.0 / rps
+    now = time.monotonic()
+    sleep_needed = _last_call_ts + min_interval - now
+    if sleep_needed > 0:
+        time.sleep(sleep_needed)
+    _last_call_ts = time.monotonic()
+
+def _http_get(url: str, params: dict | None = None, *, timeout: int = TIMEOUT_SECS):
+    """
+    GET robusto con:
+      - apikey inyectada,
+      - rate limit,
+      - retries + backoff con jitter para 429/5xx,
+      - errores detallados.
+    """
+    if not FMP_API_KEY:
+        raise RuntimeError("FMP_API_KEY no configurada (variable de entorno 'FMP_API_KEY').")
+
+    params = dict(params or {})
+    params["apikey"] = FMP_API_KEY
+
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        _respect_rate_limit()
+        try:
+            r = _session.get(url, params=params, timeout=timeout)
+        except Exception as e:
+            last_exc = e
+            # pequeño backoff y reintento
+            time.sleep(0.25 * attempt)
+            continue
+
+        code = r.status_code
+        if code == 200:
+            try:
+                return r.json()
+            except Exception:
+                snippet = r.text[:200].replace("\n", " ")
+                raise RuntimeError(f"FMP JSON decode error: {url} | {snippet}")
+
+        if code in (429, 500, 502, 503, 504):
+            # backoff exponencial con jitter
+            base = 0.75 * (2 ** (attempt - 1))
+            # jitter ∈ [-0.25, 0.25] * 2^(attempt-1)
+            jitter = 0.25 * (2 ** (attempt - 1)) * ((int.from_bytes(os.urandom(1), "big") / 255.0) - 0.5) * 2
+            time.sleep(max(0.5, base + jitter))
+            continue
+
+        snippet = r.text[:200].replace("\n", " ")
+        raise RuntimeError(f"FMP HTTP {code} {r.reason}: {url} | {snippet}")
+
+    # se agotaron reintentos
+    if last_exc:
+        raise RuntimeError(f"FMP: sin respuesta estable tras {MAX_RETRIES} intentos: {url}") from last_exc
+    raise RuntimeError(f"FMP: agotados retries: {url}")
+
+# ============================ UTILIDADES VARIAS ============================
 
 EXCHANGES_OK = {
-    "NASDAQ","Nasdaq","NasdaqGS","NasdaqGM",
-    "NYSE","NYSE ARCA","NYSE Arca","NYSE American",
-    "AMEX","BATS"
+    "NASDAQ", "Nasdaq", "NasdaqGS", "NasdaqGM",
+    "NYSE", "NYSE ARCA", "NYSE Arca", "NYSE American",
+    "AMEX", "BATS"
 }
-IPO_MIN_DAYS_DEFAULT = 365
 
-def _http_get(url: str, params: dict | None = None, sleep: float = 0.0):
-    if sleep > 0: time.sleep(sleep)
-    params = params or {}
-    key = os.getenv("FMP_API_KEY", "")
-    if not key:
-        raise RuntimeError('FMP_API_KEY no configurada (secrets.toml o env).')
-    params["apikey"] = key
-    r = requests.get(url, params=params, timeout=30)
-    if not r.ok:
-        raise RuntimeError(f"FMP HTTP {r.status_code} {r.reason}: {url} | {r.text[:200]}")
-    return r.json()
-
-def clean_symbol(sym: str) -> str:
+def _clean_symbol(sym: str) -> str:
     return (sym or "").strip().upper()
 
-# --- SCREENER & PERFILES -----------------------------------------------------
-def run_fmp_screener(limit=200) -> pd.DataFrame:
+def _to_num(s, default=np.nan):
+    try:
+        return pd.to_numeric(s, errors="coerce")
+    except Exception:
+        return default
+
+# ============================ SCREENER (UNIVERSO) ============================
+
+def run_fmp_screener(limit: int = 300,
+                     eps_growth_min: float = 15,
+                     roe_min: float = 10,
+                     volume_min: int = 500_000,
+                     mcap_min: float = 1e7,
+                     *,
+                     fetch_profiles: bool = True) -> pd.DataFrame:
+    """
+    Descarga universo base desde /stock-screener de FMP y (opcionalmente) enriquece con /profile/{sym}.
+    Devuelve DataFrame con columnas estandarizadas.
+    """
     url = "https://financialmodelingprep.com/api/v3/stock-screener"
     params = {
-        "epsGrowthMoreThan": 15,
-        "returnOnEquityMoreThan": 10,
-        "volumeMoreThan": 500000,
-        "marketCapMoreThan": 1e7,
+        "epsGrowthMoreThan": eps_growth_min,
+        "returnOnEquityMoreThan": roe_min,
+        "volumeMoreThan": int(volume_min),
+        "marketCapMoreThan": mcap_min,
         "limit": int(limit),
     }
     base = _http_get(url, params=params)
     df = pd.DataFrame(base)
     if df.empty or "symbol" not in df.columns:
-        return pd.DataFrame()
-    # perfiles
-    profiles = []
-    for sym in df["symbol"].dropna().unique():
-        try:
-            prof = _http_get(f"https://financialmodelingprep.com/api/v3/profile/{sym}")
-            if isinstance(prof, list) and prof:
-                p0 = prof[0]
-                profiles.append({
-                    "symbol": clean_symbol(sym),
-                    "sector": p0.get("sector"),
-                    "industry": p0.get("industry"),
-                    "marketCap_profile": p0.get("mktCap") or p0.get("marketCap"),
-                    "price_profile": p0.get("price"),
-                    "exchange": p0.get("exchangeShortName") or p0.get("exchange"),
-                    "ipoDate": p0.get("ipoDate"),
-                })
-        except Exception:
-            continue
-    dfp = pd.DataFrame(profiles)
-    out = df.merge(dfp, on="symbol", how="left")
-    # normaliza
-    for c in ["marketCap","marketCap_profile","price","price_profile"]:
-        if c not in out.columns: out[c] = np.nan
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    out["marketCap"] = out["marketCap"].fillna(out["marketCap_profile"])
-    for c in ["sector","industry"]:
-        if c not in out.columns: out[c] = "Unknown"
-        out[c] = out[c].fillna("Unknown").astype(str)
-    for c in ["exchange"]:
-        if c not in out.columns: out[c] = ""
-        out[c] = out[c].fillna("").astype(str)
-    out["ipoDate"] = pd.to_datetime(out.get("ipoDate"), errors="coerce")
-    out["symbol"] = out["symbol"].astype(str).apply(clean_symbol)
-    return out.drop_duplicates("symbol")
-    
-def filter_universe(df: pd.DataFrame, min_mcap=5e8, ipo_min_days=IPO_MIN_DAYS_DEFAULT) -> pd.DataFrame:
-    if df.empty: return df
-    today = pd.Timestamp.today().normalize()
-    typ_ok = True  # ya filtrado por screener
-    exch = df["exchange"].fillna("")
-    df2 = df[(exch.isin(EXCHANGES_OK)) | (exch=="")].copy()
-    df2 = df2[df2["marketCap"] >= float(min_mcap)]
-    df2 = df2[(df2["ipoDate"].isna()) | (df2["ipoDate"] <= today - pd.Timedelta(days=int(ipo_min_days)))]
-    return df2.sort_values("marketCap", ascending=False)
+        raise RuntimeError("Screener FMP devolvió vacío o sin 'symbol'.")
 
-# --- PRECIOS (OHLCV) ---------------------------------------------------------
-def get_prices_fmp(symbol: str, start: str = DEFAULT_START, end: str = DEFAULT_END) -> pd.DataFrame | None:
-    sym = clean_symbol(symbol)
-    base = f"https://financialmodelingprep.com/api/v3/historical-price-full/{sym}"
+    df["symbol"] = df["symbol"].astype(str).apply(_clean_symbol)
 
-    # 1) intento con rango
+    if fetch_profiles:
+        # Enriquecer con perfil para sector/industry/mktcap/ipoDate/exchange/flags
+        symbols = df["symbol"].dropna().unique().tolist()
+
+        profiles = []
+        # procesar en lotes para respetar cuota
+        batch = 40
+        pause = 1.0
+        for i in range(0, len(symbols), batch):
+            blk = symbols[i:i+batch]
+            for sym in blk:
+                try:
+                    prof = _http_get(f"https://financialmodelingprep.com/api/v3/profile/{sym}")
+                    if isinstance(prof, list) and prof:
+                        p0 = prof[0]
+                        profiles.append({
+                            "symbol": sym,
+                            "sector": p0.get("sector"),
+                            "industry": p0.get("industry"),
+                            "marketCap_profile": p0.get("mktCap") or p0.get("marketCap"),
+                            "beta_profile": p0.get("beta"),
+                            "price_profile": p0.get("price"),
+                            "currency": p0.get("currency"),
+                            "isEtf": bool(p0.get("isEtf")),
+                            "isFund": bool(p0.get("isFund")),
+                            "isAdr":  bool(p0.get("isAdr")),
+                            "exchange": p0.get("exchangeShortName") or p0.get("exchange"),
+                            "type": p0.get("type"),
+                            "country": p0.get("country"),
+                            "ipoDate": p0.get("ipoDate"),
+                        })
+                except Exception:
+                    profiles.append({"symbol": sym})
+            time.sleep(pause)
+
+        dfp = pd.DataFrame(profiles)
+        if not dfp.empty:
+            df = df.merge(dfp, on="symbol", how="left")
+
+    # Normalizaciones básicas
+    for col in ["marketCap", "marketCap_profile", "price", "price_profile", "beta", "beta_profile"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["marketCap"] = df["marketCap"].fillna(df.get("marketCap_profile"))
+    df["price"]     = df["price"].fillna(df.get("price_profile"))
+    df["beta"]      = df["beta"].fillna(df.get("beta_profile"))
+
+    # Campos categóricos
+    for c in ["sector", "industry", "exchange", "type", "country"]:
+        if c not in df.columns:
+            df[c] = ""
+        df[c] = df[c].fillna("").astype(str)
+
+    for c in ["isEtf", "isFund", "isAdr"]:
+        if c not in df.columns:
+            df[c] = False
+        df[c] = df[c].fillna(False).astype(bool)
+
+    # IPO date
+    if "ipoDate" not in df.columns:
+        df["ipoDate"] = pd.NaT
+    else:
+        df["ipoDate"] = pd.to_datetime(df["ipoDate"], errors="coerce")
+
+    # Quitar duplicados por símbolo, favorecer mayor mcap
+    df = df.sort_values("marketCap", ascending=False).drop_duplicates(subset=["symbol"], keep="first")
+
+    # Columnas útiles que esperamos más adelante
+    keep = [
+        "symbol", "sector", "industry", "exchange", "type", "country",
+        "marketCap", "price", "beta", "isEtf", "isFund", "isAdr", "ipoDate", "volume"
+    ]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep].copy()
+
+def filter_universe(df: pd.DataFrame,
+                    min_mcap: float = 5e8,
+                    exchanges_ok: set[str] = EXCHANGES_OK,
+                    ipo_min_days: int = 365) -> pd.DataFrame:
+    """
+    Limpia el universo:
+      - excluye ETFs/fondos/ADRs
+      - limita a exchanges esperados
+      - exige IPO ≥ ipo_min_days
+      - exige market cap mínimo
+      - tipo stock/equity (si existe)
+    """
+    d = df.copy()
+    # excluir vehículos no equity “común”
+    for c in ["isEtf", "isFund", "isAdr"]:
+        if c not in d.columns:
+            d[c] = False
+    d = d[(~d["isEtf"]) & (~d["isFund"]) & (~d["isAdr"])]
+
+    # tipo
+    if "type" in d.columns:
+        typ = d["type"].fillna("").str.lower()
+        ok_type = typ.str.contains("stock") | typ.str.contains("equity") | (typ == "")
+        d = d[ok_type]
+
+    # exchange
+    if "exchange" in d.columns:
+        exch = d["exchange"].fillna("")
+        d = d[(exch.isin(exchanges_ok)) | (exch == "")]
+
+    # IPO
+    if "ipoDate" in d.columns:
+        today = pd.Timestamp.today().normalize()
+        d = d[(d["ipoDate"].isna()) | (d["ipoDate"] <= today - pd.Timedelta(days=int(ipo_min_days)))]
+
+    # mcap mínimo
+    if "marketCap" in d.columns:
+        d = d[pd.to_numeric(d["marketCap"], errors="coerce") >= float(min_mcap)]
+
+    # orden por tamaño
+    if "marketCap" in d.columns:
+        d = d.sort_values("marketCap", ascending=False)
+
+    # normaliza símbolos y dedup
+    d["symbol"] = d["symbol"].astype(str).apply(_clean_symbol)
+    d = d.dropna(subset=["symbol"]).drop_duplicates(subset=["symbol"], keep="first")
+
+    return d.copy()
+
+# ============================= PRECIOS (HISTÓRICO) =============================
+
+def _hist_full(symbol: str, start: str | None, end: str | None):
+    base = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
+    params = {}
+    if start:
+        params["from"] = start
+    if end:
+        params["to"] = end
+    return _http_get(base, params=params)
+
+def _hist_compact(symbol: str):
+    base = f"https://financialmodelingprep.com/api/v3/historical-price-full/{symbol}"
+    return _http_get(base, params={})  # fallback sin rangos
+
+def get_prices_fmp(symbol: str,
+                   start: str | None = None,
+                   end: str | None = None) -> pd.DataFrame | None:
+    """
+    Devuelve DataFrame con columnas: ['open','high','low','close','volume'] indexado por fecha.
+    Mapea adjClose/adj_* si es necesario. Orden ascendente por fecha.
+    """
+    sym = _clean_symbol(symbol)
     try:
-        j = _http_get(base, params={"from": start, "to": end})
+        j = _hist_full(sym, start, end)
         hist = j.get("historical", [])
-    except Exception:
-        hist = []
-
-    # 2) fallback sin rango
-    if not isinstance(hist, list) or len(hist) == 0:
-        try:
-            j2 = _http_get(base)
+        if not isinstance(hist, list) or len(hist) == 0:
+            j2 = _hist_compact(sym)
             hist = j2.get("historical", [])
-        except Exception:
-            hist = []
-
-    if not isinstance(hist, list) or len(hist) == 0:
-        return None
-
-    dfp = pd.DataFrame(hist)
-    if dfp.empty:
-        return None
-
-    # Normaliza nombres (lower / sin guiones) y mapea sinónimos
-    rename_map = {c: c.lower().replace("-", "_") for c in dfp.columns}
-    dfp = dfp.rename(columns=rename_map)
-
-    # sinónimos → estándar
-    synonyms = {
-        "close": ["close", "adjclose", "adj_close", "adjusted_close", "price"],
-        "open":  ["open", "adjopen", "adj_open", "adjusted_open"],
-        "high":  ["high", "adjhigh", "adj_high", "adjusted_high"],
-        "low":   ["low", "adjlow", "adj_low", "adjusted_low"],
-        "volume":["volume", "volumeto", "volumes", "qty"]
-    }
-
-    def first_present(cols: list[str]) -> str | None:
-        for c in cols:
-            if c in dfp.columns:
-                return c
-        return None
-
-    cols = {}
-    for std, cands in synonyms.items():
-        src = first_present(cands)
-        if src is not None:
-            cols[std] = src
-
-    # Debe existir al menos 'close'
-    if "close" not in cols:
-        return None
-
-    # Crea DataFrame base con 'close'
-    out = pd.DataFrame()
-    out["close"] = pd.to_numeric(dfp[cols["close"]], errors="coerce")
-
-    # Reconstruye O/H/L si faltan usando 'close' (fallback tolerante)
-    for k in ["open", "high", "low"]:
-        if k in cols:
-            out[k] = pd.to_numeric(dfp[cols[k]], errors="coerce")
-        else:
-            out[k] = out["close"]  # fallback: igual a close
-
-    # Volume: si no hay, crea 0
-    if "volume" in cols:
-        out["volume"] = pd.to_numeric(dfp[cols["volume"]], errors="coerce").fillna(0)
-    else:
-        out["volume"] = 0.0
-
-    # Fecha
-    date_col = "date" if "date" in dfp.columns else None
-    if date_col is None:
-        # algunos endpoints traen 'label'
-        if "label" in dfp.columns:
-            dfp["date"] = pd.to_datetime(dfp["label"], errors="coerce")
-        else:
+        if not isinstance(hist, list) or len(hist) == 0:
             return None
-    else:
-        dfp["date"] = pd.to_datetime(dfp["date"], errors="coerce")
 
-    out["date"] = dfp["date"]
-    out = out.dropna(subset=["date", "close"])
-    if out.empty:
+        dfp = pd.DataFrame(hist)
+        # Mapear columnas alternativas
+        mapping = {
+            "adjClose": "close",
+            "adj_open": "open",
+            "adj_high": "high",
+            "adj_low":  "low",
+        }
+        for k, v in mapping.items():
+            if k in dfp.columns and v not in dfp.columns:
+                dfp[v] = dfp[k]
+
+        need = ["date", "open", "high", "low", "close", "volume"]
+        # algunos endpoints traen 'volumefrom/volumeto' (crypto) — ignoramos para equities
+        missing = [c for c in need if c not in dfp.columns]
+        if missing:
+            # si falta 'open/high/low' pero hay 'close' y 'volume', intentamos reconstruir OHLC=close
+            base_ok = all(c in dfp.columns for c in ["date", "close", "volume"])
+            if base_ok:
+                for c in ["open", "high", "low"]:
+                    if c not in dfp.columns:
+                        dfp[c] = dfp["close"]
+                need = ["date", "open", "high", "low", "close", "volume"]
+            else:
+                return None
+
+        dfp["date"] = pd.to_datetime(dfp["date"], errors="coerce")
+        dfp = dfp.dropna(subset=["date"]).sort_values("date").set_index("date")
+
+        # Tipos numéricos
+        for c in ["open", "high", "low", "close", "volume"]:
+            dfp[c] = pd.to_numeric(dfp[c], errors="coerce")
+
+        # Filtra NaN extremos
+        dfp = dfp[["open", "high", "low", "close", "volume"]].dropna(how="all")
+        if dfp.empty:
+            return None
+        return dfp
+    except Exception:
         return None
 
-    out = out.sort_values("date").set_index("date")
+# =========================== PANEL DE PRECIOS (BULK) ===========================
 
-    # Orden y tipos finales
-    out = out[["open", "high", "low", "close", "volume"]].astype(
-        {"open":"float64","high":"float64","low":"float64","close":"float64","volume":"float64"}
-    )
+def _process_symbols(symbols: List[str], fn_fetch, batch: int = 40, pause: float = 1.0) -> Dict[str, pd.DataFrame]:
+    """
+    Procesa símbolos en lotes con pausa entre lotes para respetar cuota.
+    fn_fetch: callable(symbol) -> DataFrame | None
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    for i in range(0, len(symbols), batch):
+        blk = symbols[i:i + batch]
+        for s in blk:
+            sym = _clean_symbol(s)
+            try:
+                dfp = fn_fetch(sym)
+                if dfp is not None and not dfp.empty:
+                    out[sym] = dfp
+            except Exception:
+                # ignora símbolo que falla
+                continue
+        time.sleep(pause)
     return out
 
-def load_prices_panel(symbols: List[str], start: str, end: str, cache_key: str | None = None, force: bool=False) -> Dict[str, pd.DataFrame]:
-    # lee panel cacheado si existe
-    if cache_key and not force:
-        cached = load_panel(f"prices_{cache_key}")
-        if cached: return cached
-    panel = {}
-    for s in symbols:
-        dfp = get_prices_fmp(s, start, end)
-        if dfp is not None and not dfp.empty:
-            panel[s] = dfp
-    if cache_key:
-        save_panel(panel, f"prices_{cache_key}")
+def load_prices_panel(symbols: List[str],
+                      start: str | None = None,
+                      end: str | None = None,
+                      *,
+                      cache_key: str | None = None,
+                      force: bool = False,
+                      batch: int = 40,
+                      pause: float = 1.0) -> Dict[str, pd.DataFrame]:
+    """
+    Descarga precios para lista de símbolos en un dict {symbol: DataFrame}.
+    Parám. cache_key/force están para compatibilidad con tu app; el cache real lo maneja cache_io o Streamlit.
+    """
+    # Si manejas cache externo, úsalo allí; aquí solo descargamos
+    fetch = lambda s: get_prices_fmp(s, start, end)
+    panel = _process_symbols(symbols, fetch, batch=batch, pause=pause)
     return panel
 
-def load_benchmark(symbol: str, start: str, end: str, cache_key: str | None = None, force: bool=False) -> pd.Series | None:
-    key = f"bench_{symbol}_{cache_key}" if cache_key else None
-    if key and not force:
-        dfc = load_df(key)
-        if dfc is not None:
-            return dfc["close"]
-    df = get_prices_fmp(symbol, start, end)
-    if df is None or df.empty: return None
-    out = df[["close"]]
-    if key: save_df(out, key)
-    return out["close"]
+def load_benchmark(symbol: str,
+                   start: str | None = None,
+                   end: str | None = None) -> pd.DataFrame | None:
+    """
+    Descarga la serie de un benchmark (p.ej. 'SPY', 'QQQ', 'IPSA').
+    """
+    return get_prices_fmp(symbol, start, end)
 
