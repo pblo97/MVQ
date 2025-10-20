@@ -48,56 +48,117 @@ def _yr_series(items, key):
     out.sort(key=lambda z: z[0])
     return out
 
+def _first_item(obj):
+    """Devuelve primer item para endpoints que pueden ser dict o list."""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list) and obj:
+        return obj[0]
+    return None
+
+def _sum_last_quarters(items, key, n=4):
+    """Suma los últimos n trimestres (quarterly)."""
+    if not isinstance(items, list) or not items:
+        return None
+    try:
+        df = pd.DataFrame(items)
+        if "date" not in df.columns:
+            return None
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+        vals = pd.to_numeric(df[key], errors="coerce").dropna().tail(n)
+        if len(vals) == 0:
+            return None
+        return float(vals.sum())
+    except Exception:
+        return None
+
 # ==================== SET MÍNIMO (DESCARGA + CACHE) ====================
 
 def _fetch_min_battle_fmp(symbol: str, market_cap_hint: float | None = None) -> dict:
     """
-    Mínimos robustos para VFQ:
-      fcf_yield, inv_ev_ebitda, gross_profitability, roic, roa, netMargin,
-      marketCap (con fallback) y coverage_count.
+    Mínimos robustos para VFQ con fallbacks:
+      - ROA/ROIC/Margen: ratios-ttm -> ratios (annual)
+      - EV/EBITDA, FCF, GrossProfit, TotalAssets, Shares, MarketCap: key-metrics-ttm -> key-metrics (annual)
+      - fcf_yield, gross_profitability, inv_ev_ebitda
     """
     sym = (symbol or "").strip().upper()
     out: Dict[str, object] = {"symbol": sym}
 
-    # Ratios TTM
+    # Ratios: TTM → annual
+    roa = roic = net_m = None
     try:
         r = _http_get(f"https://financialmodelingprep.com/api/v3/ratios-ttm/{sym}")
         if isinstance(r, list) and r:
             x = r[0]
-            out["roa"] = x.get("returnOnAssetsTTM")
-            out["roic"] = x.get("returnOnCapitalEmployedTTM") or x.get("returnOnInvestedCapitalTTM")
-            out["netMargin"] = x.get("netProfitMarginTTM")
+            roa   = x.get("returnOnAssetsTTM")
+            roic  = x.get("returnOnCapitalEmployedTTM") or x.get("returnOnInvestedCapitalTTM")
+            net_m = x.get("netProfitMarginTTM")
     except Exception:
         pass
+    if roa is None or roic is None or net_m is None:
+        try:
+            r1 = _http_get(f"https://financialmodelingprep.com/api/v3/ratios/{sym}",
+                           params={"period": "annual", "limit": 1})
+            if isinstance(r1, list) and r1:
+                y = r1[0]
+                if roa   is None: roa   = y.get("returnOnAssets")
+                if roic  is None: roic  = y.get("returnOnCapitalEmployed") or y.get("returnOnInvestedCapital")
+                if net_m is None: net_m = y.get("netProfitMargin")
+        except Exception:
+            pass
+    out["roa"] = roa
+    out["roic"] = roic
+    out["netMargin"] = net_m
 
-    # Key-metrics TTM
+    # Key-metrics: TTM → annual
+    evToEbitda = fcf_ttm = gp_ttm = ta_ttm = shares = mcap = None
     try:
         k = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{sym}")
         if isinstance(k, list) and k:
             y = k[0]
-            out["evToEbitda"]       = y.get("enterpriseValueOverEBITDATTM")
-            out["fcf_ttm"]          = y.get("freeCashFlowTTM")
-            out["grossProfitTTM"]   = y.get("grossProfitTTM")
-            out["totalAssetsTTM"]   = y.get("totalAssetsTTM")
-            out["sharesOutstanding"]= y.get("sharesOutstanding")
-            if y.get("marketCap"):
-                out["marketCap"] = y.get("marketCap")
+            evToEbitda = y.get("enterpriseValueOverEBITDATTM")
+            fcf_ttm    = y.get("freeCashFlowTTM")
+            gp_ttm     = y.get("grossProfitTTM")
+            ta_ttm     = y.get("totalAssetsTTM")
+            shares     = y.get("sharesOutstanding")
+            mcap       = y.get("marketCap") or mcap
     except Exception:
         pass
+    if any(v is None for v in [evToEbitda, fcf_ttm, gp_ttm, ta_ttm, mcap]):
+        try:
+            km1 = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics/{sym}",
+                            params={"period": "annual", "limit": 1})
+            if isinstance(km1, list) and km1:
+                z = km1[0]
+                evToEbitda = evToEbitda or z.get("enterpriseValueOverEBITDA")
+                fcf_ttm    = fcf_ttm    or z.get("freeCashFlow")
+                gp_ttm     = gp_ttm     or z.get("grossProfit")
+                ta_ttm     = ta_ttm     or z.get("totalAssets")
+                shares     = shares     or z.get("sharesOutstanding")
+                mcap       = mcap       or z.get("marketCap")
+        except Exception:
+            pass
 
-    # Fallback market cap
-    if "marketCap" not in out or out["marketCap"] in (None, 0):
+    out["evToEbitda"]        = evToEbitda
+    out["fcf_ttm"]           = fcf_ttm
+    out["grossProfitTTM"]    = gp_ttm
+    out["totalAssetsTTM"]    = ta_ttm
+    out["sharesOutstanding"] = shares
+
+    # Market cap fallback
+    if not mcap:
         try:
             mc = _http_get(f"https://financialmodelingprep.com/api/v3/market-capitalization/{sym}", params={"limit": 1})
             if isinstance(mc, list) and mc:
-                out["marketCap"] = mc[0].get("marketCap")
+                mcap = mc[0].get("marketCap")
         except Exception:
-            out["marketCap"] = market_cap_hint
+            pass
+    out["marketCap"] = mcap or market_cap_hint
 
     # Derivados
-    fcf = out.get("fcf_ttm"); mcap = out.get("marketCap")
-    gp  = out.get("grossProfitTTM"); ta = out.get("totalAssetsTTM")
-    ev  = out.get("evToEbitda")
+    fcf = out.get("fcf_ttm"); gp = out.get("grossProfitTTM"); ta = out.get("totalAssetsTTM"); ev = out.get("evToEbitda")
+    mcap = out.get("marketCap")
 
     out["fcf_yield"] = (fcf / mcap) if (fcf not in (None, 0) and mcap not in (None, 0)) else None
     out["gross_profitability"] = (gp / ta) if (gp not in (None, 0) and ta not in (None, 0)) else None
@@ -139,7 +200,7 @@ def build_vfq_scores(df_universe: pd.DataFrame,
                      df_fund: pd.DataFrame,
                      size_buckets: int = 3) -> pd.DataFrame:
     """
-    Une universo (sector/marketCap) + fundamentales TTM y calcula:
+    Une universo (sector/marketCap) + fundamentales TTM/anual y calcula:
       ValueScore = mean(rank(fcf_yield, 1/EV/EBITDA))
       QualityScore = mean(rank(gross_profitability, roic, roa, netMargin))
       VFQ = mean(ValueScore, QualityScore)
@@ -153,7 +214,6 @@ def build_vfq_scores(df_universe: pd.DataFrame,
     # Unificar sector / market cap
     df = coalesce_first(df, ["sector","sector_x","sector_y"], "sector_unified", to_numeric=False)
     df["sector_unified"] = df["sector_unified"].fillna("Unknown").astype(str)
-
     df = coalesce_first(df, ["marketCap","marketCap_x","marketCap_y","marketCap_profile"], "marketCap_unified", to_numeric=True)
 
     # Buckets de tamaño
@@ -163,7 +223,7 @@ def build_vfq_scores(df_universe: pd.DataFrame,
     except Exception:
         df["size_bucket"] = 1
 
-    # Lista de métricas esperadas
+    # Métricas esperadas
     val_candidates = ["fcf_yield", "inv_ev_ebitda"]
     qlt_candidates  = ["gross_profitability", "roic", "roa", "netMargin"]
     all_fields = val_candidates + qlt_candidates
@@ -181,9 +241,10 @@ def build_vfq_scores(df_universe: pd.DataFrame,
         if not present:
             return pd.Series(np.nan, index=df.index, dtype="float64")
         mat = pd.concat([df[c] for c in present], axis=1)
-        # rank por columna y luego promedio de ranks
-        ranks = pd.concat([mat[c].groupby(grp).rank(method="average", ascending=False, na_option="bottom")
-                           for c in present], axis=1)
+        ranks = pd.concat(
+            [mat[c].groupby(grp).rank(method="average", ascending=False, na_option="bottom")
+             for c in present], axis=1
+        )
         return ranks.mean(axis=1)
 
     # Scores
@@ -197,7 +258,7 @@ def build_vfq_scores(df_universe: pd.DataFrame,
     except Exception:
         df["VFQ_pct_sector"] = np.nan
 
-    # Cobertura: cuenta cuántas métricas existen y no son NaN
+    # Cobertura VFQ
     existing = [f for f in all_fields if f in df.columns]
     if existing:
         df["coverage_count"] = df[existing].notna().sum(axis=1)
@@ -210,58 +271,89 @@ def build_vfq_scores(df_universe: pd.DataFrame,
     keep = [c for c in keep if c in df.columns]
     return df[keep].copy()
 
-
 # =========================== GUARDRAILS (CALIDAD) ===========================
 
 def download_guardrails(symbol: str) -> dict:
     """
-    TTM + series anuales para:
-      EBIT_TTM, CFO_TTM, FCF_TTM, Net Issuance (12–24m), Asset Growth (y/y),
-      Accruals/TA y NetDebt/EBITDA.
+    TTM + fallbacks:
+      - Key-metrics-ttm (net_debt_ttm, ebitda_ttm) → annual si falta
+      - CFO/FCF: ttm → quarterly (sum 4) → annual
+      - EBIT: ttm → quarterly (sum 4) → annual
+      - Net issuance, asset growth, accruals/TA, netdebt/EBITDA (annual)
     """
     sym = (symbol or "").strip().upper()
     out: Dict[str, object] = {"symbol": sym}
 
-    # TTM básicos
+    # --- TTM básicos (key-metrics-ttm → annual)
     try:
         kttm = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{sym}")
-        if isinstance(kttm, list) and kttm:
-            k = kttm[0]
+        k = _first_item(kttm)
+        if k:
             out["shares_out_ttm"] = _safe_num(k.get("sharesOutstanding"))
             out["net_debt_ttm"]   = _safe_num(k.get("netDebtTTM")) or None
             out["ebitda_ttm"]     = _safe_num(k.get("ebitdaTTM")) or None
     except Exception:
         pass
 
-    # CFO/FCF TTM
+    # --- CFO/FCF TTM → quarterly sum → annual
+    out["cfo_ttm"] = None
+    out["fcf_ttm"] = None
     try:
         cfttm = _http_get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement-ttm/{sym}")
-        if isinstance(cfttm, dict) and cfttm:
-            out["cfo_ttm"] = _safe_num(cfttm.get("netCashProvidedByOperatingActivitiesTTM"))
-            out["fcf_ttm"] = _safe_num(cfttm.get("freeCashFlowTTM"))
+        c = _first_item(cfttm)
+        if c:
+            out["cfo_ttm"] = _safe_num(c.get("netCashProvidedByOperatingActivitiesTTM"))
+            out["fcf_ttm"] = _safe_num(c.get("freeCashFlowTTM"))
     except Exception:
+        pass
+    if out.get("cfo_ttm") is None or out.get("fcf_ttm") is None:
         try:
-            cf = _http_get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{sym}", params={"limit":1})
-            if isinstance(cf, list) and cf:
-                out["cfo_ttm"] = _safe_num(cf[0].get("netCashProvidedByOperatingActivities"))
-                out["fcf_ttm"] = _safe_num(cf[0].get("freeCashFlow"))
+            cf_q = _http_get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{sym}", params={"period":"quarter","limit":6})
+        except Exception:
+            cf_q = []
+        if out.get("cfo_ttm") is None:
+            s = _sum_last_quarters(cf_q, "netCashProvidedByOperatingActivities", 4)
+            if s is not None: out["cfo_ttm"] = s
+        if out.get("fcf_ttm") is None:
+            s = _sum_last_quarters(cf_q, "freeCashFlow", 4)
+            if s is not None: out["fcf_ttm"] = s
+    if out.get("cfo_ttm") is None or out.get("fcf_ttm") is None:
+        try:
+            cf_a = _http_get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{sym}", params={"period":"annual","limit":1})
+            if isinstance(cf_a, list) and cf_a:
+                out["cfo_ttm"] = out["cfo_ttm"] or _safe_num(cf_a[0].get("netCashProvidedByOperatingActivities"))
+                out["fcf_ttm"] = out["fcf_ttm"] or _safe_num(cf_a[0].get("freeCashFlow"))
         except Exception:
             pass
 
-    # EBIT TTM (o proxy)
+    # --- EBIT TTM → quarterly sum → annual
+    out["ebit_ttm"] = None
     try:
         inc_ttm = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement-ttm/{sym}")
-        if isinstance(inc_ttm, dict) and inc_ttm:
-            out["ebit_ttm"] = _safe_num(inc_ttm.get("ebitTTM") or inc_ttm.get("operatingIncomeTTM"))
+        it = _first_item(inc_ttm)
+        if it:
+            out["ebit_ttm"] = _safe_num(it.get("ebitTTM") or it.get("operatingIncomeTTM"))
     except Exception:
+        pass
+    if out.get("ebit_ttm") is None:
         try:
-            inc = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement/{sym}", params={"period":"annual","limit":1})
-            if isinstance(inc, list) and inc:
-                out["ebit_ttm"] = _safe_num(inc[0].get("ebit") or inc[0].get("operatingIncome"))
+            inc_q = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement/{sym}", params={"period":"quarter","limit":6})
+        except Exception:
+            inc_q = []
+        s = _sum_last_quarters(inc_q, "ebit", 4)
+        if s is None:
+            s = _sum_last_quarters(inc_q, "operatingIncome", 4)
+        if s is not None:
+            out["ebit_ttm"] = s
+    if out.get("ebit_ttm") is None:
+        try:
+            inc_a = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement/{sym}", params={"period":"annual","limit":1})
+            if isinstance(inc_a, list) and inc_a:
+                out["ebit_ttm"] = _safe_num(inc_a[0].get("ebit") or inc_a[0].get("operatingIncome"))
         except Exception:
             pass
 
-    # Series anuales (5)
+    # --- Series anuales: growth, accruals, issuance, leverage
     try:
         bal = _http_get(f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{sym}", params={"period":"annual","limit":5})
     except Exception:
@@ -279,24 +371,24 @@ def download_guardrails(symbol: str) -> dict:
     except Exception:
         km = []
 
-    # Asset growth
+    # Asset growth (y/y)
     assets = _yr_series(bal, "totalAssets")
     if len(assets) >= 2:
         _, a0 = assets[-2]; _, a1 = assets[-1]
         out["asset_growth"] = (a1 - a0)/a0 if (a0 not in (None, 0)) else None
 
-    # Accruals/TA
+    # Accruals/TA ~ (NI − CFO) / activos medios
     ni  = _yr_series(inc, "netIncome")
     cfo = _yr_series(cf,  "netCashProvidedByOperatingActivities")
     ta  = _yr_series(bal, "totalAssets")
     if len(ni) >= 2 and len(cfo) >= 2 and len(ta) >= 2:
         _, ni1 = ni[-1]; _, cfo1 = cfo[-1]
         _, ta1 = ta[-1]; _, ta0 = ta[-2]
-        accruals = (ni1 - cfo1)
+        accruals   = (ni1 - cfo1)
         avg_assets = ((ta1 or 0.0) + (ta0 or 0.0))/2.0 if (ta1 and ta0) else None
         out["accruals_ta"] = (accruals/avg_assets) if (avg_assets not in (None, 0)) else None
 
-    # Net issuance
+    # Net issuance (Δ acciones 12–24m) usando key-metrics anual
     shares = _yr_series(km, "sharesOutstanding")
     if len(shares) >= 2:
         _, s0 = shares[-2]; _, s1 = shares[-1]
@@ -304,7 +396,7 @@ def download_guardrails(symbol: str) -> dict:
     else:
         out["net_issuance"] = None
 
-    # NetDebt/EBITDA
+    # NetDebt/EBITDA (último anual con ambos)
     net_debt = None; ebitda = None
     if isinstance(km, list) and km:
         for item in reversed(km):
@@ -335,26 +427,24 @@ def download_guardrails_batch(symbols: list[str], cache_key: str | None = None, 
 
 def apply_quality_guardrails(df: pd.DataFrame,
                              require_profit_floor: bool = True,
-                             profit_floor_min_hits: int = 2,  # de {EBIT>0, CFO>0, FCF>0}
+                             profit_floor_min_hits: int = 2,
                              max_net_issuance: float = 0.03,
                              max_asset_growth: float = 0.20,
                              max_accruals_ta: float = 0.10,
-                             max_netdebt_ebitda: float = 3.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+                             max_netdebt_ebitda: float = 3.0) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Robustez:
-      - Si falta alguna columna esperada, crea una Serie NaN alineada.
-      - Convierte a numérico antes de comparar.
-    Devuelve (subset_que_pasa, diagnóstico_con_flags).
+      - Columnas faltantes -> Serie NaN
+      - Conversión a numérico antes de comparar
+    Devuelve (subset_que_pasa, diagnóstico_completo_con_flags).
     """
     d = df.copy()
 
     def col(name: str) -> pd.Series:
         if name in d.columns:
             return pd.to_numeric(d[name], errors="coerce")
-        # columna faltante → Serie NaN alineada
         return pd.Series(np.nan, index=d.index, dtype="float64")
 
-    # Pisos de rentabilidad (TTM)
     ebit = col("ebit_ttm")
     cfo  = col("cfo_ttm")
     fcf  = col("fcf_ttm")
@@ -368,7 +458,6 @@ def apply_quality_guardrails(df: pd.DataFrame,
                        fcf_ok.fillna(False).astype(int)
     profit_pass = (d["profit_hits"] >= int(profit_floor_min_hits)) if require_profit_floor else pd.Series(True, index=d.index)
 
-    # Otros guardrails
     net_issuance   = col("net_issuance")
     asset_growth   = col("asset_growth")
     accruals_ta    = col("accruals_ta")
@@ -377,7 +466,6 @@ def apply_quality_guardrails(df: pd.DataFrame,
     issuance_pass = (net_issuance.fillna(0) <= float(max_net_issuance))
     asset_pass    = (asset_growth.abs() <= float(max_asset_growth))
     accruals_pass = (accruals_ta.abs() <= float(max_accruals_ta))
-    # Si no hay dato de deuda, no penalizamos (pasa)
     lev_pass      = (netdebt_ebitda.fillna(0) <= float(max_netdebt_ebitda)) | netdebt_ebitda.isna()
 
     mask = profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
@@ -390,5 +478,3 @@ def apply_quality_guardrails(df: pd.DataFrame,
     d["guard_all"]      = mask
 
     return d[mask].copy(), d
-
-
