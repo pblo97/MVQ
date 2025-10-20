@@ -187,6 +187,7 @@ def build_vfq_scores(df_base: pd.DataFrame, df_fund: pd.DataFrame) -> pd.DataFra
       - fcf_yield / inv_ev_ebitda / gross_profitability
       - ValueScore, QualityScore, VFQ y VFQ_pct_sector
       - coverage_count (nº de métricas VFQ no nulas)
+    Robusto a columnas faltantes.
     """
     if df_base is None or df_base.empty:
         return pd.DataFrame()
@@ -196,42 +197,37 @@ def build_vfq_scores(df_base: pd.DataFrame, df_fund: pd.DataFrame) -> pd.DataFra
         if c not in dfb.columns:
             dfb[c] = np.nan if c in ("marketCap", "price") else ""
 
-    # Merge
-    dff = df_fund.copy() if df_fund is not None else pd.DataFrame(columns=["symbol"])
+    dff = df_fund.copy() if (df_fund is not None and not df_fund.empty) else pd.DataFrame(columns=["symbol"])
     df = dfb.merge(dff, on="symbol", how="left")
 
-    # Asegurar derivadas si no vinieron ya calculadas
-    if "inv_ev_ebitda" not in df.columns:
-        df["inv_ev_ebitda"] = np.where(pd.to_numeric(df.get("evToEbitda"), errors="coerce").replace(0, np.nan).notna(),
-                                       1.0 / pd.to_numeric(df.get("evToEbitda"), errors="coerce").replace(0, np.nan),
-                                       np.nan)
+    # Series numéricas seguras
+    ev   = _num_or_nan(df, "evToEbitda")
+    mcap = _num_or_nan(df, "marketCap")
+    fcf  = _num_or_nan(df, "fcf_ttm")
+    gp   = _num_or_nan(df, "grossProfitTTM")
+    ta   = _num_or_nan(df, "totalAssetsTTM")
 
-    if "fcf_yield" not in df.columns:
-        mcap = pd.to_numeric(df.get("marketCap"), errors="coerce")
-        fcf  = pd.to_numeric(df.get("fcf_ttm"), errors="coerce")
-        df["fcf_yield"] = np.where((mcap.notna()) & (mcap != 0) & fcf.notna(), fcf / mcap, np.nan)
+    # Derivadas VFQ (resistentes a 0/NaN)
+    ev_nonzero = ev.replace(0, np.nan)
+    df["inv_ev_ebitda"] = np.where(ev_nonzero.notna(), 1.0 / ev_nonzero, np.nan)
+    df["fcf_yield"] = np.where((mcap.notna()) & (mcap != 0) & fcf.notna(), fcf / mcap, np.nan)
+    df["gross_profitability"] = np.where((ta.notna()) & (ta != 0) & gp.notna(), gp / ta, np.nan)
 
-    if "gross_profitability" not in df.columns:
-        gp = pd.to_numeric(df.get("grossProfitTTM"), errors="coerce")
-        ta = pd.to_numeric(df.get("totalAssetsTTM"), errors="coerce")
-        df["gross_profitability"] = np.where((ta.notna()) & (ta != 0) & gp.notna(), gp / ta, np.nan)
-
-    # Winsorizar métricas usadas
+    # Winsorizar variables usadas
     for c in ["fcf_yield", "inv_ev_ebitda", "gross_profitability", "roic", "roa", "netMargin"]:
         if c in df.columns:
             df[c] = _winsorize(pd.to_numeric(df[c], errors="coerce"), 0.01)
 
-    # Coverage & size bucket
-    fields = ["fcf_yield", "inv_ev_ebitda", "gross_profitability", "roic", "roa", "netMargin"]
-    df["coverage_count"] = df[fields].notna().sum(axis=1)
+    # Cobertura VFQ
+    vfq_cols = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df.columns]
+    df["coverage_count"] = df[vfq_cols].notna().sum(axis=1) if vfq_cols else 0
 
-    # Buckets de tamaño por marketCap (terciles) si hay
+    # Buckets de tamaño
     if "marketCap" in df.columns:
         r = df["marketCap"].rank(method="first", na_option="keep")
         try:
             df["size_bucket"] = pd.qcut(r, 3, labels=False, duplicates="drop")
         except Exception:
-            # fallback simple 0/1/2 por percentil
             pct = r / r.max() if r.max() and r.max() > 0 else r
             df["size_bucket"] = np.select([pct <= 0.33, pct <= 0.66, pct > 0.66], [0, 1, 2], default=np.nan)
     else:
@@ -240,29 +236,32 @@ def build_vfq_scores(df_base: pd.DataFrame, df_fund: pd.DataFrame) -> pd.DataFra
     df["sector"] = df["sector"].fillna("Unknown").astype(str)
     grp = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
 
-    # Ranks Value / Quality
+    # Ranking por grupo (si existen columnas)
     def _rank_by_group(s: pd.Series, ascending: bool, group: pd.Series) -> pd.Series:
         return s.groupby(group).rank(method="average", ascending=ascending, na_option="bottom")
 
-    val_ranks = []
-    for c in ["fcf_yield", "inv_ev_ebitda"]:
-        if c in df.columns:
-            val_ranks.append(_rank_by_group(df[c], ascending=False, group=grp))
-    df["ValueScore"] = pd.concat(val_ranks, axis=1).mean(axis=1) if val_ranks else np.nan
+    val_inputs = [c for c in ["fcf_yield","inv_ev_ebitda"] if c in df.columns]
+    q_inputs   = [c for c in ["gross_profitability","roic","roa","netMargin"] if c in df.columns]
 
-    q_ranks = []
-    for c in ["gross_profitability", "roic", "roa", "netMargin"]:
-        if c in df.columns:
-            q_ranks.append(_rank_by_group(df[c], ascending=False, group=grp))
-    df["QualityScore"] = pd.concat(q_ranks, axis=1).mean(axis=1) if q_ranks else np.nan
+    if val_inputs:
+        val_ranks = [_rank_by_group(df[c], ascending=False, group=grp) for c in val_inputs]
+        df["ValueScore"] = pd.concat(val_ranks, axis=1).mean(axis=1)
+    else:
+        df["ValueScore"] = np.nan
+
+    if q_inputs:
+        q_ranks = [_rank_by_group(df[c], ascending=False, group=grp) for c in q_inputs]
+        df["QualityScore"] = pd.concat(q_ranks, axis=1).mean(axis=1)
+    else:
+        df["QualityScore"] = np.nan
 
     df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1)
     df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
 
     # Orden amigable
-    cols = ["symbol", "sector", "marketCap", "coverage_count",
-            "fcf_yield", "inv_ev_ebitda", "gross_profitability", "roic", "roa", "netMargin",
-            "ValueScore", "QualityScore", "VFQ", "VFQ_pct_sector"]
+    cols = ["symbol","sector","marketCap","coverage_count",
+            "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin",
+            "ValueScore","QualityScore","VFQ","VFQ_pct_sector"]
     cols = [c for c in cols if c in df.columns]
     return df[cols + [c for c in df.columns if c not in cols]].copy()
 
