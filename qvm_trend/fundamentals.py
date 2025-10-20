@@ -419,6 +419,12 @@ def download_guardrails_batch(symbols: List[str],
     return df
 
 
+# helper: devuelve serie numérica; si no existe la columna, crea NaN
+def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
+    if col not in d.columns:
+        return pd.Series(np.nan, index=d.index)
+    return pd.to_numeric(d[col], errors="coerce")
+
 def apply_quality_guardrails(df: pd.DataFrame,
                              require_profit_floor: bool = True,
                              profit_floor_min_hits: int = 2,   # de {EBIT>0, CFO>0, FCF>0}
@@ -430,28 +436,39 @@ def apply_quality_guardrails(df: pd.DataFrame,
     Aplica umbrales de guardrails y devuelve:
       - df_filtrado (cumplen todos)
       - df_diag (con flags/diagnóstico)
+    Robusto a columnas faltantes.
     """
     d = df.copy()
 
-    # Coerción numérica segura
-    for c in ["ebit_ttm", "cfo_ttm", "fcf_ttm", "net_issuance", "asset_growth", "accruals_ta", "netdebt_ebitda"]:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
+    # Asegurar columnas como series numéricas (o NaN)
+    ebit = _num_or_nan(d, "ebit_ttm")
+    cfo  = _num_or_nan(d, "cfo_ttm")
+    fcf  = _num_or_nan(d, "fcf_ttm")
+    neti = _num_or_nan(d, "net_issuance")
+    ag   = _num_or_nan(d, "asset_growth")
+    acc  = _num_or_nan(d, "accruals_ta")
+    ndeb = _num_or_nan(d, "netdebt_ebitda")
 
-    # Profit floor
-    ebit_ok = (d.get("ebit_ttm") > 0)
-    cfo_ok  = (d.get("cfo_ttm")  > 0)
-    fcf_ok  = (d.get("fcf_ttm")  > 0)
+    # Profit floor (series booleanas)
+    ebit_ok = (ebit > 0)
+    cfo_ok  = (cfo  > 0)
+    fcf_ok  = (fcf  > 0)
     d["profit_hits"] = ebit_ok.astype(int) + cfo_ok.astype(int) + fcf_ok.astype(int)
-    profit_pass = (d["profit_hits"] >= int(profit_floor_min_hits)) if require_profit_floor else True
+    if require_profit_floor:
+        profit_pass = (d["profit_hits"] >= int(profit_floor_min_hits))
+    else:
+        profit_pass = pd.Series(True, index=d.index)
 
-    # Otros guardrails
-    issuance_pass = (d.get("net_issuance").fillna(0) <= float(max_net_issuance))
-    asset_pass    = (d.get("asset_growth").abs() <= float(max_asset_growth))
-    accruals_pass = (d.get("accruals_ta").abs() <= float(max_accruals_ta))
-    lev_pass      = (d.get("netdebt_ebitda").fillna(0) <= float(max_netdebt_ebitda)) | d.get("netdebt_ebitda").isna()
+    # Otros guardrails (NaN-safe)
+    issuance_pass = (neti.fillna(0) <= float(max_net_issuance))
+    asset_pass    = (ag.abs()      <= float(max_asset_growth))
+    accruals_pass = (acc.abs()     <= float(max_accruals_ta))
+    # Permitimos NaN en netdebt/EBITDA como "no bloquear"
+    lev_pass      = (ndeb.fillna(0) <= float(max_netdebt_ebitda)) | ndeb.isna()
 
     mask = profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
+
+    # flags de diagnóstico (todas series del mismo tamaño)
     d["guard_profit"]   = profit_pass
     d["guard_issuance"] = issuance_pass
     d["guard_assets"]   = asset_pass
