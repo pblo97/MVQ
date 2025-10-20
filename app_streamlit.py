@@ -69,8 +69,9 @@ df_vfq_filt = df_vfq[
     (df_vfq["VFQ_pct_sector"] >= min_vfq_pct)
 ].copy()
 st.write(f"Elegibles por VFQ & cobertura: **{len(df_vfq_filt)}**")
-st.dataframe(df_vfq_filt[["symbol","sector","marketCap_unified","coverage_count","ValueScore","QualityScore","VFQ","VFQ_pct_sector"]]
-             .sort_values(["VFQ","coverage_count"], ascending=[False,False]), use_container_width=True)
+st.dataframe(
+    df_vfq_filt[["symbol","sector_unified","marketCap_unified","coverage_count",
+                 "ValueScore","QualityScore","VFQ","VFQ_pct_sector"]].sort_values(["VFQ","coverage_count"], ascending=[False,False]),use_container_width=True)
 
 # 3) Precios + tendencia (cache de panel)
 st.subheader("3) Tendencia (MA200 OR Mom 12–1)")
@@ -112,6 +113,7 @@ if enriched is None or enriched.empty:
     st.info("No hay señales con los umbrales actuales.")
 else:
     merged = df_vfq[["symbol","ValueScore","QualityScore","VFQ","VFQ_pct_sector"]].merge(enriched, on="symbol", how="right")
+
     st.dataframe(merged.sort_values(["EntrySignal","BreakoutScore","VFQ"], ascending=[False,False,False]),
                  use_container_width=True)
 

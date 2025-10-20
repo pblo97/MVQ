@@ -89,49 +89,82 @@ def winsorize(s: pd.Series, p: float = 0.01) -> pd.Series:
     lo, hi = s.quantile(p), s.quantile(1-p)
     return s.clip(lo, hi)
 
+# qvm_trend/fundamentals.py  (reemplazo de build_vfq_scores + helper)
+
+def coalesce_first(df: pd.DataFrame, candidates: list[str], new_col: str, to_numeric: bool=False):
+    """
+    Toma las columnas en 'candidates' (si existen), hace forward-first-non-null por fila
+    y la guarda en 'new_col'. Si to_numeric=True, coerciona a numérico.
+    """
+    cols = [c for c in candidates if c in df.columns]
+    if not cols:
+        df[new_col] = pd.Series([None]*len(df), index=df.index)
+        return df
+    buf = pd.concat([df[c] for c in cols], axis=1)
+    out = buf.bfill(axis=1).iloc[:,0]
+    if to_numeric:
+        out = pd.to_numeric(out, errors="coerce")
+    df[new_col] = out
+    return df
+
+
 def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame, size_buckets: int = 3) -> pd.DataFrame:
     """
     Une universo (sector, marketCap) + fundamentales; calcula ValueScore, QualityScore y VFQ.
+    Robusto a columnas duplicadas: sector_x/sector_y, marketCap_x/marketCap_y.
     """
-    dfu = df_universe[["symbol","sector","marketCap"]].copy()
+    # Mezcla universo + fundas
+    dfu = df_universe.copy()
     dff = df_fund.copy()
     df = dfu.merge(dff, on="symbol", how="left")
 
-    # market cap unificado
-    df["marketCap_unified"] = pd.to_numeric(df["marketCap"], errors="coerce")
-    # buckets por tamaño
+    # Sector unificado (sector, sector_x, sector_y)
+    df = coalesce_first(df, ["sector", "sector_x", "sector_y"], "sector_unified", to_numeric=False)
+    # MarketCap unificado (marketCap, marketCap_x, marketCap_y, marketCap_profile)
+    df = coalesce_first(df, ["marketCap", "marketCap_x", "marketCap_y", "marketCap_profile"], 
+                        "marketCap_unified", to_numeric=True)
+
+    # Buckets por tamaño (tolerante si muchos NaN)
     r = df["marketCap_unified"].rank(method="first")
     try:
         df["size_bucket"] = pd.qcut(r, size_buckets, labels=False, duplicates="drop")
     except Exception:
         df["size_bucket"] = 1
 
-    # winsor
+    # Winsor
     for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"]:
         if c in df.columns:
             df[c] = winsorize(pd.to_numeric(df[c], errors="coerce"), 0.01)
 
-    # ranks intra (sector x size_bucket)
-    grp = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
+    # Grupo: sector × tamaño (usa el sector_unified)
+    grp = df["sector_unified"].astype(str) + "|" + df["size_bucket"].astype(str)
 
-    def _rank(s, asc=False): 
+    def _rank(s, asc=False):
         return s.groupby(grp).rank(method="average", ascending=asc, na_option="bottom")
 
-    val = pd.concat([
-        _rank(df["fcf_yield"], asc=False),
-        _rank(df["inv_ev_ebitda"], asc=False),
-    ], axis=1).mean(axis=1)
+    # Value: FCF yield, 1/EV/EBITDA
+    v_parts = []
+    if "fcf_yield" in df.columns:      v_parts.append(_rank(df["fcf_yield"], asc=False))
+    if "inv_ev_ebitda" in df.columns:  v_parts.append(_rank(df["inv_ev_ebitda"], asc=False))
+    df["ValueScore"] = pd.concat(v_parts, axis=1).mean(axis=1) if v_parts else np.nan
 
-    qlt = pd.concat([
-        _rank(df["gross_profitability"], asc=False),
-        _rank(df["roic"], asc=False),
-        _rank(df["roa"], asc=False),
-        _rank(df["netMargin"], asc=False),
-    ], axis=1).mean(axis=1)
+    # Quality: GrossProfitability, ROIC, ROA, NetMargin
+    q_parts = []
+    for c in ["gross_profitability","roic","roa","netMargin"]:
+        if c in df.columns:
+            q_parts.append(_rank(df[c], asc=False))
+    df["QualityScore"] = pd.concat(q_parts, axis=1).mean(axis=1) if q_parts else np.nan
 
-    df["ValueScore"] = val
-    df["QualityScore"] = qlt
-    df["VFQ"] = pd.concat([val, qlt], axis=1).mean(axis=1)
-    df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
+    df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1)
+    # percentil intra-sector (con el sector_unified)
+    df["VFQ_pct_sector"] = df.groupby("sector_unified")["VFQ"].rank(pct=True)
 
-    return df
+    # Selección de columnas de salida amigable
+    keep = ["symbol",
+            "sector_unified","marketCap_unified",
+            "coverage_count",
+            "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin",
+            "ValueScore","QualityScore","VFQ","VFQ_pct_sector"]
+    keep = [c for c in keep if c in df.columns]
+    return df[keep]
+
