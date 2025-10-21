@@ -145,6 +145,8 @@ except Exception as e:
     st.error(f"Error en guardrails: {e}")
     st.stop()
 
+
+
 # ======================== Paso 3: Fundamentals VFQ ========================
 st.header("Fundamentals mínimos (VFQ) + Scores")
 try:
@@ -181,6 +183,23 @@ try:
 except Exception as e:
     st.error(f"Error en VFQ: {e}")
     st.stop()
+
+
+# Cobertura por columna (rápido)
+st.caption("Cobertura (no nulos) fundamentals")
+try:
+    cov = df_fund[["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm","grossProfitTTM","totalAssetsTTM","roic","roa","netMargin"]].notna().sum().sort_values(ascending=False)
+    st.write(cov.to_frame("count").T)
+except Exception:
+    pass
+
+# Mostrar filas con error si existieran
+if "__err_fund" in df_fund.columns:
+    badf = df_fund[df_fund["__err_fund"].notna()][["symbol","__err_fund"]]
+    if not badf.empty:
+        st.warning("Errores al descargar fundamentals (primeros):")
+        st.dataframe(badf.head(50), width="stretch")
+
 
 # ======================== Paso 4: Tendencia & Breakout ========================
 st.header("4) Tendencia (MA200 / Mom 12–1) + Señal de Breakout")

@@ -1,10 +1,12 @@
 # qvm_trend/fundamentals.py
 from __future__ import annotations
+from typing import List, Dict, Any
 
 import math
 from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
+
 
 # HTTP común (robusto, con rate limit/backoff) provisto en data_io.py
 from .data_io import _http_get
@@ -57,104 +59,142 @@ def _winsorize(s: pd.Series, p: float = 0.01) -> pd.Series:
 # FUNDAMENTALES (set mínimo) → para VFQ
 # ======================================================================================
 
-def _fetch_min_battle_fmp(symbol: str, market_cap_hint: float | None = None) -> dict:
-    """
-    Descarga un set mínimo para construir VFQ con múltiples fallbacks:
-      - evToEbitda (TTM → annual)
-      - fcf_ttm (TTM → annual cash-flow)
-      - grossProfit / totalAssets (TTM → annual income/balance)
-      - ratios TTM (ROIC, ROA, netMargin) → annual ratios si faltan
-      - sharesOutstanding, marketCap (con fallback a /market-capitalization)
-    """
-    sym = (symbol or "").strip().upper()
-    out = {"symbol": sym}
-
-    # --- Ratios TTM: ROIC/ROA/netMargin
+def _num(x):
     try:
-        rttm = _http_get(f"https://financialmodelingprep.com/api/v3/ratios-ttm/{sym}")
-        r0 = _first_obj(rttm)
-        out["roa"]       = _safe_float(r0.get("returnOnAssetsTTM"))
-        out["roic"]      = _safe_float(r0.get("returnOnCapitalEmployedTTM") or r0.get("returnOnInvestedCapitalTTM"))
-        out["netMargin"] = _safe_float(r0.get("netProfitMarginTTM"))
+        return float(x)
     except Exception:
-        pass
-    # Fallback ratios annual
-    if any(out.get(k) is None for k in ["roa", "roic", "netMargin"]):
-        try:
-            ra = _http_get(f"https://financialmodelingprep.com/api/v3/ratios/{sym}", params={"period": "annual", "limit": 1})
-            r1 = _first_obj(ra)
-            out["roa"]       = out.get("roa")       or _safe_float(r1.get("returnOnAssets"))
-            out["roic"]      = out.get("roic")      or _safe_float(r1.get("returnOnCapitalEmployed"))
-            out["netMargin"] = out.get("netMargin") or _safe_float(r1.get("netProfitMargin"))
-        except Exception:
-            pass
+        return None
 
-    # --- Key-metrics TTM: EV/EBITDA, FCF, GrossProfit, TotalAssets, Shares, MarketCap
-    evToEbitda = fcf_ttm = gp_ttm = ta_ttm = shares = mcap = None
+def _fetch_min_battle_fmp(symbol: str, market_cap_hint: float | None = None) -> Dict[str, Any]:
+    """
+    Descarga el set mínimo y normaliza nombres:
+      evToEbitda, fcf_ttm, cfo_ttm, ebit_ttm, grossProfitTTM, totalAssetsTTM,
+      roic, roa, netMargin, marketCap (si hay/ hint)
+    Usa TTM y cae en annual si falta.
+    """
+    s = symbol.strip().upper()
+    out: Dict[str, Any] = {"symbol": s}
+
+    # --- KEY METRICS TTM (ev/ebitda, grossProfitTTM, totalAssetsTTM) ---
     try:
-        kttm = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{sym}")
-        k0 = _first_obj(kttm)
-        evToEbitda = _safe_float(k0.get("enterpriseValueOverEBITDATTM"))
-        fcf_ttm    = _safe_float(k0.get("freeCashFlowTTM"))
-        gp_ttm     = _safe_float(k0.get("grossProfitTTM"))
-        ta_ttm     = _safe_float(k0.get("totalAssetsTTM"))
-        shares     = _safe_float(k0.get("sharesOutstanding"))
-        mcap       = _safe_float(k0.get("marketCap"))
+        j = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{s}")
+        kmttm = j[0] if isinstance(j, list) and j else (j if isinstance(j, dict) else {})
     except Exception:
-        pass
+        kmttm = {}
 
-    # Fallback key-metrics annual
-    if any(v is None for v in [evToEbitda, fcf_ttm, gp_ttm, ta_ttm, mcap, shares]):
+    # --- RATIOS TTM (roic/roa/netMargin) ---
+    try:
+        j = _http_get(f"https://financialmodelingprep.com/api/v3/ratios-ttm/{s}")
+        rttm = j[0] if isinstance(j, list) and j else (j if isinstance(j, dict) else {})
+    except Exception:
+        rttm = {}
+
+    # --- CASH-FLOW TTM (CFO/FCF) ---
+    try:
+        cfttm = _http_get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement-ttm/{s}")
+        cfttm = cfttm if isinstance(cfttm, dict) else {}
+    except Exception:
+        cfttm = {}
+
+    # --- INCOME TTM (EBIT aprox) ---
+    try:
+        incttm = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement-ttm/{s}")
+        incttm = incttm if isinstance(incttm, dict) else {}
+    except Exception:
+        incttm = {}
+
+    # Map TTM → normalizados
+    evttm  = _num(kmttm.get("enterpriseValueOverEBITDATTM"))
+    gpttm  = _num(kmttm.get("grossProfitTTM"))
+    tattm  = _num(kmttm.get("totalAssetsTTM"))
+    fcf_t  = _num(cfttm.get("freeCashFlowTTM"))
+    cfo_t  = _num(cfttm.get("netCashProvidedByOperatingActivitiesTTM"))
+    ebit_t = _num(incttm.get("ebitTTM") or incttm.get("operatingIncomeTTM"))
+
+    roic_t = _num(rttm.get("returnOnCapitalEmployedTTM") or rttm.get("returnOnInvestedCapitalTTM"))
+    roa_t  = _num(rttm.get("returnOnAssetsTTM"))
+    nmar_t = _num(rttm.get("netProfitMarginTTM"))
+
+    out["evToEbitda"]        = evttm
+    out["grossProfitTTM"]    = gpttm
+    out["totalAssetsTTM"]    = tattm
+    out["fcf_ttm"]           = fcf_t
+    out["cfo_ttm"]           = cfo_t
+    out["ebit_ttm"]          = ebit_t
+    out["roic"]              = roic_t
+    out["roa"]               = roa_t
+    out["netMargin"]         = nmar_t
+    out["marketCap"]         = _num(kmttm.get("marketCap")) or (market_cap_hint if market_cap_hint else None)
+
+    # --- Flags de fuente (útiles para debug) ---
+    out["__src_ev"]   = "ttm" if evttm is not None else None
+    out["__src_gp"]   = "ttm" if gpttm is not None else None
+    out["__src_ta"]   = "ttm" if tattm is not None else None
+    out["__src_fcf"]  = "ttm" if fcf_t is not None else None
+    out["__src_cfo"]  = "ttm" if cfo_t is not None else None
+    out["__src_ebit"] = "ttm" if ebit_t is not None else None
+    out["__src_roic"] = "ttm" if roic_t is not None else None
+    out["__src_roa"]  = "ttm" if roa_t is not None else None
+    out["__src_nmar"] = "ttm" if nmar_t is not None else None
+
+    # -------- Fallback ANUAL si falta algo crítico --------
+    need_annual = any(
+        x is None for x in [out["evToEbitda"], out["grossProfitTTM"], out["totalAssetsTTM"],
+                            out["fcf_ttm"], out["cfo_ttm"], out["ebit_ttm"], out["roic"], out["roa"], out["netMargin"]]
+    )
+
+    if need_annual:
+        # ANNUAL key-metrics (ev/ebitda, grossProfit, totalAssets, marketCap)
         try:
-            km1 = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics/{sym}", params={"period": "annual", "limit": 1})
-            z = _first_obj(km1)
-            evToEbitda = evToEbitda or _safe_float(z.get("enterpriseValueOverEBITDA"))
-            fcf_ttm    = fcf_ttm    or _safe_float(z.get("freeCashFlow"))
-            gp_ttm     = gp_ttm     or _safe_float(z.get("grossProfit"))
-            ta_ttm     = ta_ttm     or _safe_float(z.get("totalAssets"))
-            shares     = shares     or _safe_float(z.get("sharesOutstanding"))
-            mcap       = mcap       or _safe_float(z.get("marketCap"))
+            j = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics/{s}", params={"period":"annual","limit":4})
+            km = j[0] if isinstance(j, list) and j else {}
         except Exception:
-            pass
+            km = {}
+        if out["evToEbitda"]     is None: out["evToEbitda"]     = _num(km.get("enterpriseValueOverEBITDA"))
+        if out["grossProfitTTM"] is None: out["grossProfitTTM"] = _num(km.get("grossProfit"))
+        if out["totalAssetsTTM"] is None: out["totalAssetsTTM"] = _num(km.get("totalAssets"))
+        if out["marketCap"]      is None: out["marketCap"]      = _num(km.get("marketCap")) or (market_cap_hint if market_cap_hint else None)
 
-    # Fallback final para grossProfit/totalAssets desde income/balance anual
-    if gp_ttm is None or ta_ttm is None:
+        # ANNUAL ratios (roic/roa/net margin)
         try:
-            inc_a = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement/{sym}", params={"period": "annual", "limit": 1})
-            bal_a = _http_get(f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{sym}", params={"period": "annual", "limit": 1})
-            i0 = _first_obj(inc_a); b0 = _first_obj(bal_a)
-            gp_ttm = gp_ttm or _safe_float(i0.get("grossProfit"))
-            ta_ttm = ta_ttm or _safe_float(b0.get("totalAssets"))
+            j = _http_get(f"https://financialmodelingprep.com/api/v3/ratios/{s}", params={"period":"annual","limit":4})
+            rr = j[0] if isinstance(j, list) and j else {}
         except Exception:
-            pass
+            rr = {}
+        if out["roic"]      is None: out["roic"]      = _num(rr.get("returnOnCapitalEmployed") or rr.get("returnOnInvestedCapital"))
+        if out["roa"]       is None: out["roa"]       = _num(rr.get("returnOnAssets"))
+        if out["netMargin"] is None: out["netMargin"] = _num(rr.get("netProfitMargin"))
 
-    # Market cap fallback
-    if not mcap:
-        try:
-            mc = _http_get(f"https://financialmodelingprep.com/api/v3/market-capitalization/{sym}", params={"limit": 1})
-            m0 = _first_obj(mc)
-            mcap = _safe_float(m0.get("marketCap"))
-        except Exception:
-            pass
-    if not mcap and market_cap_hint:
-        mcap = float(market_cap_hint)
+        # ANNUAL cash-flow (CFO/FCF)
+        if out["cfo_ttm"] is None or out["fcf_ttm"] is None:
+            try:
+                cf = _http_get(f"https://financialmodelingprep.com/api/v3/cash-flow-statement/{s}", params={"period":"annual","limit":1})
+                cf0 = cf[0] if isinstance(cf, list) and cf else {}
+            except Exception:
+                cf0 = {}
+            if out["cfo_ttm"] is None: out["cfo_ttm"] = _num(cf0.get("netCashProvidedByOperatingActivities"))
+            if out["fcf_ttm"] is None: out["fcf_ttm"] = _num(cf0.get("freeCashFlow"))
 
-    # Output crudo
-    out["evToEbitda"]        = evToEbitda
-    out["fcf_ttm"]           = fcf_ttm
-    out["grossProfitTTM"]    = gp_ttm
-    out["totalAssetsTTM"]    = ta_ttm
-    out["sharesOutstanding"] = shares
-    out["marketCap"]         = mcap
+        # ANNUAL income (EBIT)
+        if out["ebit_ttm"] is None:
+            try:
+                inc = _http_get(f"https://financialmodelingprep.com/api/v3/income-statement/{s}", params={"period":"annual","limit":1})
+                inc0 = inc[0] if isinstance(inc, list) and inc else {}
+            except Exception:
+                inc0 = {}
+            out["ebit_ttm"] = _num(inc0.get("ebit") or inc0.get("operatingIncome"))
 
-    # Derivados VFQ
-    out["inv_ev_ebitda"]        = (1.0 / evToEbitda) if (evToEbitda not in (None, 0)) else None
-    out["fcf_yield"]            = (fcf_ttm / mcap)   if (fcf_ttm is not None and mcap not in (None, 0)) else None
-    out["gross_profitability"]  = (gp_ttm / ta_ttm)  if (gp_ttm is not None and ta_ttm not in (None, 0)) else None
     return out
 
 
-def download_fundamentals(symbols: List[str], market_caps=None, cache_key=None, force=False) -> pd.DataFrame:
+def download_fundamentals(symbols: List[str],
+                          market_caps: Dict[str, float] | None = None,
+                          cache_key: str | None = None,
+                          force: bool = False) -> pd.DataFrame:
+    """
+    Batch mínimo robusto; añade __err_fund si algo revienta.
+    """
+    from .cache_io import load_df, save_df  # lazy import por si no está
     key = f"fund_{cache_key}" if cache_key else None
     if key and not force:
         dfc = load_df(key)
@@ -168,8 +208,13 @@ def download_fundamentals(symbols: List[str], market_caps=None, cache_key=None, 
             rows.append(_fetch_min_battle_fmp(s, market_cap_hint=mc_map.get(s)))
         except Exception as e:
             rows.append({"symbol": s, "__err_fund": str(e)[:180]})
+
     df = pd.DataFrame(rows).drop_duplicates("symbol")
-    if key: save_df(df, key)
+    if key:
+        try:
+            save_df(df, key)
+        except Exception:
+            pass
     return df
 
 def download_guardrails_batch(symbols: List[str], cache_key: str | None = None, force: bool = False) -> pd.DataFrame:
