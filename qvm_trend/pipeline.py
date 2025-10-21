@@ -280,3 +280,4 @@ def enrich_with_breakout(
         })
 
     return pd.DataFrame(rows).drop_duplicates("symbol", keep="last")
+

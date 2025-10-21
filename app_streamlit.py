@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 import numpy as np
 import streamlit as st
-from qvm_trend.montecarlo import mc_bootstrap_trades
+
 # ------------------ Imports del proyecto ------------------
 try:
     from qvm_trend.data_io import (
@@ -337,53 +337,49 @@ if st.button("Guardar tablas (cache_io)"):
         st.success("Tablas guardadas en cache_io.")
     except Exception as e:
         st.error(f"No se pudo guardar: {e}")
- #======================== Paso 6: Monte Carlo (robustez) ========================
-st.header("6) Monte Carlo (robustez)")
+ #======================== Paso 6: Resumen ========================
+def perf_summary_from_returns(rets: pd.Series, periods_per_year: int) -> dict:
+    r = rets.dropna().astype(float)
+    if r.empty:
+        return {}
+    eq = (1 + r).cumprod()
+    yrs = len(r) / periods_per_year
+    cagr = eq.iloc[-1]**(1/yrs) - 1 if yrs > 0 else np.nan
+    vol = r.std() * np.sqrt(periods_per_year) if r.std() > 0 else np.nan
+    sharpe = (r.mean()*periods_per_year) / r.std() if r.std() > 0 else np.nan
+    dd = eq/eq.cummax() - 1
+    maxdd = dd.min()
+    hit = (r > 0).mean()
+    avg_win = r[r > 0].mean() if (r > 0).any() else np.nan
+    avg_loss = r[r < 0].mean() if (r < 0).any() else np.nan
+    payoff = (avg_win/abs(avg_loss)) if (avg_win and avg_loss) else np.nan
+    expct = (hit*avg_win + (1-hit)*avg_loss) if (not np.isnan(hit) and avg_win is not None and avg_loss is not None) else np.nan
+    return {
+        "CAGR": float(cagr), "Vol_anual": float(vol), "Sharpe": float(sharpe),
+        "MaxDD": float(maxdd), "HitRate": float(hit), "AvgWin": float(avg_win),
+        "AvgLoss": float(avg_loss), "Payoff": float(payoff), "Expectancy": float(expct),
+        "Periodos": int(len(r))
+    }
+st.header("5) Resumen de performance (sin Monte Carlo)")
+rets_any = None
+for cand in ["rets2_m","rets2_q","rets"]:
+    if cand in locals() and isinstance(locals()[cand], pd.Series) and len(locals()[cand])>0:
+        rets_any = locals()[cand].dropna().astype(float); break
 
-# 1) Localiza una serie de retornos del backtest (usa la que tengas)
-#    - rets2_m: mensual (v2)
-#    - rets2_q: trimestral (v2)
-#    - rets:    mensual (v1)
-trade_R = None
-for cand in ["rets2_m", "rets2_q", "rets"]:
-    if cand in locals() and isinstance(locals()[cand], (pd.Series, pd.DataFrame)):
-        s = locals()[cand]
-        if isinstance(s, pd.DataFrame) and s.shape[1] == 1:
-            s = s.iloc[:, 0]
-        if isinstance(s, pd.Series) and len(s) > 0:
-            trade_R = s.dropna().astype(float)
-            break
-
-# 2) Fallback: si sólo tienes equity, derivar retornos
-if trade_R is None:
-    for cand_eq in ["eq2_m", "eq2_q", "eq"]:
-        if cand_eq in locals() and isinstance(locals()[cand_eq], pd.Series) and len(locals()[cand_eq]) > 1:
-            trade_R = locals()[cand_eq].pct_change().dropna().astype(float)
-            break
-
-if trade_R is None or len(trade_R) < 20:
-    st.info("Aún no hay suficientes retornos del backtest para Monte Carlo. Ejecuta un backtest o amplía el periodo.")
+if rets_any is None or len(rets_any) < 6:
+    st.info("Necesitas un backtest con al menos ~6 periodos para ver el resumen.")
 else:
-    # Controles de simulación
-    sims = st.slider("N° simulaciones", 1000, 20000, 5000, 500)
-    block = st.slider("Tamaño de bloque (conservar rachas)", 3, 20, 8, 1)
-
-    # Corre Monte Carlo
-    mc = mc_bootstrap_trades(trade_R, n_sims=sims, block=block, seed=42)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("CAGR p50", f"{mc['CAGR_p50']*100:.2f}%")
-        st.metric("CAGR p10", f"{mc['CAGR_p10']*100:.2f}%")
-        st.metric("CAGR p90", f"{mc['CAGR_p90']*100:.2f}%")
-    with col2:
-        st.metric("MaxDD p50", f"{mc['MaxDD_p50']*100:.1f}%")
-        st.metric("MaxDD p10", f"{mc['MaxDD_p10']*100:.1f}%")
-        st.metric("MaxDD p90", f"{mc['MaxDD_p90']*100:.1f}%")
-    with col3:
-        st.metric("Terminal p50 (×)", f"{mc['Terminal_p50']:.2f}")
-        st.metric("Terminal p10 (×)", f"{mc['Terminal_p10']:.2f}")
-        st.metric("Terminal p90 (×)", f"{mc['Terminal_p90']:.2f}")
-
-    # (Opcional) muestra JSON completo
-    with st.expander("Detalles Monte Carlo"):
-        st.json(mc)
+    k = 12 if rets_any.index.freqstr in ("M","ME") or len(rets_any)>30 else 4  # heurística
+    summ = perf_summary_from_returns(rets_any, periods_per_year=k)
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        st.metric("CAGR", f"{summ['CAGR']*100:.2f}%")
+        st.metric("Sharpe", f"{summ['Sharpe']:.2f}")
+        st.metric("Hit Rate", f"{summ['HitRate']*100:.1f}%")
+    with c2:
+        st.metric("Max Drawdown", f"{summ['MaxDD']*100:.1f}%")
+        st.metric("Payoff", f"{summ['Payoff']:.2f}")
+        st.metric("Expectancy", f"{summ['Expectancy']*100:.2f}%")
+    with c3:
+        st.metric("Vol anual", f"{summ['Vol_anual']*100:.1f}%")
+        st.metric("Periodos", f"{summ['Periodos']}")
