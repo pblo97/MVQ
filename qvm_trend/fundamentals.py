@@ -6,7 +6,7 @@ import math
 from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
-
+import time 
 
 # HTTP común (robusto, con rate limit/backoff) provisto en data_io.py
 from .data_io import _http_get
@@ -187,34 +187,65 @@ def _fetch_min_battle_fmp(symbol: str, market_cap_hint: float | None = None) -> 
     return out
 
 
+def _coverage_count(df: pd.DataFrame) -> int:
+    if df is None or df.empty: 
+        return 0
+    cols = [c for c in ["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm",
+                        "grossProfitTTM","totalAssetsTTM","roic","roa","netMargin"] if c in df.columns]
+    return int(df[cols].notna().sum(axis=1).sum()) if cols else 0
+
 def download_fundamentals(symbols: List[str],
                           market_caps: Dict[str, float] | None = None,
                           cache_key: str | None = None,
-                          force: bool = False) -> pd.DataFrame:
+                          force: bool = False,
+                          max_symbols_per_minute: int = 100) -> pd.DataFrame:
     """
-    Batch mínimo robusto; añade __err_fund si algo revienta.
+    Descarga mínimos de batalla para VFQ con:
+      - reintentos suaves y limitación de tasa
+      - evita cachear snapshots sin cobertura
     """
-    from .cache_io import load_df, save_df  # lazy import por si no está
+    from .cache_io import load_df, save_df  # lazy
     key = f"fund_{cache_key}" if cache_key else None
     if key and not force:
         dfc = load_df(key)
-        if dfc is not None:
+        if dfc is not None and not dfc.empty:
             return dfc
 
-    rows = []
+    rows, errs = [], 0
     mc_map = market_caps or {}
-    for s in symbols:
+    throttle = max(0.0, 60.0 / max(1, max_symbols_per_minute))
+    for i, s in enumerate(symbols):
+        # simple rate-limit
+        if i > 0 and throttle > 0:
+            time.sleep(throttle)
         try:
-            rows.append(_fetch_min_battle_fmp(s, market_cap_hint=mc_map.get(s)))
+            rec = _fetch_min_battle_fmp(s, market_cap_hint=mc_map.get(s))
+            rows.append(rec)
         except Exception as e:
+            errs += 1
             rows.append({"symbol": s, "__err_fund": str(e)[:180]})
 
     df = pd.DataFrame(rows).drop_duplicates("symbol")
-    if key:
-        try:
-            save_df(df, key)
-        except Exception:
-            pass
+
+    # Si literalmente no hay cobertura, intenta un segundo pase con 25 símbolos aleatorios
+    if _coverage_count(df) == 0 and len(symbols) > 0:
+        sample = list(pd.Series(symbols).drop_duplicates().sample(min(25, len(symbols)), random_state=42))
+        rows2 = []
+        for s in sample:
+            try:
+                rows2.append(_fetch_min_battle_fmp(s, market_cap_hint=mc_map.get(s)))
+                time.sleep(throttle)
+            except Exception as e:
+                rows2.append({"symbol": s, "__err_fund": str(e)[:180]})
+        df2 = pd.DataFrame(rows2).drop_duplicates("symbol")
+        # mergea lo que haya
+        df = df.set_index("symbol").combine_first(df2.set_index("symbol")).reset_index()
+
+    # NO guardes si sigue sin cobertura (evita “cachear vacío”)
+    if key and _coverage_count(df) > 0:
+        try: save_df(df, key)
+        except Exception: pass
+
     return df
 
 def download_guardrails_batch(symbols: List[str], cache_key: str | None = None, force: bool = False) -> pd.DataFrame:

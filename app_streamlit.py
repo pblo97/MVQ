@@ -158,6 +158,23 @@ try:
     mc_map = uni.set_index("symbol")["marketCap"].to_dict() if "marketCap" in uni.columns else {}
     df_fund = download_fundamentals(kept_syms, market_caps=mc_map, cache_key=cache_tag, force=force_fund)
 
+    # Diagnóstico de cobertura por columna
+    st.caption("Cobertura (no nulos) fundamentals")
+    try:
+        cols_cov = ["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm","grossProfitTTM","totalAssetsTTM","roic","roa","netMargin"]
+        cov = df_fund.reindex(columns=[c for c in cols_cov if c in df_fund.columns]).notna().sum().sort_values(ascending=False)
+        st.write(cov.to_frame("count").T)
+    except Exception:
+        pass
+
+    # Muestra ejemplos con datos (si hay)
+    non_null_any = df_fund.dropna(how="all", subset=[c for c in cols_cov if c in df_fund.columns])
+    if not non_null_any.empty:
+        st.dataframe(non_null_any.head(10), width="stretch")
+    else:
+        st.warning("⚠️ Aún sin cobertura en fundamentals. Prueba con Cache key nuevo y activa 'Refrescar fundamentals'. "
+                "Reduce el tamaño del screener (100–150) para evitar 429.")
+
     # Diagnóstico de errores de fundamentals
     if "__err_fund" in df_fund.columns:
         st.warning("Algunas descargas de fundamentals fallaron; mostrando columna __err_fund")
