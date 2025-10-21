@@ -221,19 +221,27 @@ if "__err_fund" in df_fund.columns:
 
 # ======================== Paso 4: Tendencia & Breakout ========================
 st.header("4) Tendencia (MA200 / Mom 12–1) + Señal de Breakout")
+
 try:
-    syms_vfq = df_vfq_sel["symbol"].tolist()
+    syms_vfq = df_vfq_sel["symbol"].dropna().astype(str).tolist()
     if len(syms_vfq) == 0:
         st.warning("No hay símbolos tras VFQ; relaja guardrails/VFQ o amplía universo.")
         st.stop()
 
-    # Precios panel
-    panel = load_prices_panel(syms_vfq, start.isoformat(), end.isoformat(), cache_key=cache_tag, force=False)
+    # --- Carga de precios y benchmark
+    panel = load_prices_panel(
+        syms_vfq,
+        start.isoformat(),
+        end.isoformat(),
+        cache_key=cache_tag,
+        force=False
+    )
     bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
 
-    # Señales de tendencia
-    trend = apply_trend_filter(panel, use_and_condition=use_and)  # debe incluir 'symbol' y 'signal_trend'
-    # Breakout enrich
+    # --- Señales de tendencia
+    trend = apply_trend_filter(panel, use_and_condition=use_and)  # devuelve 'symbol','signal_trend', métricas
+
+    # --- Señales de breakout
     brk = enrich_with_breakout(
         panel,
         rvol_lookback=20,
@@ -242,43 +250,35 @@ try:
         p52_th=p52_th,
         updown_vol_th=updown_vol_th,
         bench_series=bench_px["close"] if isinstance(bench_px, pd.DataFrame) and "close" in bench_px.columns else None,
-        min_hits=min_hits,
-        use_rs_slope=use_rs_slope,
-        rs_min_slope=0.0
-)
-    base_cols = [c for c in ["symbol","sector","marketCap","VFQ","ValueScore","QualityScore","coverage_count"] if c in df_vfq.columns]
-    base_for_signals = df_vfq[base_cols].drop_duplicates("symbol")
+        # estos dos son opcionales; inclúyelos solo si tu enrich_with_breakout ya los acepta
+        **({"min_hits": min_hits} if "min_hits" in enrich_with_breakout.__code__.co_varnames else {}),
+        **({"use_rs_slope": use_rs_slope, "rs_min_slope": 0.0} if "use_rs_slope" in enrich_with_breakout.__code__.co_varnames else {}),
+    )
 
+    # --- Base para señales (VFQ + metadata)
+    base_cols = [c for c in ["symbol","sector","marketCap","VFQ","ValueScore","QualityScore","coverage_count"] if c in df_vfq.columns]
+    base_for_signals = df_vfq[base_cols].drop_duplicates("symbol") if base_cols else df_vfq[["symbol"]].drop_duplicates()
+
+    # --- Merge único (NO volver a crear df_sig más abajo)
     df_sig = (
         base_for_signals
         .merge(trend if isinstance(trend, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_trend"]), on="symbol", how="left")
-        .merge(brk if isinstance(brk, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_breakout"]), on="symbol", how="left")
+        .merge(brk   if isinstance(brk,   pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_breakout"]), on="symbol", how="left")
     )
 
-    # --- Garantiza columnas booleanas presentes ---
-    if "signal_trend" not in df_sig.columns:
-        df_sig["signal_trend"] = False
-    df_sig["signal_trend"] = df_sig["signal_trend"].fillna(False).astype(bool)
+    # --- Garantiza columnas booleanas y diagnósticas
+    for col in ("signal_trend","signal_breakout"):
+        if col not in df_sig.columns: df_sig[col] = False
+        df_sig[col] = df_sig[col].fillna(False).astype(bool)
 
-    if "signal_breakout" not in df_sig.columns:
-        df_sig["signal_breakout"] = False
-    df_sig["signal_breakout"] = df_sig["signal_breakout"].fillna(False).astype(bool)
+    for c in ["RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope","c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope","hits"]:
+        if c not in df_sig.columns: df_sig[c] = np.nan
 
-    # Crea columnas diagnósticas vacías si no existieran (para que la UI no rompa)
-    for c in ["RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope",
-            "c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope","hits"]:
-        if c not in df_sig.columns:
-            df_sig[c] = np.nan
-
-    # --- Regla de entrada (ENTRY) ---
+    # --- Regla de entrada (ENTRY) siempre creada antes de usarla
     require_breakout = st.sidebar.checkbox("Exigir breakout para ENTRY", value=False)
+    df_sig["ENTRY"] = (df_sig["signal_trend"] & df_sig["signal_breakout"]) if require_breakout else df_sig["signal_trend"]
 
-    if require_breakout:
-        df_sig["ENTRY"] = df_sig["signal_trend"] & df_sig["signal_breakout"]
-    else:
-        df_sig["ENTRY"] = df_sig["signal_trend"]  # solo tendencia
-
-    # --- Conteo y diagnóstico opcional ---
+    # --- Conteo y diagnóstico
     st.caption("Conteo señales por etapa")
     st.write({
         "n_total": int(len(df_sig)),
@@ -290,6 +290,8 @@ try:
     dbg_cols = ["symbol","RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope",
                 "c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope","hits",
                 "signal_trend","signal_breakout","ENTRY"]
+    dbg_cols = [c for c in dbg_cols if c in df_sig.columns]
+
     st.subheader("Diagnóstico de métricas de breakout (muestra)")
     st.dataframe(
         df_sig[dbg_cols].sort_values(
@@ -299,45 +301,13 @@ try:
         width="stretch"
     )
 
-    # --- Tabla de candidatas ---
+    # --- Tabla de candidatas
     st.subheader("Candidatas (ENTRY = True)")
+    sort_cols = [c for c in ["VFQ","ValueScore","QualityScore"] if c in df_sig.columns]
     st.dataframe(
-        df_sig.loc[df_sig["ENTRY"]].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False),
+        df_sig.loc[df_sig["ENTRY"]].sort_values(sort_cols, ascending=False),
         width="stretch"
     )
-  # debe incluir 'symbol' y 'signal_breakout'
-
-    # Join señales a los scores
-    df_sig = df_vfq_sel.merge(trend, on="symbol", how="left").merge(brk, on="symbol", how="left")
- # --- Diagnóstico: cuántas pasan cada cosa
-    st.caption("Conteo señales por etapa")
-    n = len(df_sig)
-    st.write({
-        "n_total": n,
-        "trend_true": int(df_sig["signal_trend"].fillna(False).sum()),
-        "breakout_true": int(df_sig["signal_breakout"].fillna(False).sum()),
-        "entry_true": int(df_sig["ENTRY"].fillna(False).sum()),
-    })
-
-    # --- Ver distribución de métricas de breakout (últimos 100)
-    cols_dbg = ["symbol","RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope",
-                "signal_trend","signal_breakout","ENTRY"]
-    dbg = df_sig.reindex(columns=[c for c in cols_dbg if c in df_sig.columns]).copy()
-    st.subheader("Diagnóstico de métricas de breakout (muestra)")
-    st.dataframe(dbg.sort_values(["signal_breakout","RVOL20","ClosePos","P52","UDVol20"],
-                                ascending=[False,False,False,False,False]).head(100), width="stretch")
-   
-    # Asegurar columnas
-    if "signal_trend" not in df_sig.columns: df_sig["signal_trend"] = False
-    if "signal_breakout" not in df_sig.columns: df_sig["signal_breakout"] = False
-
-    df_sig["ENTRY"] = df_sig["signal_trend"].fillna(False) & df_sig["signal_breakout"].fillna(False)
-
-    st.subheader("Candidatas (ENTRY = True)")
-    st.dataframe(df_sig[df_sig["ENTRY"]].sort_values("VFQ", ascending=False), width="stretch")
-
-    st.subheader("Diagnóstico de señales (top 100)")
-    st.dataframe(df_sig.sort_values(["ENTRY", "VFQ"], ascending=[False, False]).head(100), width="stretch")
 
 except Exception as e:
     st.error(f"Error en señales: {e}")
