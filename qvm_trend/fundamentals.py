@@ -346,7 +346,18 @@ def build_vfq_scores(df_base: pd.DataFrame, df_fund: pd.DataFrame) -> pd.DataFra
                           if q_inputs else np.nan)
 
     df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1)
-    df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
+    # ... después de calcular df["VFQ"] ...
+# Percentil intra-sector robusto
+    sec = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
+    try:
+        df["VFQ_pct_sector"] = df.groupby(sec)["VFQ"].rank(pct=True)
+    except Exception:
+        # Fallback: percentil sobre todo el universo si el groupby falla
+        df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
+
+    # Si por cualquier motivo quedó NaN, asumimos 1.0 (no penalizar por falta de sector)
+    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].fillna(1.0)
+
 
     # Orden amigable
     cols = ["symbol","sector","marketCap","coverage_count",

@@ -223,7 +223,9 @@ with tab3:
             # cobertura mínima
             df_vfq_sel = df_vfq[df_vfq.get("coverage_count", 0) >= int(min_cov)].copy()
             status.update(label=f"VFQ listo. Elegibles: {len(df_vfq_sel)}", state="complete")
-
+        mask_cov = df_vfq.get("coverage_count", 0) >= int(min_cov)
+        mask_pct = df_vfq.get("VFQ_pct_sector", np.nan).fillna(1.0) >= float(min_pct)
+        df_vfq_sel = df_vfq[mask_cov & mask_pct].copy()
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
         cols_show = [c for c in ["symbol","sector","marketCap","coverage_count","VFQ","ValueScore","QualityScore","fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"] if c in df_vfq_sel.columns]
         st.dataframe(
