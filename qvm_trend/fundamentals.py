@@ -320,20 +320,35 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     df["sector"] = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
 
     # --- market cap unificado
-    def numcol(name: str) -> pd.Series:
-        return pd.to_numeric(df[name], errors="coerce") if name in df.columns else pd.Series(np.nan, index=df.index)
+       # --- market cap unificado (robusto a _x/_y y variantes)
+    def to_num(colname: str) -> pd.Series:
+        return pd.to_numeric(df[colname], errors="coerce") if colname in df.columns else pd.Series(np.nan, index=df.index)
 
+    # 1) Candidatos de market cap (acepta marketCap, marketCap_x, marketCap_y, marketCap_profile, marketCap_ev, etc.)
     mcap = pd.Series(np.nan, index=df.index)
-    for c in ["marketCap","marketCap_profile","marketCap_ev"]:
+    mcap_candidates = (
+        ["marketCap", "marketCap_profile", "marketCap_ev"] +
+        [c for c in df.columns if c.lower().startswith("marketcap")]
+    )
+    for c in mcap_candidates:
         if c in df.columns:
-            mcap = mcap.fillna(numcol(c))
+            mcap = mcap.fillna(to_num(c))
 
-    # fallback: price * sharesOutstanding (o shares_out_ttm)
-    px = numcol("price")
-    sh = numcol("sharesOutstanding") if "sharesOutstanding" in df.columns else numcol("shares_out_ttm")
-    if px.notna().any() and sh.notna().any():
-        mcap = mcap.fillna(px * sh)
+    # 2) Fallback: price * sharesOutstanding (también robusto a _x/_y)
+    price_series = pd.Series(np.nan, index=df.index)
+    for c in [c for c in df.columns if c.lower().startswith("price")]:
+        price_series = price_series.fillna(to_num(c))
 
+    shares_series = pd.Series(np.nan, index=df.index)
+    shares_candidates = (
+        ["sharesOutstanding", "shares_out_ttm"] +
+        [c for c in df.columns if c.lower().startswith("sharesoutstanding")]
+    )
+    for c in shares_candidates:
+        if c in df.columns:
+            shares_series = shares_series.fillna(to_num(c))
+
+    mcap = mcap.fillna(price_series * shares_series)
     df["marketCap_unified"] = pd.to_numeric(mcap, errors="coerce")
 
     # --- bucket por tamaño (usa helper global _bucket_by_quantiles)
@@ -341,10 +356,10 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     grp_key = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
 
     # --------- derivadas para Value/Quality ----------
-    ev  = numcol("evToEbitda")
-    fcf = numcol("fcf_ttm")
-    gp  = numcol("grossProfitTTM")
-    ta  = numcol("totalAssetsTTM")
+    ev  = to_num("evToEbitda")
+    fcf = to_num("fcf_ttm")
+    gp  = to_num("grossProfitTTM")
+    ta  = to_num("totalAssetsTTM")
 
     df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
     df["fcf_yield"] = (fcf / df["marketCap_unified"]).replace([np.inf, -np.inf], np.nan)
