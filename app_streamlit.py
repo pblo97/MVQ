@@ -169,7 +169,7 @@ with tab2:
 
 with tab3:
     st.subheader("3) Ranking VFQ")
-    st.subheader("3) Ranking VFQ")
+    
 
     # --- Controles de filtros VFQ (UI) ---
     c1, c2 = st.columns(2)
@@ -194,18 +194,38 @@ with tab3:
         else:
             st.info("No llegó ninguna métrica VFQ: revisa la API key/ratelimit o los nombres mapeados en download_fundamentals.")
 
-        # --- máscaras robustas (evita 'truth value is ambiguous')
+        # -------- PARCHE ANTI “truth value of a DataFrame is ambiguous” --------
+        # Asegura que min_cov y min_pct sean numéricos simples
+        min_cov = int(min_cov)
+        min_pct = float(min_pct)
+
+        # coverage_count -> Serie booleana alineada
         if "coverage_count" in df_vfq.columns:
-            mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
+            _cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0)
+            mask_cov = (_cov >= min_cov)
         else:
             mask_cov = pd.Series(True, index=df_vfq.index)
 
+        # VFQ_pct_sector -> Serie booleana alineada (si falta, asumimos 1.0)
         if "VFQ_pct_sector" in df_vfq.columns:
-            mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= float(min_pct)
+            _pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0)
+            mask_pct = (_pct >= min_pct)
         else:
             mask_pct = pd.Series(True, index=df_vfq.index)
 
-        df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
+        # Fuerza que sean Series booleanas y reindexa por seguridad
+        mask_cov = pd.Series(mask_cov, index=df_vfq.index).astype(bool)
+        mask_pct = pd.Series(mask_pct, index=df_vfq.index).astype(bool)
+
+        # Combina máscaras de forma segura
+        mask_all = mask_cov & mask_pct
+
+        # DEBUG opcional (quitar si no lo necesitas)
+        # st.write({"mask_cov_dtype": mask_cov.dtype, "mask_pct_dtype": mask_pct.dtype,
+        #           "mask_cov_shape": mask_cov.shape, "mask_pct_shape": mask_pct.shape,
+        #           "df_vfq_shape": df_vfq.shape})
+
+        df_vfq_sel = df_vfq.loc[mask_all].copy()
 
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
 
