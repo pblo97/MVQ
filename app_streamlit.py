@@ -170,6 +170,7 @@ with tab2:
 with tab3:
     st.subheader("3) Ranking VFQ")
     
+    
 
     # --- Controles de filtros VFQ (UI) ---
     c1, c2 = st.columns(2)
@@ -239,8 +240,28 @@ with tab3:
             use_container_width=True, hide_index=True
         )
 
+        st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")
+        st.write({
+            "símbolos_guardrails": len(kept_syms),
+            "filas_fund": 0 if df_fund is None else len(df_fund),
+            "cols_fund": [] if df_fund is None else list(df_fund.columns),
+        })
+
+        if isinstance(df_fund, pd.DataFrame) and not df_fund.empty:
+            base_cols_dbg = [
+                "evToEbitda", "fcf_ttm", "cfo_ttm", "ebit_ttm",
+                "grossProfitTTM", "totalAssetsTTM", "roic", "roa", "netMargin",
+                "marketCap", "__err_fund"
+            ]
+            present = [c for c in base_cols_dbg if c in df_fund.columns]
+            st.write("No-nulos por columna base:", df_fund[present].notna().sum().sort_values(ascending=False).to_dict())
+            # Muestra rápida (con posibles errores devueltos por la API):
+            st.dataframe(df_fund[["symbol"] + present].head(20), use_container_width=True, hide_index=True)
+
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
+
 
 
 

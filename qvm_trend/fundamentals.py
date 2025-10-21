@@ -198,7 +198,7 @@ def download_fundamentals(symbols: List[str],
                           market_caps: Dict[str, float] | None = None,
                           cache_key: str | None = None,
                           force: bool = False,
-                          max_symbols_per_minute: int = 100) -> pd.DataFrame:
+                          max_symbols_per_minute: int = 50) -> pd.DataFrame:
     """
     Descarga mínimos de batalla para VFQ con:
       - reintentos suaves y limitación de tasa
