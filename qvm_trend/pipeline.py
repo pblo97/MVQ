@@ -222,18 +222,15 @@ def enrich_with_breakout(
     closepos_th: float = 0.6,
     p52_th: float = 0.95,
     updown_vol_th: float = 1.2,
-    bench_series: pd.Series | None = None
+    bench_series: pd.Series | None = None,
+    min_hits: int = 4,             # NUEVO: K-de-4
+    use_rs_slope: bool = False,    # opcional: check extra
+    rs_min_slope: float = 0.0
 ) -> pd.DataFrame:
-    """
-    Calcula métricas de breakout y devuelve:
-      ['symbol','RVOL20','ClosePos','P52','UDVol20','rs_ma20_slope','signal_breakout']
-    Señal básica: RVOL>=rvol_th & ClosePos>=closepos_th & P52>=p52_th & UDVol>=updown_vol_th
-    """
     rows = []
     if panel is None:
         return pd.DataFrame(columns=["symbol","signal_breakout"])
 
-    # bench_close debe ser Serie con índice fechas
     bench_close = None
     if isinstance(bench_series, pd.Series):
         bench_close = bench_series.astype(float).copy()
@@ -243,19 +240,28 @@ def enrich_with_breakout(
         if df is None or df.empty:
             rows.append({"symbol": sym, "signal_breakout": False}); continue
         dfx = df.copy().sort_index()
-        # métricas últimas
+
+        # --- métricas últimas ---
         rvol = _rvol_last(dfx, rvol_lookback)
         cpos = _closepos_last(dfx)
         p52  = _p52_last(dfx, 252)
         udr  = _updown_vol_ratio(dfx, 20)
         rs_sl = _rs_ma20_slope(dfx, bench_close) if bench_close is not None else np.nan
 
-        sig = (
-            (rvol >= rvol_th if np.isfinite(rvol) else False) and
-            (cpos >= closepos_th if np.isfinite(cpos) else False) and
-            (p52  >= p52_th   if np.isfinite(p52)  else False) and
-            (udr  >= updown_vol_th if np.isfinite(udr) else False)
-        )
+        # --- checks individuales ---
+        c_rvol = bool(np.isfinite(rvol) and (rvol >= rvol_th))
+        c_cpos = bool(np.isfinite(cpos) and (cpos >= closepos_th))
+        c_p52  = bool(np.isfinite(p52)  and (p52  >= p52_th))
+        c_udr  = bool(np.isfinite(udr)  and (udr  >= updown_vol_th))
+
+        hits = int(c_rvol) + int(c_cpos) + int(c_p52) + int(c_udr)
+
+        c_rss = False
+        if use_rs_slope and np.isfinite(rs_sl):
+            c_rss = (rs_sl > rs_min_slope)
+            hits += int(c_rss)
+
+        sig = (hits >= int(min_hits))
 
         rows.append({
             "symbol": sym,
@@ -264,8 +270,13 @@ def enrich_with_breakout(
             "P52": p52,
             "UDVol20": udr,
             "rs_ma20_slope": rs_sl,
+            "c_RVOL": c_rvol,
+            "c_ClosePos": c_cpos,
+            "c_P52": c_p52,
+            "c_UDVol": c_udr,
+            "c_RSslope": c_rss,
+            "hits": hits,
             "signal_breakout": bool(sig)
         })
 
     return pd.DataFrame(rows).drop_duplicates("symbol", keep="last")
-
