@@ -169,6 +169,14 @@ with tab2:
 
 with tab3:
     st.subheader("3) Ranking VFQ")
+    st.subheader("3) Ranking VFQ")
+
+    # --- Controles de filtros VFQ (UI) ---
+    c1, c2 = st.columns(2)
+    # Cobertura mínima: nº de métricas fundamentales no nulas requeridas (1–6 suele estar bien)
+    min_cov = c1.slider("Cobertura fundamentales (≥ métricas)", 0, 6, 1, 1)
+    # Umbral de percentil intra-sector (0.00–1.00). 0.05 = top 95% hacia arriba
+    min_pct = c2.slider("VFQ pct (intra-sector) mínimo", 0.00, 1.00, 0.00, 0.01)
     try:
         kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
         with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
@@ -178,22 +186,39 @@ with tab3:
             status.update(label="VFQ calculado", state="complete")
 
         # diagnóstico cobertura
+        # --- diagnóstico cobertura
         vfq_fields = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df_vfq.columns]
         st.caption("Cobertura por métrica (no nulos)")
-        if vfq_fields:
+        if len(vfq_fields) > 0:
             st.bar_chart(df_vfq[vfq_fields].notna().sum().sort_values(ascending=False), use_container_width=True)
         else:
             st.info("No llegó ninguna métrica VFQ: revisa la API key/ratelimit o los nombres mapeados en download_fundamentals.")
 
-        # filtro por cobertura mínima
-        df_vfq_sel = df_vfq[df_vfq.get("coverage_count", 0) >= int(min_cov)].copy()
+        # --- máscaras robustas (evita 'truth value is ambiguous')
+        if "coverage_count" in df_vfq.columns:
+            mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
+        else:
+            mask_cov = pd.Series(True, index=df_vfq.index)
+
+        if "VFQ_pct_sector" in df_vfq.columns:
+            mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= float(min_pct)
+        else:
+            mask_pct = pd.Series(True, index=df_vfq.index)
+
+        df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
 
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
-        cols_show = [c for c in ["symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore","fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"] if c in df_vfq_sel.columns]
+
+        cols_show = [c for c in [
+            "symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
+            "fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"
+        ] if c in df_vfq_sel.columns]
+
         st.dataframe(
             df_vfq_sel[cols_show].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False).head(300),
             use_container_width=True, hide_index=True
         )
+
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
 
