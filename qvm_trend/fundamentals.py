@@ -264,107 +264,150 @@ def download_guardrails_batch(symbols: List[str], cache_key: str | None = None, 
     if key: save_df(df, key)
     return df
 
+def _winsor(s: pd.Series, p: float = 0.01) -> pd.Series:
+    if s is None or s.empty: 
+        return s
+    s = pd.to_numeric(s, errors="coerce")
+    lo, hi = s.quantile(p), s.quantile(1-p)
+    return s.clip(lo, hi)
 
-def build_vfq_scores(df_base: pd.DataFrame, df_fund: pd.DataFrame) -> pd.DataFrame:
+def _bucket_by_quantiles(s: pd.Series, q: int = 3) -> pd.Series:
+    r = s.rank(method="first", na_option="keep")
+    try:
+        return pd.qcut(r, q, labels=False, duplicates="drop")
+    except Exception:
+        if r.max() and r.max() > 0:
+            pct = r / r.max()
+        else:
+            pct = r
+        return pd.Series(np.select(
+            [pct <= 0.33, pct <= 0.66, pct > 0.66],
+            [0,1,2],
+            default=np.nan
+        ), index=s.index)
+
+def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
+                     size_buckets: int = 3) -> pd.DataFrame:
     """
-    Une universo + fundamentales y construye:
-      - fcf_yield / inv_ev_ebitda / gross_profitability
-      - ValueScore, QualityScore, VFQ y VFQ_pct_sector
-      - coverage_count
-    Robusto a columnas faltantes.
+    Fusiona universo + fundamentales mínimos y calcula VFQ de forma tolerante a NaNs.
+    Devuelve un DF con:
+      ['symbol','sector','marketCap_unified','coverage_count','ValueScore','QualityScore','VFQ','VFQ_pct_sector', ...]
     """
-    if df_base is None or df_base.empty:
-        return pd.DataFrame()
+    import numpy as np
+    import pandas as pd
 
-    dfb = df_base.copy()
+    # --- merge base
+    dfu = (df_universe or pd.DataFrame()).copy()
+    dff = (df_fund or pd.DataFrame()).copy()
+    if "symbol" not in dfu.columns or dfu.empty:
+        return pd.DataFrame(columns=["symbol","VFQ","coverage_count"])
+    if "symbol" not in dff.columns:
+        dff = pd.DataFrame(columns=["symbol"])
 
-    # Asegurar columnas mínimas en el universo
-    if "symbol" not in dfb.columns:
-        raise ValueError("df_base debe contener al menos la columna 'symbol'.")
-    if "sector" not in dfb.columns:
-        dfb["sector"] = "Unknown"
-    if "marketCap" not in dfb.columns:
-        dfb["marketCap"] = np.nan
-    if "price" not in dfb.columns:
-        dfb["price"] = np.nan
+    df = dfu.merge(dff, on="symbol", how="left").copy()
+    df["symbol"] = df["symbol"].astype(str).str.upper()
 
-    # Merge con fundamentales (puede venir vacío)
-    dff = df_fund.copy() if (df_fund is not None and not df_fund.empty) else pd.DataFrame(columns=["symbol"])
-    df = dfb.merge(dff, on="symbol", how="left")
-
-    # Reafirmar columnas críticas por si el merge las perdió
+    # --- columnas de identificación
     if "sector" not in df.columns:
         df["sector"] = "Unknown"
-    if "marketCap" not in df.columns:
-        df["marketCap"] = np.nan
+    df["sector"] = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
 
-    # Series numéricas seguras
-    ev   = _num_or_nan(df, "evToEbitda")
-    mcap = _num_or_nan(df, "marketCap")
-    fcf  = _num_or_nan(df, "fcf_ttm")
-    gp   = _num_or_nan(df, "grossProfitTTM")
-    ta   = _num_or_nan(df, "totalAssetsTTM")
+    # --- market cap unificado
+    def numcol(name):
+        return pd.to_numeric(df[name], errors="coerce") if name in df.columns else pd.Series(np.nan, index=df.index)
 
-    # Derivadas VFQ
-    ev_nz = ev.replace(0, np.nan)
-    df["inv_ev_ebitda"] = np.where(ev_nz.notna(), 1.0 / ev_nz, np.nan)
-    df["fcf_yield"] = np.where((mcap.notna()) & (mcap != 0) & fcf.notna(), fcf / mcap, np.nan)
-    df["gross_profitability"] = np.where((ta.notna()) & (ta != 0) & gp.notna(), gp / ta, np.nan)
-
-    # Winsor suave
-    for c in ["fcf_yield", "inv_ev_ebitda", "gross_profitability", "roic", "roa", "netMargin"]:
+    mcap = pd.Series(np.nan, index=df.index)
+    for c in ["marketCap","marketCap_profile","marketCap_ev"]:
         if c in df.columns:
-            df[c] = _winsorize(pd.to_numeric(df[c], errors="coerce"), 0.01)
+            mcap = mcap.fillna(numcol(c))
+    # fallback: price * sharesOutstanding
+    if "price" in df.columns and ("sharesOutstanding" in df.columns or "shares_out_ttm" in df.columns):
+        px = numcol("price")
+        sh = numcol("sharesOutstanding") if "sharesOutstanding" in df.columns else numcol("shares_out_ttm")
+        mcap = mcap.fillna(px * sh)
 
-    # Cobertura VFQ
-    vfq_cols_all = ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"]
-    vfq_cols = [c for c in vfq_cols_all if c in df.columns]
-    df["coverage_count"] = df[vfq_cols].notna().sum(axis=1) if vfq_cols else 0
+    df["marketCap_unified"] = pd.to_numeric(mcap, errors="coerce")
 
-    # Buckets de tamaño
-    r = df["marketCap"].rank(method="first", na_option="keep")
+    # --- bucket por tamaño (3 cuantiles por defecto)
+    def _bucket_by_quantiles(s: pd.Series, q: int = 3) -> pd.Series:
+        r = s.rank(method="first", na_option="keep")
+        try:
+            return pd.qcut(r, q, labels=False, duplicates="drop")
+        except Exception:
+            if r.max() and pd.notna(r.max()) and r.max() > 0:
+                pct = r / r.max()
+            else:
+                pct = r
+            return pd.Series(np.select([pct <= 0.33, pct <= 0.66, pct > 0.66], [0,1,2], default=np.nan), index=s.index)
+
+    df["size_bucket"] = _bucket_by_quantiles(df["marketCap_unified"], q=size_buckets)
+    grp_key = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
+
+    # --------- NUEVO: derivar métricas que faltaban ----------
+    ev = numcol("evToEbitda")
+    gp = numcol("grossProfitTTM")
+    ta = numcol("totalAssetsTTM")
+    fcf = numcol("fcf_ttm")
+
+    # Value
+    df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
+    df["fcf_yield"] = (fcf / df["marketCap_unified"]).replace([np.inf, -np.inf], np.nan)
+
+    # Quality extra (si quieres usarla)
+    df["gross_profitability"] = (gp / ta).replace([np.inf, -np.inf], np.nan)
+
+    # --- columnas VFQ disponibles
+    val_cols = [c for c in ["fcf_yield","inv_ev_ebitda"] if c in df.columns]
+    q_cols   = [c for c in ["gross_profitability","roic","roa","netMargin"] if c in df.columns]
+
+    # --- winsor suave
+    def _winsor(s: pd.Series, p: float = 0.01) -> pd.Series:
+        if s is None or s.empty:
+            return s
+        s = pd.to_numeric(s, errors="coerce")
+        lo, hi = s.quantile(p), s.quantile(1-p)
+        return s.clip(lo, hi)
+
+    for c in val_cols + q_cols:
+        df[c] = _winsor(df[c], 0.01)
+
+    # --- coverage_count (sobre las que realmente existen)
+    fields = val_cols + q_cols
+    if len(fields) == 0:
+        df["coverage_count"] = 0
+        df["ValueScore"] = np.nan; df["QualityScore"] = np.nan; df["VFQ"] = np.nan; df["VFQ_pct_sector"] = 1.0
+        return df
+
+    df["coverage_count"] = df[fields].notna().sum(axis=1)
+
+    # --- ranks por grupo tamaño-sector (asc=False = mayor mejor)
+    def _rank_group(col):
+        s = pd.to_numeric(df[col], errors="coerce")
+        return s.groupby(grp_key).rank(method="average", ascending=False, na_option="bottom")
+
+    if len(val_cols) > 0:
+        val_ranks = pd.concat([_rank_group(c) for c in val_cols], axis=1)
+        df["ValueScore"] = val_ranks.mean(axis=1)
+    else:
+        df["ValueScore"] = np.nan
+
+    if len(q_cols) > 0:
+        q_ranks = pd.concat([_rank_group(c) for c in q_cols], axis=1)
+        df["QualityScore"] = q_ranks.mean(axis=1)
+    else:
+        df["QualityScore"] = np.nan
+
+    # VFQ: media de lo disponible (ignora NaNs)
+    df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1, skipna=True)
+
+    # percentil intra-sector robusto (con relleno)
     try:
-        df["size_bucket"] = pd.qcut(r, 3, labels=False, duplicates="drop")
+        df["VFQ_pct_sector"] = df.groupby(df["sector"])["VFQ"].rank(pct=True)
     except Exception:
-        pct = r / r.max() if (hasattr(r, "max") and r.max() and r.max() > 0) else r
-        df["size_bucket"] = np.select([pct <= 0.33, pct <= 0.66, pct > 0.66], [0, 1, 2], default=np.nan)
-
-    # Sector seguro
-    df["sector"] = df["sector"].fillna("Unknown").astype(str)
-    grp = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
-
-    # Ranking por grupo (si existen columnas)
-    def _rank_by_group(s: pd.Series, ascending: bool, group: pd.Series) -> pd.Series:
-        return s.groupby(group).rank(method="average", ascending=ascending, na_option="bottom")
-
-    val_inputs = [c for c in ["fcf_yield","inv_ev_ebitda"] if c in df.columns]
-    q_inputs   = [c for c in ["gross_profitability","roic","roa","netMargin"] if c in df.columns]
-
-    df["ValueScore"] = (pd.concat([_rank_by_group(df[c], False, grp) for c in val_inputs], axis=1).mean(axis=1)
-                        if val_inputs else np.nan)
-    df["QualityScore"] = (pd.concat([_rank_by_group(df[c], False, grp) for c in q_inputs], axis=1).mean(axis=1)
-                          if q_inputs else np.nan)
-
-    df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1)
-    # ... después de calcular df["VFQ"] ...
-# Percentil intra-sector robusto
-    sec = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
-    try:
-        df["VFQ_pct_sector"] = df.groupby(sec)["VFQ"].rank(pct=True)
-    except Exception:
-        # Fallback: percentil sobre todo el universo si el groupby falla
         df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
-
-    # Si por cualquier motivo quedó NaN, asumimos 1.0 (no penalizar por falta de sector)
     df["VFQ_pct_sector"] = df["VFQ_pct_sector"].fillna(1.0)
 
-
-    # Orden amigable
-    cols = ["symbol","sector","marketCap","coverage_count",
-            "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin",
-            "ValueScore","QualityScore","VFQ","VFQ_pct_sector"]
-    cols = [c for c in cols if c in df.columns]
-    return df[cols + [c for c in df.columns if c not in cols]].copy()
+    return df
 
 # ======================================================================================
 # GUARDRAILS (calidad) — batch + aplicación de umbrales

@@ -167,79 +167,37 @@ with tab2:
     except Exception as e:
         st.error(f"Error en guardrails: {e}")
 
-st.subheader("Ranking VFQ")
-
-try:
-    kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
-    if len(kept_syms) == 0:
-        st.info("No hay símbolos tras guardrails. Relaja umbrales o salta guardrails para probar VFQ.")
-    else:
-        with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
-            # OBLIGATORIO para VFQ: esta función trae fcf_yield, ev/ebitda, roic, roa, netMargin, gross_profitability, etc.
-            df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
-            status.update(label="Descarga completada", state="complete")
-
-        # Diagnóstico columnas que llegaron
-        st.caption("Diagnóstico VFQ — columnas y cobertura (no-nulos):")
-        vfq_fields = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df_fund.columns]
-        st.write("Columnas VFQ presentes:", vfq_fields)
-        if vfq_fields:
-            st.write("No-nulos por métrica:", df_fund[vfq_fields].notna().sum())
-        else:
-            st.error("No llegó ninguna métrica VFQ. Revisa tu clave FMP / límite de peticiones o el mapeo en download_fundamentals().")
-
-        # Construcción de VFQ (función robusta/tolerante a NaN)
-        base_for_vfq = uni.merge(df_fund, on="symbol", how="left")
-        df_vfq = build_vfq_scores(base_for_vfq, base_for_vfq)
-
-        # Sliders/controles de cobertura y percentil (ajusta a tu UI)
-        min_cov = st.slider("Cobertura fundamentales (≥ métricas)", 1, 6, 2)
-        min_pct = st.slider("VFQ pct (intra-sector) mínimo", 0.0, 0.95, 0.25, 0.05)
-
-        mask_cov = df_vfq.get("coverage_count", 0) >= int(min_cov)
-        mask_pct = df_vfq.get("VFQ_pct_sector", 0).fillna(0) >= float(min_pct)
-        df_vfq_sel = df_vfq[mask_cov & mask_pct].copy()
-
-        st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
-        cols_show = [c for c in ["symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
-                                 "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"]
-                     if c in df_vfq_sel.columns]
-        st.dataframe(
-            df_vfq_sel.sort_values(["VFQ","ValueScore","QualityScore"], ascending=False)[cols_show].head(300),
-            use_container_width=True, hide_index=True
-        )
-except Exception as e:
-    st.error(f"Error en VFQ: {e}")
-
-# ====== Paso 3: VFQ (Value+Quality) ======
 with tab3:
-    st.subheader("Ranking VFQ")
+    st.subheader("3) Ranking VFQ")
     try:
         kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
         with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
             df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
-            base_for_vfq = uni.merge(df_fund, on="symbol", how="right")
+            base_for_vfq = uni.merge(df_fund, on="symbol", how="right")  # right asegura que no pierdas símbolos con fundas
             df_vfq = build_vfq_scores(base_for_vfq, base_for_vfq)
-            # cobertura mínima
-            df_vfq_sel = df_vfq[df_vfq.get("coverage_count", 0) >= int(min_cov)].copy()
-            status.update(label=f"VFQ listo. Elegibles: {len(df_vfq_sel)}", state="complete")
-        mask_cov = df_vfq.get("coverage_count", 0) >= int(min_cov)
-        mask_pct = df_vfq.get("VFQ_pct_sector", np.nan).fillna(1.0) >= float(min_pct)
-        df_vfq_sel = df_vfq[mask_cov & mask_pct].copy()
+            status.update(label="VFQ calculado", state="complete")
+
+        # diagnóstico cobertura
+        vfq_fields = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df_vfq.columns]
+        st.caption("Cobertura por métrica (no nulos)")
+        if vfq_fields:
+            st.bar_chart(df_vfq[vfq_fields].notna().sum().sort_values(ascending=False), use_container_width=True)
+        else:
+            st.info("No llegó ninguna métrica VFQ: revisa la API key/ratelimit o los nombres mapeados en download_fundamentals.")
+
+        # filtro por cobertura mínima
+        df_vfq_sel = df_vfq[df_vfq.get("coverage_count", 0) >= int(min_cov)].copy()
+
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
-        cols_show = [c for c in ["symbol","sector","marketCap","coverage_count","VFQ","ValueScore","QualityScore","fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"] if c in df_vfq_sel.columns]
+        cols_show = [c for c in ["symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore","fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"] if c in df_vfq_sel.columns]
         st.dataframe(
-            df_vfq_sel[cols_show].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False).head(200),
-            use_container_width=True, hide_index=True,
-            column_config={
-                "VFQ": st.column_config.NumberColumn("VFQ", format="%.1f"),
-                "ValueScore": st.column_config.NumberColumn("Value", format="%.1f"),
-                "QualityScore": st.column_config.NumberColumn("Quality", format="%.1f"),
-                "coverage_count": st.column_config.NumberColumn("Cov.", help="# métricas no nulas", format="%d")
-            }
+            df_vfq_sel[cols_show].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False).head(300),
+            use_container_width=True, hide_index=True
         )
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
+
 
 # ====== Paso 4: SEÑALES (Tendencia & Breakout) ======
 with tab4:
