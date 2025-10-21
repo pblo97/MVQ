@@ -127,7 +127,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 # ====== Paso 1: UNIVERSO ======
 with tab1:
-    st.subheader("1) Universo inicial")
+    st.subheader("Universo inicial")
     try:
         with st.status("Cargando universo del screener…", expanded=False) as status:
             uni_raw = run_fmp_screener(limit=limit)
@@ -144,7 +144,7 @@ with tab1:
 
 # ====== Paso 2: FUNDAMENTALES & GUARDRAILS ======
 with tab2:
-    st.subheader("2) Guardrails de calidad")
+    st.subheader("Guardrails")
     try:
         syms = uni["symbol"].dropna().astype(str).unique().tolist()
         with st.status("Descargando guardrails/fundamentales (cacheados)…", expanded=False) as status:
@@ -167,9 +167,53 @@ with tab2:
     except Exception as e:
         st.error(f"Error en guardrails: {e}")
 
+st.subheader("Ranking VFQ")
+
+try:
+    kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+    if len(kept_syms) == 0:
+        st.info("No hay símbolos tras guardrails. Relaja umbrales o salta guardrails para probar VFQ.")
+    else:
+        with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
+            # OBLIGATORIO para VFQ: esta función trae fcf_yield, ev/ebitda, roic, roa, netMargin, gross_profitability, etc.
+            df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
+            status.update(label="Descarga completada", state="complete")
+
+        # Diagnóstico columnas que llegaron
+        st.caption("Diagnóstico VFQ — columnas y cobertura (no-nulos):")
+        vfq_fields = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df_fund.columns]
+        st.write("Columnas VFQ presentes:", vfq_fields)
+        if vfq_fields:
+            st.write("No-nulos por métrica:", df_fund[vfq_fields].notna().sum())
+        else:
+            st.error("No llegó ninguna métrica VFQ. Revisa tu clave FMP / límite de peticiones o el mapeo en download_fundamentals().")
+
+        # Construcción de VFQ (función robusta/tolerante a NaN)
+        base_for_vfq = uni.merge(df_fund, on="symbol", how="left")
+        df_vfq = build_vfq_scores(base_for_vfq, base_for_vfq)
+
+        # Sliders/controles de cobertura y percentil (ajusta a tu UI)
+        min_cov = st.slider("Cobertura fundamentales (≥ métricas)", 1, 6, 2)
+        min_pct = st.slider("VFQ pct (intra-sector) mínimo", 0.0, 0.95, 0.25, 0.05)
+
+        mask_cov = df_vfq.get("coverage_count", 0) >= int(min_cov)
+        mask_pct = df_vfq.get("VFQ_pct_sector", 0).fillna(0) >= float(min_pct)
+        df_vfq_sel = df_vfq[mask_cov & mask_pct].copy()
+
+        st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
+        cols_show = [c for c in ["symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
+                                 "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"]
+                     if c in df_vfq_sel.columns]
+        st.dataframe(
+            df_vfq_sel.sort_values(["VFQ","ValueScore","QualityScore"], ascending=False)[cols_show].head(300),
+            use_container_width=True, hide_index=True
+        )
+except Exception as e:
+    st.error(f"Error en VFQ: {e}")
+
 # ====== Paso 3: VFQ (Value+Quality) ======
 with tab3:
-    st.subheader("3) Ranking VFQ")
+    st.subheader("Ranking VFQ")
     try:
         kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
         with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
@@ -197,7 +241,7 @@ with tab3:
 
 # ====== Paso 4: SEÑALES (Tendencia & Breakout) ======
 with tab4:
-    st.subheader("4) Tendencia & Breakout")
+    st.subheader("Tendencia & Rompimiento")
     try:
         syms_vfq = df_vfq_sel["symbol"].dropna().astype(str).tolist()
         if len(syms_vfq) == 0:
@@ -293,7 +337,7 @@ with tab4:
 
 # ====== Paso 5: EXPORT ======
 with tab5:
-    st.subheader("5) Exportar / Guardar corrida")
+    st.subheader("Exportar / Guardar ")
     uni_s  = st.session_state.get("uni")
     gdiag  = st.session_state.get("guard_diag")
     vfq_s  = st.session_state.get("vfq")
