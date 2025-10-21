@@ -154,13 +154,7 @@ def _fetch_min_battle_fmp(symbol: str, market_cap_hint: float | None = None) -> 
     return out
 
 
-def download_fundamentals(symbols: List[str],
-                          market_caps: Dict[str, float] | None = None,
-                          cache_key: str | None = None,
-                          force: bool = False) -> pd.DataFrame:
-    """
-    Descarga fundamentals mínimos para VFQ. Usa cache si está disponible.
-    """
+def download_fundamentals(symbols: List[str], market_caps=None, cache_key=None, force=False) -> pd.DataFrame:
     key = f"fund_{cache_key}" if cache_key else None
     if key and not force:
         dfc = load_df(key)
@@ -169,15 +163,29 @@ def download_fundamentals(symbols: List[str],
 
     rows = []
     mc_map = market_caps or {}
-    # Procesar en lotes ligeros desde la app (rate limit ya se maneja en _http_get)
     for s in symbols:
         try:
             rows.append(_fetch_min_battle_fmp(s, market_cap_hint=mc_map.get(s)))
-        except Exception:
-            rows.append({"symbol": s})
+        except Exception as e:
+            rows.append({"symbol": s, "__err_fund": str(e)[:180]})
     df = pd.DataFrame(rows).drop_duplicates("symbol")
-    if key:
-        save_df(df, key)
+    if key: save_df(df, key)
+    return df
+
+def download_guardrails_batch(symbols: List[str], cache_key: str | None = None, force: bool = False) -> pd.DataFrame:
+    key = f"guard_{cache_key}" if cache_key else None
+    if key and not force:
+        dfc = load_df(key)
+        if dfc is not None:
+            return dfc
+    rows = []
+    for s in symbols:
+        try:
+            rows.append(download_guardrails(s))
+        except Exception as e:
+            rows.append({"symbol": s, "__err_guard": str(e)[:180]})
+    df = pd.DataFrame(rows).drop_duplicates("symbol")
+    if key: save_df(df, key)
     return df
 
 
