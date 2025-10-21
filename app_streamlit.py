@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 import numpy as np
 import streamlit as st
-
+from qvm_trend.montecarlo import mc_bootstrap_trades
 # ------------------ Imports del proyecto ------------------
 try:
     from qvm_trend.data_io import (
@@ -303,11 +303,24 @@ try:
 
     # --- Tabla de candidatas
     st.subheader("Candidatas (ENTRY = True)")
-    sort_cols = [c for c in ["VFQ","ValueScore","QualityScore"] if c in df_sig.columns]
+
+    # filtramos primero por ENTRY
+    df_candidates = df_sig.loc[df_sig["ENTRY"]].copy()
+
+    # columnas para ordenar (las que existan)
+    sort_cols = [c for c in ["BreakoutScore", "VFQ", "ValueScore", "QualityScore"] if c in df_candidates.columns]
+    if not sort_cols:
+        # fallback por si faltan scores (no rompe)
+        sort_cols = [c for c in ["VFQ", "ValueScore", "QualityScore"] if c in df_candidates.columns]
+
+    # orden descendente para todas
+    asc = [False] * len(sort_cols)
+
     st.dataframe(
-        df_sig.loc[df_sig["ENTRY"]].sort_values(sort_cols, ascending=False),
-        width="stretch"
+        df_candidates.sort_values(sort_cols, ascending=asc),
+        width="stretch"   # si Streamlit te advierte, cambia a width="content" o "stretch" según tu versión
     )
+
 
 except Exception as e:
     st.error(f"Error en señales: {e}")
@@ -324,4 +337,53 @@ if st.button("Guardar tablas (cache_io)"):
         st.success("Tablas guardadas en cache_io.")
     except Exception as e:
         st.error(f"No se pudo guardar: {e}")
+ #======================== Paso 6: Monte Carlo (robustez) ========================
+st.header("6) Monte Carlo (robustez)")
 
+# 1) Localiza una serie de retornos del backtest (usa la que tengas)
+#    - rets2_m: mensual (v2)
+#    - rets2_q: trimestral (v2)
+#    - rets:    mensual (v1)
+trade_R = None
+for cand in ["rets2_m", "rets2_q", "rets"]:
+    if cand in locals() and isinstance(locals()[cand], (pd.Series, pd.DataFrame)):
+        s = locals()[cand]
+        if isinstance(s, pd.DataFrame) and s.shape[1] == 1:
+            s = s.iloc[:, 0]
+        if isinstance(s, pd.Series) and len(s) > 0:
+            trade_R = s.dropna().astype(float)
+            break
+
+# 2) Fallback: si sólo tienes equity, derivar retornos
+if trade_R is None:
+    for cand_eq in ["eq2_m", "eq2_q", "eq"]:
+        if cand_eq in locals() and isinstance(locals()[cand_eq], pd.Series) and len(locals()[cand_eq]) > 1:
+            trade_R = locals()[cand_eq].pct_change().dropna().astype(float)
+            break
+
+if trade_R is None or len(trade_R) < 20:
+    st.info("Aún no hay suficientes retornos del backtest para Monte Carlo. Ejecuta un backtest o amplía el periodo.")
+else:
+    # Controles de simulación
+    sims = st.slider("N° simulaciones", 1000, 20000, 5000, 500)
+    block = st.slider("Tamaño de bloque (conservar rachas)", 3, 20, 8, 1)
+
+    # Corre Monte Carlo
+    mc = mc_bootstrap_trades(trade_R, n_sims=sims, block=block, seed=42)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("CAGR p50", f"{mc['CAGR_p50']*100:.2f}%")
+        st.metric("CAGR p10", f"{mc['CAGR_p10']*100:.2f}%")
+        st.metric("CAGR p90", f"{mc['CAGR_p90']*100:.2f}%")
+    with col2:
+        st.metric("MaxDD p50", f"{mc['MaxDD_p50']*100:.1f}%")
+        st.metric("MaxDD p10", f"{mc['MaxDD_p10']*100:.1f}%")
+        st.metric("MaxDD p90", f"{mc['MaxDD_p90']*100:.1f}%")
+    with col3:
+        st.metric("Terminal p50 (×)", f"{mc['Terminal_p50']:.2f}")
+        st.metric("Terminal p10 (×)", f"{mc['Terminal_p10']:.2f}")
+        st.metric("Terminal p90 (×)", f"{mc['Terminal_p90']:.2f}")
+
+    # (Opcional) muestra JSON completo
+    with st.expander("Detalles Monte Carlo"):
+        st.json(mc)
