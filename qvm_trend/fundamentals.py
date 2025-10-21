@@ -293,116 +293,94 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     Devuelve un DF con:
       ['symbol','sector','marketCap_unified','coverage_count','ValueScore','QualityScore','VFQ','VFQ_pct_sector', ...]
     """
-    import numpy as np
-    import pandas as pd
+    # --- merge base (SIN usar 'or' sobre DataFrames)
+    if isinstance(df_universe, pd.DataFrame):
+        dfu = df_universe.copy()
+    else:
+        dfu = pd.DataFrame()
 
-    # --- merge base
-    dfu = (df_universe or pd.DataFrame()).copy()
-    dff = (df_fund or pd.DataFrame()).copy()
-    if "symbol" not in dfu.columns or dfu.empty:
+    if isinstance(df_fund, pd.DataFrame):
+        dff = df_fund.copy()
+    else:
+        dff = pd.DataFrame()
+
+    if dfu.empty or "symbol" not in dfu.columns:
         return pd.DataFrame(columns=["symbol","VFQ","coverage_count"])
+
     if "symbol" not in dff.columns:
-        dff = pd.DataFrame(columns=["symbol"])
+        dff = pd.DataFrame(columns=["symbol"])  # vacío pero mergeable
 
     df = dfu.merge(dff, on="symbol", how="left").copy()
     df["symbol"] = df["symbol"].astype(str).str.upper()
 
     # --- columnas de identificación
-    if "sector" not in df.columns:
-        df["sector"] = "Unknown"
+    for col in ["sector","industry"]:
+        if col not in df.columns:
+            df[col] = "Unknown"
     df["sector"] = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
 
     # --- market cap unificado
-    def numcol(name):
+    def numcol(name: str) -> pd.Series:
         return pd.to_numeric(df[name], errors="coerce") if name in df.columns else pd.Series(np.nan, index=df.index)
 
     mcap = pd.Series(np.nan, index=df.index)
     for c in ["marketCap","marketCap_profile","marketCap_ev"]:
         if c in df.columns:
             mcap = mcap.fillna(numcol(c))
-    # fallback: price * sharesOutstanding
-    if "price" in df.columns and ("sharesOutstanding" in df.columns or "shares_out_ttm" in df.columns):
-        px = numcol("price")
-        sh = numcol("sharesOutstanding") if "sharesOutstanding" in df.columns else numcol("shares_out_ttm")
+
+    # fallback: price * sharesOutstanding (o shares_out_ttm)
+    px = numcol("price")
+    sh = numcol("sharesOutstanding") if "sharesOutstanding" in df.columns else numcol("shares_out_ttm")
+    if px.notna().any() and sh.notna().any():
         mcap = mcap.fillna(px * sh)
 
     df["marketCap_unified"] = pd.to_numeric(mcap, errors="coerce")
 
-    # --- bucket por tamaño (3 cuantiles por defecto)
-    def _bucket_by_quantiles(s: pd.Series, q: int = 3) -> pd.Series:
-        r = s.rank(method="first", na_option="keep")
-        try:
-            return pd.qcut(r, q, labels=False, duplicates="drop")
-        except Exception:
-            if r.max() and pd.notna(r.max()) and r.max() > 0:
-                pct = r / r.max()
-            else:
-                pct = r
-            return pd.Series(np.select([pct <= 0.33, pct <= 0.66, pct > 0.66], [0,1,2], default=np.nan), index=s.index)
-
+    # --- bucket por tamaño (usa helper global _bucket_by_quantiles)
     df["size_bucket"] = _bucket_by_quantiles(df["marketCap_unified"], q=size_buckets)
     grp_key = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
 
-    # --------- NUEVO: derivar métricas que faltaban ----------
-    ev = numcol("evToEbitda")
-    gp = numcol("grossProfitTTM")
-    ta = numcol("totalAssetsTTM")
+    # --------- derivadas para Value/Quality ----------
+    ev  = numcol("evToEbitda")
     fcf = numcol("fcf_ttm")
+    gp  = numcol("grossProfitTTM")
+    ta  = numcol("totalAssetsTTM")
 
-    # Value
     df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
     df["fcf_yield"] = (fcf / df["marketCap_unified"]).replace([np.inf, -np.inf], np.nan)
-
-    # Quality extra (si quieres usarla)
     df["gross_profitability"] = (gp / ta).replace([np.inf, -np.inf], np.nan)
 
     # --- columnas VFQ disponibles
     val_cols = [c for c in ["fcf_yield","inv_ev_ebitda"] if c in df.columns]
     q_cols   = [c for c in ["gross_profitability","roic","roa","netMargin"] if c in df.columns]
 
-    # --- winsor suave
-    def _winsor(s: pd.Series, p: float = 0.01) -> pd.Series:
-        if s is None or s.empty:
-            return s
-        s = pd.to_numeric(s, errors="coerce")
-        lo, hi = s.quantile(p), s.quantile(1-p)
-        return s.clip(lo, hi)
-
+    # winsor suave
     for c in val_cols + q_cols:
         df[c] = _winsor(df[c], 0.01)
 
-    # --- coverage_count (sobre las que realmente existen)
     fields = val_cols + q_cols
     if len(fields) == 0:
         df["coverage_count"] = 0
-        df["ValueScore"] = np.nan; df["QualityScore"] = np.nan; df["VFQ"] = np.nan; df["VFQ_pct_sector"] = 1.0
+        df["ValueScore"] = np.nan
+        df["QualityScore"] = np.nan
+        df["VFQ"] = np.nan
+        df["VFQ_pct_sector"] = 1.0
         return df
 
     df["coverage_count"] = df[fields].notna().sum(axis=1)
 
-    # --- ranks por grupo tamaño-sector (asc=False = mayor mejor)
-    def _rank_group(col):
+    def _rank_group(col: str) -> pd.Series:
         s = pd.to_numeric(df[col], errors="coerce")
         return s.groupby(grp_key).rank(method="average", ascending=False, na_option="bottom")
 
-    if len(val_cols) > 0:
-        val_ranks = pd.concat([_rank_group(c) for c in val_cols], axis=1)
-        df["ValueScore"] = val_ranks.mean(axis=1)
-    else:
-        df["ValueScore"] = np.nan
+    df["ValueScore"]   = pd.concat([_rank_group(c) for c in val_cols], axis=1).mean(axis=1) if val_cols else np.nan
+    df["QualityScore"] = pd.concat([_rank_group(c) for c in q_cols],  axis=1).mean(axis=1) if q_cols else np.nan
+    df["VFQ"]          = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1, skipna=True)
 
-    if len(q_cols) > 0:
-        q_ranks = pd.concat([_rank_group(c) for c in q_cols], axis=1)
-        df["QualityScore"] = q_ranks.mean(axis=1)
-    else:
-        df["QualityScore"] = np.nan
-
-    # VFQ: media de lo disponible (ignora NaNs)
-    df["VFQ"] = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1, skipna=True)
-
-    # percentil intra-sector robusto (con relleno)
+    # VFQ percentil intra-sector (robusto)
     try:
-        df["VFQ_pct_sector"] = df.groupby(df["sector"])["VFQ"].rank(pct=True)
+        sec = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
+        df["VFQ_pct_sector"] = df.groupby(sec)["VFQ"].rank(pct=True)
     except Exception:
         df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
     df["VFQ_pct_sector"] = df["VFQ_pct_sector"].fillna(1.0)
