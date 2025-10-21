@@ -31,27 +31,71 @@ def apply_trend_filter(panel: Dict[str, pd.DataFrame], use_and=False) -> List[st
             elig.append(sym)
     return elig
 
-def enrich_with_breakout(df_sel: pd.DataFrame, price_map: Dict[str, pd.DataFrame],
-                         benchmark_series=None, float_map=None, th=DEFAULT_TH, min_score=0.6) -> pd.DataFrame:
+def enrich_with_breakout(
+    panel: dict[str, pd.DataFrame],
+    rvol_lookback: int = 20,
+    rvol_th: float = 1.5,
+    closepos_th: float = 0.6,
+    p52_th: float = 0.95,
+    updown_vol_th: float = 1.2,
+    bench_series: pd.Series | None = None,
+    min_hits: int = 4,             # <-- nuevo: mínimo de checks que deben cumplirse (0..4)
+    use_rs_slope: bool = False,    # opcional: añadir RS slope>0 como check extra
+    rs_min_slope: float = 0.0
+) -> pd.DataFrame:
     rows = []
-    for sym in df_sel["symbol"].tolist():
-        dfp = price_map.get(sym)
-        if dfp is None or dfp.empty: continue
-        bench = benchmark_series.reindex(dfp.index).ffill() if benchmark_series is not None else None
-        shares_float = float_map.get(sym) if float_map is not None else None
-        feat, _ = compute_breakout_features(dfp, benchmark=bench, shares_float=shares_float)
-        score, tests = breakout_score(feat, th)
-        signal = entry_signal(score, tests, min_score=min_score)
+    if panel is None:
+        return pd.DataFrame(columns=["symbol","signal_breakout"])
+
+    bench_close = None
+    if isinstance(bench_series, pd.Series):
+        bench_close = bench_series.astype(float).copy()
+        bench_close.index = pd.to_datetime(bench_close.index)
+
+    for sym, df in panel.items():
+        if df is None or df.empty:
+            rows.append({"symbol": sym, "signal_breakout": False}); continue
+        dfx = df.copy().sort_index()
+
+        rvol = _rvol_last(dfx, rvol_lookback)
+        cpos = _closepos_last(dfx)
+        p52  = _p52_last(dfx, 252)
+        udr  = _updown_vol_ratio(dfx, 20)
+        rs_sl = _rs_ma20_slope(dfx, bench_close) if bench_close is not None else np.nan
+
+        c_rvol = bool(np.isfinite(rvol) and (rvol >= rvol_th))
+        c_cpos = bool(np.isfinite(cpos) and (cpos >= closepos_th))
+        c_p52  = bool(np.isfinite(p52)  and (p52  >= p52_th))
+        c_udr  = bool(np.isfinite(udr)  and (udr  >= updown_vol_th))
+
+        hits = int(c_rvol) + int(c_cpos) + int(c_p52) + int(c_udr)
+
+        # opcional: RS slope como check extra
+        c_rss = False
+        if use_rs_slope and np.isfinite(rs_sl):
+            c_rss = (rs_sl > rs_min_slope)
+            hits += int(c_rss)
+
+        sig = (hits >= int(min_hits))
+
         rows.append({
-            "symbol": sym, "BreakoutScore": score, "EntrySignal": signal,
-            "RVOL20": feat.rvol20, "ClosePos": feat.closepos, "P52": feat.p52,
-            "TSMOM20": feat.tsmom20, "TSMOM63": feat.tsmom63, "MA20_slope": feat.ma20_slope,
-            "OBV_slope20": feat.obv_slope20, "ADL_slope20": feat.adl_slope20,
-            "UDVolRatio20": feat.updown_vol_ratio20, "RS_MA20_slope": feat.rs_ma20_slope,
-            "ATR_pct_rank": feat.atr_pct_rank, "GapHold": feat.gap_hold, "FloatVelocity": feat.float_velocity
+            "symbol": sym,
+            "RVOL20": rvol,
+            "ClosePos": cpos,
+            "P52": p52,
+            "UDVol20": udr,
+            "rs_ma20_slope": rs_sl,
+            "c_RVOL": c_rvol,
+            "c_ClosePos": c_cpos,
+            "c_P52": c_p52,
+            "c_UDVol": c_udr,
+            "c_RSslope": c_rss,
+            "hits": hits,
+            "signal_breakout": bool(sig)
         })
-    out = pd.DataFrame(rows)
-    return df_sel.merge(out, on="symbol", how="left")
+
+    return pd.DataFrame(rows).drop_duplicates("symbol", keep="last")
+
 
 
 def _ma(s: pd.Series, n: int) -> pd.Series:

@@ -86,7 +86,8 @@ rvol_th = st.sidebar.slider("RVOL 20d (umbral)", 1.0, 3.0, 1.5, step=0.1)
 closepos_th = st.sidebar.slider("ClosePos (0–1)", 0.0, 1.0, 0.6, step=0.05)
 p52_th = st.sidebar.slider("P52 (proximidad a 52W high)", 0.80, 1.05, 0.95, step=0.01)
 updown_vol_th = st.sidebar.slider("Up/Down Vol Ratio (20d)", 0.5, 3.0, 1.2, step=0.1)
-
+min_hits = st.sidebar.slider("Breakout: mín. checks verdaderos (0-5)", 1, 5, 3, step=1)
+use_rs_slope = st.sidebar.checkbox("Usar RS slope > 0 como check extra", value=False)
 # Cache / Acciones
 st.sidebar.subheader("Cache / Acciones")
 cache_tag = st.sidebar.text_input("Cache key", value="run1")
@@ -240,12 +241,33 @@ try:
         closepos_th=closepos_th,
         p52_th=p52_th,
         updown_vol_th=updown_vol_th,
-        bench_series=bench_px["close"] if isinstance(bench_px, pd.DataFrame) and "close" in bench_px.columns else None
-    )  # debe incluir 'symbol' y 'signal_breakout'
+        bench_series=bench_px["close"] if isinstance(bench_px, pd.DataFrame) and "close" in bench_px.columns else None,
+        min_hits=min_hits,
+        use_rs_slope=use_rs_slope,
+        rs_min_slope=0.0
+)
+  # debe incluir 'symbol' y 'signal_breakout'
 
     # Join señales a los scores
     df_sig = df_vfq_sel.merge(trend, on="symbol", how="left").merge(brk, on="symbol", how="left")
+ # --- Diagnóstico: cuántas pasan cada cosa
+    st.caption("Conteo señales por etapa")
+    n = len(df_sig)
+    st.write({
+        "n_total": n,
+        "trend_true": int(df_sig["signal_trend"].fillna(False).sum()),
+        "breakout_true": int(df_sig["signal_breakout"].fillna(False).sum()),
+        "entry_true": int(df_sig["ENTRY"].fillna(False).sum()),
+    })
 
+    # --- Ver distribución de métricas de breakout (últimos 100)
+    cols_dbg = ["symbol","RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope",
+                "signal_trend","signal_breakout","ENTRY"]
+    dbg = df_sig.reindex(columns=[c for c in cols_dbg if c in df_sig.columns]).copy()
+    st.subheader("Diagnóstico de métricas de breakout (muestra)")
+    st.dataframe(dbg.sort_values(["signal_breakout","RVOL20","ClosePos","P52","UDVol20"],
+                                ascending=[False,False,False,False,False]).head(100), width="stretch")
+   
     # Asegurar columnas
     if "signal_trend" not in df_sig.columns: df_sig["signal_trend"] = False
     if "signal_breakout" not in df_sig.columns: df_sig["signal_breakout"] = False
