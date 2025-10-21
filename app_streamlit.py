@@ -246,6 +246,65 @@ try:
         use_rs_slope=use_rs_slope,
         rs_min_slope=0.0
 )
+    base_cols = [c for c in ["symbol","sector","marketCap","VFQ","ValueScore","QualityScore","coverage_count"] if c in df_vfq.columns]
+    base_for_signals = df_vfq[base_cols].drop_duplicates("symbol")
+
+    df_sig = (
+        base_for_signals
+        .merge(trend if isinstance(trend, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_trend"]), on="symbol", how="left")
+        .merge(brk if isinstance(brk, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_breakout"]), on="symbol", how="left")
+    )
+
+    # --- Garantiza columnas booleanas presentes ---
+    if "signal_trend" not in df_sig.columns:
+        df_sig["signal_trend"] = False
+    df_sig["signal_trend"] = df_sig["signal_trend"].fillna(False).astype(bool)
+
+    if "signal_breakout" not in df_sig.columns:
+        df_sig["signal_breakout"] = False
+    df_sig["signal_breakout"] = df_sig["signal_breakout"].fillna(False).astype(bool)
+
+    # Crea columnas diagnósticas vacías si no existieran (para que la UI no rompa)
+    for c in ["RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope",
+            "c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope","hits"]:
+        if c not in df_sig.columns:
+            df_sig[c] = np.nan
+
+    # --- Regla de entrada (ENTRY) ---
+    require_breakout = st.sidebar.checkbox("Exigir breakout para ENTRY", value=False)
+
+    if require_breakout:
+        df_sig["ENTRY"] = df_sig["signal_trend"] & df_sig["signal_breakout"]
+    else:
+        df_sig["ENTRY"] = df_sig["signal_trend"]  # solo tendencia
+
+    # --- Conteo y diagnóstico opcional ---
+    st.caption("Conteo señales por etapa")
+    st.write({
+        "n_total": int(len(df_sig)),
+        "trend_true": int(df_sig["signal_trend"].sum()),
+        "breakout_true": int(df_sig["signal_breakout"].sum()),
+        "entry_true": int(df_sig["ENTRY"].sum()),
+    })
+
+    dbg_cols = ["symbol","RVOL20","ClosePos","P52","UDVol20","rs_ma20_slope",
+                "c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope","hits",
+                "signal_trend","signal_breakout","ENTRY"]
+    st.subheader("Diagnóstico de métricas de breakout (muestra)")
+    st.dataframe(
+        df_sig[dbg_cols].sort_values(
+            ["ENTRY","signal_breakout","hits","RVOL20","ClosePos","P52","UDVol20"],
+            ascending=[False, False, False, False, False, False, False]
+        ).head(100),
+        width="stretch"
+    )
+
+    # --- Tabla de candidatas ---
+    st.subheader("Candidatas (ENTRY = True)")
+    st.dataframe(
+        df_sig.loc[df_sig["ENTRY"]].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False),
+        width="stretch"
+    )
   # debe incluir 'symbol' y 'signal_breakout'
 
     # Join señales a los scores
