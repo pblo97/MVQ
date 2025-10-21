@@ -193,3 +193,13 @@ if st.button("Guardar tablas (cache_io)"):
         st.success("Tablas guardadas en cache_io.")
     except Exception as e:
         st.error(f"No se pudo guardar: {e}")
+
+
+from qvm_trend.data_io import fmp_probe
+
+st.subheader("Sonda FMP")
+probe = fmp_probe("AAPL")
+st.json(probe)
+if not (probe.get("key_metrics_ttm_ok") or probe.get("ratios_ttm_ok")):
+    st.error("La API FMP no está respondiendo para TTM. Verifica API key / cuota. "
+             "Usa 'Refrescar' o cambia Cache key para evitar datos cacheados vacíos.")

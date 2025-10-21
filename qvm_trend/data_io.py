@@ -381,3 +381,28 @@ def load_benchmark(symbol: str,
     """
     return get_prices_fmp(symbol, start, end)
 
+def fmp_probe(symbol: str = "AAPL") -> dict:
+    """
+    Sonda rápida: verifica que la API FMP responde y el API key está entrando.
+    Devuelve info mínima + códigos.
+    """
+    info = {"symbol": symbol}
+    try:
+        j = _http_get(f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{symbol}")
+        obj = j[0] if isinstance(j, list) and j else (j if isinstance(j, dict) else {})
+        info["key_metrics_ttm_ok"] = bool(obj)
+        info["has_ev_ebitda_ttm"] = obj.get("enterpriseValueOverEBITDATTM") is not None
+    except Exception as e:
+        info["key_metrics_ttm_ok"] = False
+        info["key_metrics_ttm_err"] = str(e)[:180]
+
+    try:
+        j2 = _http_get(f"https://financialmodelingprep.com/api/v3/ratios-ttm/{symbol}")
+        obj2 = j2[0] if isinstance(j2, list) and j2 else (j2 if isinstance(j2, dict) else {})
+        info["ratios_ttm_ok"] = bool(obj2)
+        info["has_net_margin_ttm"] = obj2.get("netProfitMarginTTM") is not None
+    except Exception as e:
+        info["ratios_ttm_ok"] = False
+        info["ratios_ttm_err"] = str(e)[:180]
+
+    return info
