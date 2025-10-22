@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, date
+from qvm_trend.fundamentals import build_vfq_scores_dynamic
 
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
@@ -125,6 +126,54 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["Universo", "Guardrails", "VFQ", "Señales", "Export"]
 )
 
+with st.sidebar:
+    st.markdown("### ⚙️ Fundamentos (VFQ)")
+
+    # Qué columnas usar (se muestran solo si existen más tarde)
+    # El calculador hará un "intersect" con las columnas reales
+    sel_value = st.multiselect(
+        "Value metrics (↑ mejor)",
+        ["fcf_yield", "inv_ev_ebitda", "earnings_yield", "shareholder_yield"],
+        default=["fcf_yield", "inv_ev_ebitda"]
+    )
+    sel_quality = st.multiselect(
+        "Quality metrics (↑ mejor)",
+        ["gross_profitability", "roic", "roa", "netMargin"],
+        default=["gross_profitability", "roic", "roa", "netMargin"]
+    )
+
+    # Pesos
+    c1, c2 = st.columns(2)
+    with c1:
+        w_value = st.slider("Peso Value", 0.0, 1.0, 0.5, 0.05)
+    with c2:
+        w_quality = st.slider("Peso Quality", 0.0, 1.0, 0.5, 0.05)
+
+    # Método de combinación de métricas dentro de cada bloque
+    method_intra = st.radio("Agregación intra-bloque", ["mean", "median", "weighted_mean"], index=0, horizontal=True)
+
+    # Winsor + agrupamiento para ranking
+    winsor_p = st.slider("Winsor p (cola)", 0.0, 0.10, 0.01, 0.005)
+    size_buckets = st.slider("Buckets por tamaño", 1, 5, 3, 1)
+    group_mode = st.selectbox("Agrupar por", ["sector", "sector|size"], index=1)
+
+    # Umbrales de selección final
+    min_cov = st.slider("Cobertura mín. (# métricas)", 0, 8, 1, 1)
+    min_pct = st.slider("VFQ pct (intra-sector) mín.", 0.00, 1.00, 0.00, 0.01)
+
+# Guardamos configuración para el calculador
+vfq_cfg = dict(
+    value_metrics=sel_value,
+    quality_metrics=sel_quality,
+    w_value=float(w_value),
+    w_quality=float(w_quality),
+    method_intra=method_intra,
+    winsor_p=float(winsor_p),
+    size_buckets=int(size_buckets),
+    group_mode=group_mode,
+)
+
+
 # ====== Paso 1: UNIVERSO ======
 with tab1:
     st.subheader("Universo inicial")
@@ -172,70 +221,44 @@ with tab2:
 
 with tab3:
     st.subheader("3) Ranking VFQ")
-    
-    
 
-    # --- Controles de filtros VFQ (UI) ---
-    c1, c2 = st.columns(2)
-    # Cobertura mínima: nº de métricas fundamentales no nulas requeridas (1–6 suele estar bien)
-    min_cov = c1.slider("Cobertura fundamentales (≥ métricas)", 0, 6, 1, 1)
-    # Umbral de percentil intra-sector (0.00–1.00). 0.05 = top 95% hacia arriba
-    min_pct = c2.slider("VFQ pct (intra-sector) mínimo", 0.00, 1.00, 0.00, 0.01)
     try:
         kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+
         with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
             df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
-            base_for_vfq = uni.merge(df_fund, on="symbol", how="right")  # right asegura que no pierdas símbolos con fundas
-            df_vfq = build_vfq_scores(base_for_vfq, base_for_vfq)
+            base_for_vfq = uni.merge(df_fund, on="symbol", how="right")  # no perder símbolos con fundas
+
+            # ➜ Nuevo calculador dinámico con tu configuración desde la sidebar
+            df_vfq = build_vfq_scores_dynamic(
+                base_for_vfq,
+                value_metrics=vfq_cfg["value_metrics"],
+                quality_metrics=vfq_cfg["quality_metrics"],
+                w_value=vfq_cfg["w_value"],
+                w_quality=vfq_cfg["w_quality"],
+                method_intra=vfq_cfg["method_intra"],
+                winsor_p=vfq_cfg["winsor_p"],
+                size_buckets=vfq_cfg["size_buckets"],
+                group_mode=vfq_cfg["group_mode"],
+            )
             status.update(label="VFQ calculado", state="complete")
 
-        # diagnóstico cobertura
-        # --- diagnóstico cobertura
+        # Cobertura por métrica (opcional)
         vfq_fields = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df_vfq.columns]
         st.caption("Cobertura por métrica (no nulos)")
-        if len(vfq_fields) > 0:
+        if vfq_fields:
             st.bar_chart(df_vfq[vfq_fields].notna().sum().sort_values(ascending=False), use_container_width=True)
-        else:
-            st.info("No llegó ninguna métrica VFQ: revisa la API key/ratelimit o los nombres mapeados en download_fundamentals.")
 
-        # -------- PARCHE ANTI “truth value of a DataFrame is ambiguous” --------
-        # Asegura que min_cov y min_pct sean numéricos simples
-        min_cov = int(min_cov)
-        min_pct = float(min_pct)
-
-        # coverage_count -> Serie booleana alineada
-        if "coverage_count" in df_vfq.columns:
-            _cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0)
-            mask_cov = (_cov >= min_cov)
-        else:
-            mask_cov = pd.Series(True, index=df_vfq.index)
-
-        # VFQ_pct_sector -> Serie booleana alineada (si falta, asumimos 1.0)
-        if "VFQ_pct_sector" in df_vfq.columns:
-            _pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0)
-            mask_pct = (_pct >= min_pct)
-        else:
-            mask_pct = pd.Series(True, index=df_vfq.index)
-
-        # Fuerza que sean Series booleanas y reindexa por seguridad
-        mask_cov = pd.Series(mask_cov, index=df_vfq.index).astype(bool)
-        mask_pct = pd.Series(mask_pct, index=df_vfq.index).astype(bool)
-
-        # Combina máscaras de forma segura
-        mask_all = mask_cov & mask_pct
-
-        # DEBUG opcional (quitar si no lo necesitas)
-        # st.write({"mask_cov_dtype": mask_cov.dtype, "mask_pct_dtype": mask_pct.dtype,
-        #           "mask_cov_shape": mask_cov.shape, "mask_pct_shape": mask_pct.shape,
-        #           "df_vfq_shape": df_vfq.shape})
-
-        df_vfq_sel = df_vfq.loc[mask_all].copy()
+        # Filtros finales con tus sliders 'min_cov' y 'min_pct'
+        mask_cov = pd.to_numeric(df_vfq.get("coverage_count", 0), errors="coerce").fillna(0) >= int(min_cov)
+        mask_pct = pd.to_numeric(df_vfq.get("VFQ_pct_sector", 1.0), errors="coerce").fillna(1.0) >= float(min_pct)
+        df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
 
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
 
         cols_show = [c for c in [
             "symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
-            "fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"
+            "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"
         ] if c in df_vfq_sel.columns]
 
         st.dataframe(
@@ -243,26 +266,9 @@ with tab3:
             use_container_width=True, hide_index=True
         )
 
-        st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")
-        st.write({
-            "símbolos_guardrails": len(kept_syms),
-            "filas_fund": 0 if df_fund is None else len(df_fund),
-            "cols_fund": [] if df_fund is None else list(df_fund.columns),
-        })
-
-        if isinstance(df_fund, pd.DataFrame) and not df_fund.empty:
-            base_cols_dbg = [
-                "evToEbitda", "fcf_ttm", "cfo_ttm", "ebit_ttm",
-                "grossProfitTTM", "totalAssetsTTM", "roic", "roa", "netMargin",
-                "marketCap", "__err_fund"
-            ]
-            present = [c for c in base_cols_dbg if c in df_fund.columns]
-            st.write("No-nulos por columna base:", df_fund[present].notna().sum().sort_values(ascending=False).to_dict())
-            # Muestra rápida (con posibles errores devueltos por la API):
-            st.dataframe(df_fund[["symbol"] + present].head(20), use_container_width=True, hide_index=True)
-
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
 
 
     st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")

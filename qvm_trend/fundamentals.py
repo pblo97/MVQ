@@ -613,3 +613,99 @@ def apply_quality_guardrails(df: pd.DataFrame,
     d["guard_all"]      = mask
 
     return d[mask].copy(), d
+
+
+def build_vfq_scores_dynamic(
+    df: pd.DataFrame,
+    value_metrics: list[str],
+    quality_metrics: list[str],
+    w_value: float = 0.5,
+    w_quality: float = 0.5,
+    method_intra: str = "mean",    # "mean" | "median" | "weighted_mean" (equipesos)
+    winsor_p: float = 0.01,
+    size_buckets: int = 3,
+    group_mode: str = "sector",    # "sector" | "sector|size"
+) -> pd.DataFrame:
+    df = df.copy()
+
+    # Helpers
+    def _numcol(name):
+        return pd.to_numeric(df[name], errors="coerce") if name in df.columns else pd.Series(np.nan, index=df.index)
+
+    def _winsor(s: pd.Series, p: float):
+        s = pd.to_numeric(s, errors="coerce")
+        if s.isna().all() or p <= 0:
+            return s
+        lo, hi = s.quantile(p), s.quantile(1 - p)
+        return s.clip(lo, hi)
+
+    # ——— derivadas mínimas si faltan (ya las tienes, pero por si acaso)
+    if "inv_ev_ebitda" in value_metrics and "inv_ev_ebitda" not in df.columns:
+        ev = _numcol("evToEbitda")
+        df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
+
+    if "fcf_yield" in value_metrics and "fcf_yield" not in df.columns:
+        df["fcf_yield"] = (_numcol("fcf_ttm") / _numcol("marketCap_unified")).replace([np.inf, -np.inf], np.nan)
+
+    if "gross_profitability" in quality_metrics and "gross_profitability" not in df.columns:
+        df["gross_profitability"] = (_numcol("grossProfitTTM") / _numcol("totalAssetsTTM")).replace([np.inf, -np.inf], np.nan)
+
+    # Conjuntos reales disponibles
+    V = [c for c in value_metrics if c in df.columns]
+    Q = [c for c in quality_metrics if c in df.columns]
+
+    # Winsorizar todo lo que se usa
+    for c in set(V + Q):
+        df[c] = _winsor(df[c], winsor_p)
+
+    # Coverage (solo sobre columnas efectivamente disponibles)
+    use_cols = V + Q
+    df["coverage_count"] = df[use_cols].notna().sum(axis=1) if use_cols else 0
+
+    # Agrupamiento: sector o sector|size
+    # Tamaño por cuantiles (si se pide)
+    if size_buckets > 1:
+        mcap = _numcol("marketCap_unified")
+        r = mcap.rank(method="first", na_option="keep")
+        try:
+            size_bucket = pd.qcut(r, size_buckets, labels=False, duplicates="drop")
+        except Exception:
+            size_bucket = pd.Series(np.nan, index=df.index)
+    else:
+        size_bucket = pd.Series(0, index=df.index)
+
+    df["sector"] = df.get("sector", "Unknown").fillna("Unknown").astype(str)
+    grp_key = df["sector"] if group_mode == "sector" else df["sector"].astype(str) + "|" + size_bucket.astype(str)
+
+    # Ranking por grupo (↑ mejor => descending)
+    def _rank_group(col):
+        s = pd.to_numeric(df[col], errors="coerce")
+        return s.groupby(grp_key).rank(method="average", ascending=False, na_option="bottom")
+
+    def _block_score(cols):
+        if not cols:
+            return pd.Series(np.nan, index=df.index)
+        ranks = pd.concat([_rank_group(c) for c in cols], axis=1)
+        if method_intra == "median":
+            return ranks.median(axis=1)
+        # weighted_mean: pesos iguales → mean
+        return ranks.mean(axis=1)
+
+    df["ValueScore"]   = _block_score(V)
+    df["QualityScore"] = _block_score(Q)
+
+    # VFQ con pesos de bloques
+    w_sum = (w_value or 0) + (w_quality or 0)
+    if w_sum == 0:
+        w_value = w_quality = 0.5
+        w_sum = 1.0
+    df["VFQ"] = (df["ValueScore"] * w_value + df["QualityScore"] * w_quality) / w_sum
+
+    # Percentil intra-sector (robusto)
+    try:
+        df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
+    except Exception:
+        df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
+    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].fillna(1.0)
+
+    return df
