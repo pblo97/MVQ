@@ -110,7 +110,7 @@ with st.sidebar:
         end = st.date_input("Fin", value=pd.to_datetime(DEFAULT_END).date())
 
     st.markdown("---")
-    run_btn = st.button("🚀 Ejecutar / Refrescar", use_container_width=True)
+    run_btn = st.button("Ejecutar", use_container_width=True)
 
 # Aplica presets en sliders (sin pisar lo que el usuario ya cambió)
 if preset == "Laxo":
@@ -127,7 +127,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 )
 
 with st.sidebar:
-    st.markdown("### ⚙️ Fundamentos (VFQ)")
+    st.markdown("⚙️ Fundamentos (VFQ)")
 
     # Qué columnas usar (se muestran solo si existen más tarde)
     # El calculador hará un "intersect" con las columnas reales
@@ -220,16 +220,16 @@ with tab2:
 
 
 with tab3:
-    st.subheader("3) Ranking VFQ")
+    st.subheader("VFQ")
 
     try:
         kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
 
+        # 1) Descarga + cálculo VFQ (dinámico)
         with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
             df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
             base_for_vfq = uni.merge(df_fund, on="symbol", how="right")  # no perder símbolos con fundas
 
-            # ➜ Nuevo calculador dinámico con tu configuración desde la sidebar
             df_vfq = build_vfq_scores_dynamic(
                 base_for_vfq,
                 value_metrics=vfq_cfg["value_metrics"],
@@ -243,17 +243,39 @@ with tab3:
             )
             status.update(label="VFQ calculado", state="complete")
 
-        # Cobertura por métrica (opcional)
-        vfq_fields = [c for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"] if c in df_vfq.columns]
-        st.caption("Cobertura por métrica (no nulos)")
-        if vfq_fields:
-            st.bar_chart(df_vfq[vfq_fields].notna().sum().sort_values(ascending=False), use_container_width=True)
+        # 2) Diagnóstico mínimo (una sola vez)
+        st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")
+        st.json({
+            "símbolos_guardrails": int(len(kept_syms)),
+            "filas_fund": 0 if df_fund is None else int(len(df_fund)),
+            "cols_fund": [] if df_fund is None else list(df_fund.columns)[:20]
+        })
 
-        # Filtros finales con tus sliders 'min_cov' y 'min_pct'
+        # No-nulos de columnas base (las que alimentan derivadas)
+        base_non_nulls = {}
+        for c in ["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm","roic","roa","netMargin","marketCap","totalAssetsTTM","grossProfitTTM"]:
+            if c in df_vfq.columns:
+                base_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
+        st.caption("No-nulos por columna base:")
+        st.json(base_non_nulls)
+
+        # Cobertura de métricas derivadas VFQ (gráfico único)
+        vfq_non_nulls = {}
+        for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin","VFQ"]:
+            if c in df_vfq.columns:
+                vfq_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
+        st.caption("Cobertura por métrica (no nulos)")
+        if vfq_non_nulls:
+            st.bar_chart(pd.Series(vfq_non_nulls).sort_values(ascending=False), use_container_width=True)
+        else:
+            st.info("No llegó ninguna métrica VFQ: revisa el mapeo/descargas.")
+
+        # 3) Filtros finales (cobertura y percentil intra-sector) — se aplican UNA vez
         mask_cov = pd.to_numeric(df_vfq.get("coverage_count", 0), errors="coerce").fillna(0) >= int(min_cov)
         mask_pct = pd.to_numeric(df_vfq.get("VFQ_pct_sector", 1.0), errors="coerce").fillna(1.0) >= float(min_pct)
         df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
 
+        # Métrica y tabla
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
 
         cols_show = [c for c in [
@@ -266,73 +288,18 @@ with tab3:
             use_container_width=True, hide_index=True
         )
 
+        # Embudo simple
+        n_total = len(df_vfq)
+        n_cov   = int(mask_cov.sum())
+        n_pct   = int(mask_pct.sum())
+        st.info(f"Embudo VFQ → total={n_total} | cobertura≥{min_cov}: {n_cov} | pct≥{min_pct}: {n_pct} | elegibles={len(df_vfq_sel)}")
+
+        # (Opcional) Guardar para usar en pestañas siguientes
+        st.session_state["vfq"] = df_vfq
+        st.session_state["vfq_sel"] = df_vfq_sel
+
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
-
-
-
-    st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")
-    st.json({
-        "símbolos_guardrails": int(len(kept_syms)),
-        "filas_fund": 0 if df_fund is None else int(len(df_fund)),
-        "cols_fund": [] if df_fund is None else list(df_fund.columns)[:20]
-    })
-
-    # Non-nulos de las columnas base que alimentan VFQ (antes de derivar)
-    base_non_nulls = {}
-    for c in ["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm","roic","roa","netMargin","marketCap","totalAssetsTTM","grossProfitTTM"]:
-        if c in df_vfq.columns:
-            base_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
-    st.caption("No-nulos por columna base:")
-    st.json(base_non_nulls)
-
-    # Muestra de las columnas base y derivadas clave
-    cols_debug = [c for c in [
-        "symbol","sector","marketCap_unified",
-        "evToEbitda","fcf_ttm","roic","roa","netMargin",
-        "fcf_yield","inv_ev_ebitda","gross_profitability",
-        "coverage_count","ValueScore","QualityScore","VFQ","VFQ_pct_sector"
-    ] if c in df_vfq.columns]
-    st.dataframe(df_vfq[cols_debug].head(12), use_container_width=True)
-
-    # Non-nulos de las métricas VFQ ya derivadas (éstas deben tener >0 si todo viene bien)
-    vfq_non_nulls = {}
-    for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin","VFQ"]:
-        if c in df_vfq.columns:
-            vfq_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
-    st.caption("Cobertura por métrica (no nulos)")
-    if vfq_non_nulls:
-        st.bar_chart(pd.Series(vfq_non_nulls).sort_values(ascending=False), use_container_width=True)
-    else:
-        st.info("No llegó ninguna métrica VFQ: revisa el mapeo/descargas.")
-
-    # --- Filtros robustos (evitan 'truth value is ambiguous') ---
-    mask_cov = pd.Series(True, index=df_vfq.index)
-    if "coverage_count" in df_vfq.columns:
-        mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
-
-    mask_pct = pd.Series(True, index=df_vfq.index)
-    if "VFQ_pct_sector" in df_vfq.columns:
-        mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= float(min_pct)
-
-    df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
-
-    st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
-
-    cols_show = [c for c in [
-        "symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
-        "fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"
-    ] if c in df_vfq_sel.columns]
-    st.dataframe(
-        df_vfq_sel[cols_show].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False).head(300),
-        use_container_width=True, hide_index=True
-    )
-
-    n_total = len(df_vfq)
-    n_cov   = int((pd.to_numeric(df_vfq.get("coverage_count"), errors="coerce").fillna(0) >= int(min_cov)).sum())
-    n_pct   = int((pd.to_numeric(df_vfq.get("VFQ_pct_sector"), errors="coerce").fillna(1.0) >= float(min_pct)).sum())
-
-    st.info(f"Embudo VFQ → total={n_total} | cobertura≥{min_cov}: {n_cov} | pct≥{min_pct}: {n_pct} | elegibles={len(df_vfq_sel)}")
 
 
 # ====== Paso 4: SEÑALES (Tendencia & Breakout) ======
