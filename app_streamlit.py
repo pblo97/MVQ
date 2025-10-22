@@ -262,7 +262,62 @@ with tab3:
         st.error(f"Error en VFQ: {e}")
 
 
+st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")
+st.json({
+    "símbolos_guardrails": int(len(kept_syms)),
+    "filas_fund": 0 if df_fund is None else int(len(df_fund)),
+    "cols_fund": [] if df_fund is None else list(df_fund.columns)[:20]
+})
 
+# Non-nulos de las columnas base que alimentan VFQ (antes de derivar)
+base_non_nulls = {}
+for c in ["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm","roic","roa","netMargin","marketCap","totalAssetsTTM","grossProfitTTM"]:
+    if c in df_vfq.columns:
+        base_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
+st.caption("No-nulos por columna base:")
+st.json(base_non_nulls)
+
+# Muestra de las columnas base y derivadas clave
+cols_debug = [c for c in [
+    "symbol","sector","marketCap_unified",
+    "evToEbitda","fcf_ttm","roic","roa","netMargin",
+    "fcf_yield","inv_ev_ebitda","gross_profitability",
+    "coverage_count","ValueScore","QualityScore","VFQ","VFQ_pct_sector"
+] if c in df_vfq.columns]
+st.dataframe(df_vfq[cols_debug].head(12), use_container_width=True)
+
+# Non-nulos de las métricas VFQ ya derivadas (éstas deben tener >0 si todo viene bien)
+vfq_non_nulls = {}
+for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin","VFQ"]:
+    if c in df_vfq.columns:
+        vfq_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
+st.caption("Cobertura por métrica (no nulos)")
+if vfq_non_nulls:
+    st.bar_chart(pd.Series(vfq_non_nulls).sort_values(ascending=False), use_container_width=True)
+else:
+    st.info("No llegó ninguna métrica VFQ: revisa el mapeo/descargas.")
+
+# --- Filtros robustos (evitan 'truth value is ambiguous') ---
+mask_cov = pd.Series(True, index=df_vfq.index)
+if "coverage_count" in df_vfq.columns:
+    mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
+
+mask_pct = pd.Series(True, index=df_vfq.index)
+if "VFQ_pct_sector" in df_vfq.columns:
+    mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= float(min_pct)
+
+df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
+
+st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
+
+cols_show = [c for c in [
+    "symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
+    "fcf_yield","inv_ev_ebitda","gross_profitability","netMargin"
+] if c in df_vfq_sel.columns]
+st.dataframe(
+    df_vfq_sel[cols_show].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False).head(300),
+    use_container_width=True, hide_index=True
+)
 
 
 # ====== Paso 4: SEÑALES (Tendencia & Breakout) ======
