@@ -369,7 +369,7 @@ with tab4:
             )
 
             # Candidatas ordenadas pro
-            st.subheader("Candidatas (ENTRY = True)")
+            st.subheader("Entradas")
             df_candidates = df_sig.loc[df_sig["ENTRY"]].copy()
             sort_cols = [c for c in ["BreakoutScore","VFQ","ValueScore","QualityScore"] if c in df_candidates.columns]
             asc = [False] * len(sort_cols) if sort_cols else [False]
