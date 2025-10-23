@@ -40,61 +40,8 @@ from qvm_trend.pipeline import (
     market_regime_on
 )
 from qvm_trend.backtests import backtest_many
-from qvm_trend.stats import beta_vs_bench, win_loss_stats, expectancy
 
-# ------------------ PERSISTENCIA DE CARTERA ------------------
-PORTFOLIO_PATH = "portfolio_symbols.csv"
-
-def _portfolio_empty_df() -> pd.DataFrame:
-    return pd.DataFrame(columns=["symbol", "date_added"]).astype({"symbol":"string","date_added":"string"})
-
-def load_portfolio_df() -> pd.DataFrame:
-    try:
-        if os.path.exists(PORTFOLIO_PATH):
-            df = pd.read_csv(PORTFOLIO_PATH)
-            if "symbol" not in df.columns:
-                return _portfolio_empty_df()
-            df["symbol"] = df["symbol"].astype(str).str.upper()
-            if "date_added" not in df.columns:
-                df["date_added"] = datetime.now().strftime("%Y-%m-%d")
-            return df.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
-        else:
-            return _portfolio_empty_df()
-    except Exception:
-        return _portfolio_empty_df()
-
-def save_portfolio_df(df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        _portfolio_empty_df().to_csv(PORTFOLIO_PATH, index=False)
-    else:
-        out = df.copy()
-        out["symbol"] = out["symbol"].astype(str).str.upper()
-        if "date_added" not in out.columns:
-            out["date_added"] = datetime.now().strftime("%Y-%m-%d")
-        out.drop_duplicates(subset=["symbol"]).to_csv(PORTFOLIO_PATH, index=False)
-
-def add_symbols_to_portfolio(symbols: list[str]) -> pd.DataFrame:
-    if not symbols:
-        return load_portfolio_df()
-    df = load_portfolio_df()
-    add = pd.DataFrame({
-        "symbol": [s.strip().upper() for s in symbols if s and str(s).strip()],
-        "date_added": datetime.now().strftime("%Y-%m-%d")
-    })
-    merged = pd.concat([df, add], ignore_index=True)
-    merged = merged.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
-    save_portfolio_df(merged)
-    return merged
-
-def remove_symbols_from_portfolio(symbols: list[str]) -> pd.DataFrame:
-    df = load_portfolio_df()
-    if df.empty or not symbols:
-        return df
-    keep = df[~df["symbol"].isin([s.strip().upper() for s in symbols])]
-    save_portfolio_df(keep)
-    return keep
-
-# ------------------ CACHÉ DE I/O (NUEVO) ------------------
+# ------------------ CACHÉ DE I/O ------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_load_prices_panel(symbols, start, end, cache_key=""):
     return load_prices_panel(symbols, start, end, cache_key=cache_key, force=False)
@@ -182,13 +129,13 @@ elif preset == "Estricto":
 # cache tag por corrida
 cache_tag = f"{int(min_mcap)}_{ipo_days}_{limit}"
 
-# Estado del pipeline (para evitar recomputar en cada rerun)
+# Estado del pipeline
 if "pipeline_ready" not in st.session_state:
     st.session_state["pipeline_ready"] = False
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Universo", "Guardrails", "VFQ", "Señales", "Export", "Backtesting", "Gestión de cartera"]
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Universo", "Guardrails", "VFQ", "Señales", "Export", "Backtesting"]
 )
 
 # ==================== VFQ sidebar extra ====================
@@ -236,7 +183,7 @@ with tab1:
                 status.update(label=f"Universo listo: {len(uni)} símbolos", state="complete")
             st.session_state["uni_raw"] = uni_raw
             st.session_state["uni"] = uni
-            st.session_state["pipeline_ready"] = False  # aún falta seguir pasos
+            st.session_state["pipeline_ready"] = False
         elif "uni" in st.session_state:
             uni = st.session_state["uni"]
             uni_raw = st.session_state.get("uni_raw", pd.DataFrame())
@@ -430,10 +377,10 @@ with tab4:
             }
         )
 
-        # guarda en session para otras pestañas
+        # guarda en session para Export y Backtesting
         st.session_state["guard_diag"] = st.session_state.get("guard_diag", pd.DataFrame())
         st.session_state["signals"] = df_sig
-        st.session_state["pipeline_ready"] = True  # pipeline completo disponible
+        st.session_state["pipeline_ready"] = True
 
     except Exception as e:
         st.error(f"Error en señales: {e}")
@@ -504,7 +451,6 @@ with tab6:
             start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
             end_iso = end.isoformat()
 
-            # ↓↓↓ USAR CACHÉ ↓↓↓
             panel_bt = _cached_load_prices_panel(symbols_bt, start_ext, end_iso, cache_key="bt_panel")
             if not panel_bt:
                 st.error("No pude cargar precios para los símbolos.")
@@ -519,113 +465,3 @@ with tab6:
                 st.subheader("Equity curves")
                 for s, eq in curves.items():
                     st.line_chart(eq.rename(s), use_container_width=True)
-
-# ====== Pestaña 7: GESTIÓN DE CARTERA (PERSISTENTE) ======
-with tab7:
-    st.subheader("📊 Gestión de Cartera — Persistente (Kelly fracc. + límite por beta)")
-    st.markdown(
-        "Calcula pesos **solo** con los símbolos de tu **cartera persistente** (CSV). "
-        "Añade desde **Entradas (ENTRY=True)** o manualmente; remueve cuando vendas.  \n"
-        "**Sizing**: Kelly `f* = p − (1−p)/b` con `b = AvgWin/|AvgLoss|` → **Kelly fracc.** + **cap por símbolo**, "
-        "y normalización `∑(β·w) ≤ beta_cap`."
-    )
-
-    # --- Cartera persistente (gestión rápida) ---
-    st.markdown("#### Cartera persistente (símbolos en posición)")
-    portfolio_df = load_portfolio_df()
-    st.dataframe(portfolio_df if not portfolio_df.empty else _portfolio_empty_df(), use_container_width=True, hide_index=True)
-    cpa, cpb, cpc = st.columns([0.45, 0.35, 0.20])
-
-    sig_df = st.session_state.get("signals", pd.DataFrame())
-    entry_syms = sig_df.loc[sig_df["ENTRY"], "symbol"].dropna().astype(str).unique().tolist() if ("ENTRY" in sig_df.columns and not sig_df.empty) else []
-    add_from_entry = cpa.multiselect("Añadir desde entradas (ENTRY=True)", options=entry_syms, default=[])
-    manual_add = cpb.text_input("Añadir manual (coma-separado)", value="").strip()
-    btn_add = cpc.button("➕ Añadir", use_container_width=True)
-    if btn_add:
-        syms_to_add = add_from_entry + [s.strip().upper() for s in manual_add.split(",") if s.strip()]
-        if syms_to_add:
-            portfolio_df = add_symbols_to_portfolio(syms_to_add)
-            st.success(f"Agregados: {', '.join(syms_to_add)}")
-        else:
-            st.info("No hay símbolos para agregar.")
-
-    st.markdown("##### Quitar de la cartera")
-    rm_sel = st.multiselect("Selecciona símbolos a remover", options=portfolio_df["symbol"].tolist() if not portfolio_df.empty else [], default=[])
-    if st.button("🗑️ Remover seleccionados", use_container_width=True):
-        if rm_sel:
-            portfolio_df = remove_symbols_from_portfolio(rm_sel)
-            st.success(f"Removidos: {', '.join(rm_sel)}")
-        else:
-            st.info("No seleccionaste símbolos.")
-
-    st.markdown("---")
-
-    # --- Cálculo de pesos (solo cartera persistente) ---
-    st.markdown("#### Cálculo de pesos sobre la cartera persistente")
-    syms_port = portfolio_df["symbol"].tolist() if not portfolio_df.empty else []
-    bench_ticker = st.text_input("Benchmark para beta (ej: SPY)", value=st.session_state.get("bench", "SPY")).strip().upper() or "SPY"
-    base_kelly = st.slider("Fracción de Kelly base", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
-    vol_cap = st.number_input("Cap por posición (proxy vol) [% equity]", min_value=0.01, max_value=0.10, value=0.03, step=0.01, format="%.2f")
-    beta_cap = st.number_input("Cap ∑(beta·peso) <=", min_value=0.25, max_value=2.0, value=1.0, step=0.05)
-
-    run_pm = st.button("🧮 Calcular pesos (cartera persistente)", use_container_width=True)
-    if run_pm:
-        if not syms_port:
-            st.warning("Tu cartera persistente está vacía. Agrega símbolos primero.")
-        else:
-            import pandas as pd
-            extend_days = 420
-            start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
-            end_iso = end.isoformat()
-
-            # ↓↓↓ USAR CACHÉ ↓↓↓
-            pnl = _cached_load_prices_panel(syms_port + [bench_ticker], start_ext, end_iso, cache_key="pm_panel")
-            if bench_ticker not in pnl:
-                st.error("No pude cargar el benchmark para calcular betas.")
-            else:
-                bench_daily = pnl[bench_ticker]['close'].pct_change().dropna()
-                bench_m = bench_daily.resample('M').apply(lambda x: (1+x).prod()-1).dropna()
-
-                rows = []
-                for s in syms_port:
-                    if s not in pnl:
-                        continue
-                    ser = pnl[s]['close'].pct_change().dropna()
-                    ser_m = ser.resample('M').apply(lambda x: (1+x).prod()-1).dropna()
-
-                    p, avg_win, avg_loss = win_loss_stats(ser_m)
-                    b = abs(avg_win / avg_loss) if (avg_loss not in (0, None)) else np.nan
-                    kelly = 0.0
-                    if b and b > 0:
-                        kelly = max(0.0, min(1.0, p - (1.0 - p)/b))
-                    f_prop = min(base_kelly * kelly, vol_cap)
-
-                    beta = beta_vs_bench(ser_m, bench_m)
-                    rows.append({
-                        'symbol': s,
-                        'HitRate': p,
-                        'AvgWin': avg_win,
-                        'AvgLoss': avg_loss,
-                        'Payoff': (abs(avg_win/avg_loss) if (avg_loss not in (0, None)) else np.nan),
-                        'Kelly*': kelly,
-                        'Propuesta_w': f_prop,
-                        'Beta': beta
-                    })
-
-                dfw = pd.DataFrame(rows)
-                if dfw.empty:
-                    st.warning("No se pudieron calcular pesos (verifica datos).")
-                else:
-                    dfw['beta_w'] = dfw['Beta'].fillna(1.0) * dfw['Propuesta_w'].fillna(0.0)
-                    total_beta_w = dfw['beta_w'].sum()
-                    scale = 1.0
-                    if total_beta_w > beta_cap and total_beta_w > 0:
-                        scale = beta_cap / total_beta_w
-                    dfw['Peso_final'] = dfw['Propuesta_w'] * scale
-
-                    st.subheader("Pesos propuestos (cartera persistente)")
-                    st.dataframe(
-                        dfw[['symbol','HitRate','AvgWin','AvgLoss','Payoff','Kelly*','Beta','Propuesta_w','Peso_final']],
-                        use_container_width=True
-                    )
-                    st.caption("Kelly fracc. + cap por símbolo, normalizado por β total ≤ beta_cap.")
