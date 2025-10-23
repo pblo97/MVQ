@@ -129,8 +129,8 @@ elif preset == "Estricto":
 cache_tag = f"{int(min_mcap)}_{ipo_days}_{limit}"
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Universo", "Guardrails", "VFQ", "Señales", "Export"]
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["Universo", "Guardrails", "VFQ", "Señales", "Export", "Backtesting", "Gestión de cartera"]
 )
 
 with st.sidebar:
@@ -375,7 +375,7 @@ with tab4:
                 }
             )
 
-            # guarda en session para Export y menús extra
+            # guarda en session para Export y tabs nuevas
             st.session_state["uni"] = uni
             st.session_state["guard_diag"] = diag
             st.session_state["vfq"] = st.session_state.get("vfq", pd.DataFrame())
@@ -407,15 +407,18 @@ with tab5:
         _dl_btn(gdiag, "Descargar guardrails diag (CSV)", "guardrails_diag.csv")
         _dl_btn(sig_s, "Descargar señales (CSV)", "senales.csv")
 
-# ======================================================================
-# =============== MENÚS EXTRA (NO MODIFICAN TUS TABS) ==================
-# ======================================================================
+# ====== Pestaña 6: BACKTESTING ======
+with tab6:
+    st.subheader("🔎 Backtesting (por activo)")
+    st.markdown(
+        "Regla evaluada: **MA200 OR Momentum 12–1 > 0** (o **AND** si marcas el check). "
+        "Se rebalancea en frecuencia **M/W**. "
+        "Los retornos se calculan entre rebalanceos, **con lag** en días si lo indicas, "
+        "y se resta un **coste** por turnover (bps). "
+        "Las métricas reportadas por símbolo incluyen **CAGR, Sharpe, Sortino, MaxDD, Turnover y #Trades**."
+    )
 
-# ===== Backtesting por activo (expander) =====
-with st.expander("🔎 Backtesting (por activo) — NUEVO", expanded=False):
-    st.write("Corre un backtest simple (MA200 OR Mom 12-1>0) por cada símbolo seleccionado.")
-
-    # símbolos por defecto: ENTRY True si existen; si no, VFQ seleccionados; si no, universo filtrado
+    # símbolos por defecto
     sig_df = st.session_state.get("signals", pd.DataFrame())
     vfq_sel_df = st.session_state.get("vfq_sel", pd.DataFrame())
     default_syms = []
@@ -441,25 +444,42 @@ with st.expander("🔎 Backtesting (por activo) — NUEVO", expanded=False):
     use_and_bt = col_bt3.checkbox("Regla AND (MA200 y Mom>0)", value=False)
     freq_bt = col_bt4.selectbox("Frecuencia", options=["M", "W"], index=0)
 
-    if st.button("▶️ Correr Backtest", use_container_width=True):
+    run_bt = st.button("▶️ Correr Backtest", use_container_width=True)
+    if run_bt:
         if not symbols_bt:
             st.warning("No hay símbolos seleccionados.")
         else:
-            panel_bt = load_prices_panel(symbols_bt, start.isoformat(), end.isoformat(), cache_key="bt_panel", force=False)
+            # Extiende ventana de cálculo para evitar NaNs en MA200/Mom
+            import pandas as pd
+            extend_days = 420
+            start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
+            end_iso = end.isoformat()
+
+            panel_bt = load_prices_panel(symbols_bt, start_ext, end_iso, cache_key="bt_panel", force=False)
             if not panel_bt:
                 st.error("No pude cargar precios para los símbolos.")
             else:
-                metrics, curves = backtest_many(panel_bt, symbols_bt, cost_bps=cost_bps, lag_days=lag_days, use_and_condition=use_and_bt, rebalance_freq=freq_bt)
+                metrics, curves = backtest_many(
+                    panel_bt, symbols_bt,
+                    cost_bps=cost_bps, lag_days=lag_days,
+                    use_and_condition=use_and_bt, rebalance_freq=freq_bt
+                )
                 st.subheader("Métricas por símbolo")
                 st.dataframe(metrics, use_container_width=True)
                 st.subheader("Equity curves")
-                # gráfico por cada símbolo
                 for s, eq in curves.items():
                     st.line_chart(eq.rename(s), use_container_width=True)
 
-# ===== Gestión de Cartera (expander) =====
-with st.expander("📊 Gestión de Cartera — Kelly fraccionado + límite por beta (NUEVO)", expanded=False):
-    st.write("Propuesta de pesos por activo usando Kelly fraccionado estimado desde retornos mensuales y normalización por cap de beta.")
+# ====== Pestaña 7: GESTIÓN DE CARTERA ======
+with tab7:
+    st.subheader("📊 Gestión de Cartera — Kelly fraccionado + límite por beta")
+    st.markdown(
+        "Se estiman pesos por activo con **Kelly fraccionado** usando retornos **mensuales**: "
+        "**HitRate** (meses ganadores), **AvgWin** y **AvgLoss**. "
+        "Kelly clásico: `f* = p − (1−p)/b`, con `b = AvgWin/|AvgLoss|`. "
+        "Luego aplicamos una **fracción base** (slider) y un **cap por posición** (proxy de volatilidad), "
+        "y normalizamos para cumplir `∑(βᵢ · wᵢ) ≤ beta_cap`, donde β es la beta vs. un **benchmark** elegido."
+    )
 
     sig_df = st.session_state.get("signals", pd.DataFrame())
     vfq_sel_df = st.session_state.get("vfq_sel", pd.DataFrame())
@@ -485,15 +505,21 @@ with st.expander("📊 Gestión de Cartera — Kelly fraccionado + límite por b
     vol_cap = st.number_input("Cap por posición (proxy vol) [% equity]", min_value=0.01, max_value=0.10, value=0.03, step=0.01, format="%.2f")
     beta_cap = st.number_input("Cap ∑(beta·peso) <=", min_value=0.25, max_value=2.0, value=1.0, step=0.05)
 
-    if st.button("🧮 Calcular pesos sugeridos", use_container_width=True):
+    run_pm = st.button("🧮 Calcular pesos sugeridos", use_container_width=True)
+    if run_pm:
         if not syms_port:
             st.warning("No hay símbolos para la cartera.")
         else:
-            pnl = load_prices_panel(syms_port + [bench_ticker], start.isoformat(), end.isoformat(), cache_key="pm_panel", force=False)
+            # Extiende ventana para métricas estables mensuales
+            import pandas as pd
+            extend_days = 420
+            start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
+            end_iso = end.isoformat()
+
+            pnl = load_prices_panel(syms_port + [bench_ticker], start_ext, end_iso, cache_key="pm_panel", force=False)
             if bench_ticker not in pnl:
                 st.error("No pude cargar el benchmark para calcular betas.")
             else:
-                # retornos diarios → mensuales
                 bench_daily = pnl[bench_ticker]['close'].pct_change().dropna()
                 bench_m = bench_daily.resample('M').apply(lambda x: (1+x).prod()-1).dropna()
 
@@ -541,5 +567,4 @@ with st.expander("📊 Gestión de Cartera — Kelly fraccionado + límite por b
                         dfw[['symbol','HitRate','AvgWin','AvgLoss','Payoff','Kelly*','Beta','Propuesta_w','Peso_final']],
                         use_container_width=True
                     )
-                    st.caption("Regla: Kelly fraccionado con tope por posición (proxy de volatilidad) y normalización por beta total.")
-
+                    st.caption("Regla: Kelly fraccionado (con tope por posición) y normalización por beta total.")
