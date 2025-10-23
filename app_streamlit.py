@@ -18,19 +18,15 @@ st.set_page_config(
 # CSS suave
 st.markdown("""
 <style>
-/* contenedor */
 .block-container { padding-top: 1.25rem; padding-bottom: 2rem; }
-/* títulos */
 h1, h2, h3 { letter-spacing: .2px; }
 hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1rem 0; }
-/* hover tablas */
 [data-testid="stDataFrame"] tbody tr:hover { background: rgba(59,130,246,.08) !important; }
-/* captions más claras */
 [data-testid="stCaptionContainer"] { opacity: .85; }
 </style>
 """, unsafe_allow_html=True)
 
-# ============== IMPORTS DE TU PIPELINE (mantén tus módulos) ==============
+# ============== IMPORTS DE TU PIPELINE ==============
 from qvm_trend.data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
     DEFAULT_START, DEFAULT_END
@@ -41,27 +37,23 @@ from qvm_trend.fundamentals import (
 )
 from qvm_trend.pipeline import (
     apply_trend_filter, enrich_with_breakout,
-    market_regime_on  # helper de régimen (SPY>MA200 & breadth)
+    market_regime_on
 )
-
-# === NUEVOS IMPORTS (para menús extra) ===
-from qvm_trend.backtests import backtest_many  # usa tu backtests.py
+from qvm_trend.backtests import backtest_many
 from qvm_trend.stats import beta_vs_bench, win_loss_stats, expectancy
 
-# ------------------ PERSISTENCIA DE CARTERA (NUEVO) ------------------
+# ------------------ PERSISTENCIA DE CARTERA ------------------
 PORTFOLIO_PATH = "portfolio_symbols.csv"
 
 def _portfolio_empty_df() -> pd.DataFrame:
     return pd.DataFrame(columns=["symbol", "date_added"]).astype({"symbol":"string","date_added":"string"})
 
 def load_portfolio_df() -> pd.DataFrame:
-    """Carga cartera persistida desde CSV local. Si no existe, DataFrame vacío."""
     try:
         if os.path.exists(PORTFOLIO_PATH):
             df = pd.read_csv(PORTFOLIO_PATH)
             if "symbol" not in df.columns:
                 return _portfolio_empty_df()
-            # normaliza
             df["symbol"] = df["symbol"].astype(str).str.upper()
             if "date_added" not in df.columns:
                 df["date_added"] = datetime.now().strftime("%Y-%m-%d")
@@ -72,7 +64,6 @@ def load_portfolio_df() -> pd.DataFrame:
         return _portfolio_empty_df()
 
 def save_portfolio_df(df: pd.DataFrame) -> None:
-    """Guarda cartera a CSV local (idempotente)."""
     if df is None or df.empty:
         _portfolio_empty_df().to_csv(PORTFOLIO_PATH, index=False)
     else:
@@ -83,8 +74,7 @@ def save_portfolio_df(df: pd.DataFrame) -> None:
         out.drop_duplicates(subset=["symbol"]).to_csv(PORTFOLIO_PATH, index=False)
 
 def add_symbols_to_portfolio(symbols: list[str]) -> pd.DataFrame:
-    """Añade símbolos a la cartera (sin duplicar). Devuelve DF resultante."""
-    if not symbols: 
+    if not symbols:
         return load_portfolio_df()
     df = load_portfolio_df()
     add = pd.DataFrame({
@@ -97,7 +87,6 @@ def add_symbols_to_portfolio(symbols: list[str]) -> pd.DataFrame:
     return merged
 
 def remove_symbols_from_portfolio(symbols: list[str]) -> pd.DataFrame:
-    """Elimina símbolos de la cartera. Devuelve DF resultante."""
     df = load_portfolio_df()
     if df.empty or not symbols:
         return df
@@ -105,7 +94,16 @@ def remove_symbols_from_portfolio(symbols: list[str]) -> pd.DataFrame:
     save_portfolio_df(keep)
     return keep
 
-# si tienes helpers de performance sin MonteCarlo:
+# ------------------ CACHÉ DE I/O (NUEVO) ------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_load_prices_panel(symbols, start, end, cache_key=""):
+    return load_prices_panel(symbols, start, end, cache_key=cache_key, force=False)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_load_benchmark(bench, start, end):
+    return load_benchmark(bench, start, end)
+
+# ------------------ PERF HELPERS ------------------
 def perf_summary_from_returns(rets: pd.Series, periods_per_year: int) -> dict:
     r = rets.dropna().astype(float)
     if r.empty: return {}
@@ -137,10 +135,9 @@ with r:
     st.caption(datetime.now().strftime("Actualizado: %d %b %Y %H:%M"))
 st.markdown("<hr/>", unsafe_allow_html=True)
 
-# ==================== SIDEBAR (pro con presets) ====================
+# ==================== SIDEBAR ====================
 with st.sidebar:
     st.markdown("### ⚙️ Controles")
-
     preset = st.segmented_control("Preset", options=["Laxo","Balanceado","Estricto"], default="Balanceado")
 
     with st.expander("Universo & Screener", expanded=True):
@@ -176,7 +173,7 @@ with st.sidebar:
     st.markdown("---")
     run_btn = st.button("Ejecutar", use_container_width=True)
 
-# Aplica presets en sliders (sin pisar lo que el usuario ya cambió)
+# Aplica presets (sin pisar cambios del usuario)
 if preset == "Laxo":
     rvol_th = min(rvol_th, 1.0); closepos_th = min(closepos_th, 0.55); p52_th = min(p52_th, 0.92); min_hits = min(min_hits, 2)
 elif preset == "Estricto":
@@ -185,11 +182,16 @@ elif preset == "Estricto":
 # cache tag por corrida
 cache_tag = f"{int(min_mcap)}_{ipo_days}_{limit}"
 
+# Estado del pipeline (para evitar recomputar en cada rerun)
+if "pipeline_ready" not in st.session_state:
+    st.session_state["pipeline_ready"] = False
+
 # ==================== TABS ====================
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Universo", "Guardrails", "VFQ", "Señales", "Export", "Backtesting", "Gestión de cartera"]
 )
 
+# ==================== VFQ sidebar extra ====================
 with st.sidebar:
     st.markdown("⚙️ Fundamentos (VFQ)")
     sel_value = st.multiselect(
@@ -202,13 +204,9 @@ with st.sidebar:
         ["gross_profitability", "roic", "roa", "netMargin"],
         default=["gross_profitability", "roic", "roa", "netMargin"]
     )
-
     c1, c2 = st.columns(2)
-    with c1:
-        w_value = st.slider("Peso Value", 0.0, 1.0, 0.5, 0.05)
-    with c2:
-        w_quality = st.slider("Peso Quality", 0.0, 1.0, 0.5, 0.05)
-
+    with c1:  w_value = st.slider("Peso Value", 0.0, 1.0, 0.5, 0.05)
+    with c2:  w_quality = st.slider("Peso Quality", 0.0, 1.0, 0.5, 0.05)
     method_intra = st.radio("Agregación intra-bloque", ["mean", "median", "weighted_mean"], index=0, horizontal=True)
     winsor_p = st.slider("Winsor p (cola)", 0.0, 0.10, 0.01, 0.005)
     size_buckets = st.slider("Buckets por tamaño", 1, 5, 3, 1)
@@ -231,12 +229,23 @@ vfq_cfg = dict(
 with tab1:
     st.subheader("Universo inicial")
     try:
-        with st.status("Cargando universo del screener…", expanded=False) as status:
-            uni_raw = run_fmp_screener(limit=limit)
-            uni = filter_universe(uni_raw, min_mcap=min_mcap, ipo_min_days=ipo_days)
-            status.update(label=f"Universo listo: {len(uni)} símbolos", state="complete")
+        if run_btn:
+            with st.status("Cargando universo del screener…", expanded=False) as status:
+                uni_raw = run_fmp_screener(limit=limit)
+                uni = filter_universe(uni_raw, min_mcap=min_mcap, ipo_min_days=ipo_days)
+                status.update(label=f"Universo listo: {len(uni)} símbolos", state="complete")
+            st.session_state["uni_raw"] = uni_raw
+            st.session_state["uni"] = uni
+            st.session_state["pipeline_ready"] = False  # aún falta seguir pasos
+        elif "uni" in st.session_state:
+            uni = st.session_state["uni"]
+            uni_raw = st.session_state.get("uni_raw", pd.DataFrame())
+        else:
+            st.info("Presiona **Ejecutar** para cargar el universo.")
+            st.stop()
+
         c1,c2,c3,c4 = st.columns(4)
-        c1.metric("Screener", f"{len(uni_raw):,}")
+        c1.metric("Screener", f"{len(st.session_state.get('uni_raw', pd.DataFrame())):,}")
         c2.metric("Tras filtros básicos", f"{len(uni):,}")
         if "sector" in uni.columns:
             st.bar_chart(uni["sector"].value_counts().head(12), use_container_width=True)
@@ -248,196 +257,183 @@ with tab1:
 with tab2:
     st.subheader("Guardrails")
     try:
-        syms = uni["symbol"].dropna().astype(str).unique().tolist()
-        with st.status("Descargando guardrails/fundamentales (cacheados)…", expanded=False) as status:
-            df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
-            kept, diag = apply_quality_guardrails(
-                df_guard,
-                require_profit_floor=(profit_hits>0),
-                profit_floor_min_hits=profit_hits,
-                max_net_issuance=max_issuance,
-                max_asset_growth=max_assets,
-                max_accruals_ta=max_accr,
-                max_netdebt_ebitda=max_ndeb
-            )
-            status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
+        if run_btn and "uni" in st.session_state:
+            uni = st.session_state["uni"]
+            syms = uni["symbol"].dropna().astype(str).unique().tolist()
+            with st.status("Descargando guardrails/fundamentales (cacheados)…", expanded=False) as status:
+                df_guard = download_guardrails_batch(syms, cache_key=cache_tag, force=False)
+                kept, diag = apply_quality_guardrails(
+                    df_guard,
+                    require_profit_floor=(profit_hits>0),
+                    profit_floor_min_hits=profit_hits,
+                    max_net_issuance=max_issuance,
+                    max_asset_growth=max_assets,
+                    max_accruals_ta=max_accr,
+                    max_netdebt_ebitda=max_ndeb
+                )
+                status.update(label=f"Guardrails OK: {len(kept)} / {len(uni)}", state="complete")
+            st.session_state["kept"] = kept
+            st.session_state["guard_diag"] = diag
+        elif "kept" in st.session_state:
+            kept = st.session_state["kept"]
+            uni = st.session_state["uni"]
+            diag = st.session_state.get("guard_diag", pd.DataFrame())
+        else:
+            st.info("Primero ejecuta **Universo** (botón Ejecutar).")
+            st.stop()
+
         c1,c2 = st.columns(2)
         c1.metric("Pasan guardrails", f"{len(kept):,}")
-        c2.metric("Rechazados", f"{len(uni)-len(kept):,}")
+        c2.metric("Rechazados", f"{len(st.session_state['uni'])-len(kept):,}")
         st.dataframe(diag.merge(uni[["symbol","sector"]], on="symbol", how="left"), use_container_width=True, hide_index=True)
-        st.caption("Nota: si ves columnas '__err_guard' o NaN, son símbolos con datos faltantes; quedan fuera.")
+        st.caption("Nota: si ves '__err_guard' o NaN, son símbolos con datos faltantes; quedan fuera.")
     except Exception as e:
         st.error(f"Error en guardrails: {e}")
-    
-    st.info(f"Guardrails OK: {len(kept)} / Universo: {len(uni)}")
 
 # ====== Paso 3: VFQ ======
 with tab3:
     st.subheader("VFQ")
-
     try:
-        kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+        if run_btn and "kept" in st.session_state:
+            uni = st.session_state["uni"]
+            kept = st.session_state["kept"]
+            kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+            with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
+                df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
+                base_for_vfq = uni.merge(df_fund, on="symbol", how="right")
+                df_vfq = build_vfq_scores_dynamic(
+                    base_for_vfq,
+                    value_metrics=vfq_cfg["value_metrics"],
+                    quality_metrics=vfq_cfg["quality_metrics"],
+                    w_value=vfq_cfg["w_value"],
+                    w_quality=vfq_cfg["w_quality"],
+                    method_intra=vfq_cfg["method_intra"],
+                    winsor_p=vfq_cfg["winsor_p"],
+                    size_buckets=vfq_cfg["size_buckets"],
+                    group_mode=vfq_cfg["group_mode"],
+                )
+                status.update(label="VFQ calculado", state="complete")
+            # filtros finales
+            mask_cov = pd.to_numeric(df_vfq.get("coverage_count", 0), errors="coerce").fillna(0) >= int(min_cov)
+            mask_pct = pd.to_numeric(df_vfq.get("VFQ_pct_sector", 1.0), errors="coerce").fillna(1.0) >= float(min_pct)
+            df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
 
-        # 1) Descarga + cálculo VFQ (dinámico)
-        with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
-            df_fund = download_fundamentals(kept_syms, cache_key=cache_tag, force=False)
-            base_for_vfq = uni.merge(df_fund, on="symbol", how="right")  # no perder símbolos con fundas
-
-            df_vfq = build_vfq_scores_dynamic(
-                base_for_vfq,
-                value_metrics=vfq_cfg["value_metrics"],
-                quality_metrics=vfq_cfg["quality_metrics"],
-                w_value=vfq_cfg["w_value"],
-                w_quality=vfq_cfg["w_quality"],
-                method_intra=vfq_cfg["method_intra"],
-                winsor_p=vfq_cfg["winsor_p"],
-                size_buckets=vfq_cfg["size_buckets"],
-                group_mode=vfq_cfg["group_mode"],
-            )
-            status.update(label="VFQ calculado", state="complete")
-
-        # 2) Diagnóstico mínimo (una sola vez)
-        st.caption("Diagnóstico de descargas de fundamentales (previo a VFQ)")
-        st.json({
-            "símbolos_guardrails": int(len(kept_syms)),
-            "filas_fund": 0 if df_fund is None else int(len(df_fund)),
-            "cols_fund": [] if df_fund is None else list(df_fund.columns)[:20]
-        })
-
-        base_non_nulls = {}
-        for c in ["evToEbitda","fcf_ttm","cfo_ttm","ebit_ttm","roic","roa","netMargin","marketCap","totalAssetsTTM","grossProfitTTM"]:
-            if c in df_vfq.columns:
-                base_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
-        st.caption("No-nulos por columna base:")
-        st.json(base_non_nulls)
-
-        vfq_non_nulls = {}
-        for c in ["fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin","VFQ"]:
-            if c in df_vfq.columns:
-                vfq_non_nulls[c] = int(pd.to_numeric(df_vfq[c], errors="coerce").notna().sum())
-        st.caption("Cobertura por métrica (no nulos)")
-        if vfq_non_nulls:
-            st.bar_chart(pd.Series(vfq_non_nulls).sort_values(ascending=False), use_container_width=True)
+            st.session_state["vfq"] = df_vfq
+            st.session_state["vfq_sel"] = df_vfq_sel
+        elif "vfq" in st.session_state and "vfq_sel" in st.session_state:
+            df_vfq = st.session_state["vfq"]
+            df_vfq_sel = st.session_state["vfq_sel"]
         else:
-            st.info("No llegó ninguna métrica VFQ: revisa el mapeo/descargas.")
-
-        # 3) Filtros finales (cobertura y percentil intra-sector)
-        mask_cov = pd.to_numeric(df_vfq.get("coverage_count", 0), errors="coerce").fillna(0) >= int(min_cov)
-        mask_pct = pd.to_numeric(df_vfq.get("VFQ_pct_sector", 1.0), errors="coerce").fillna(1.0) >= float(min_pct)
-        df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
+            st.info("Primero corre **Guardrails** (botón Ejecutar).")
+            st.stop()
 
         st.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
-
         cols_show = [c for c in [
             "symbol","sector","marketCap_unified","coverage_count","VFQ","ValueScore","QualityScore",
             "fcf_yield","inv_ev_ebitda","gross_profitability","roic","roa","netMargin"
         ] if c in df_vfq_sel.columns]
-
         st.dataframe(
             df_vfq_sel[cols_show].sort_values(["VFQ","ValueScore","QualityScore"], ascending=False).head(300),
             use_container_width=True, hide_index=True
         )
 
-        # Embudo simple
         n_total = len(df_vfq)
-        n_cov   = int(mask_cov.sum())
-        n_pct   = int(mask_pct.sum())
+        n_cov   = int(pd.to_numeric(df_vfq.get("coverage_count", 0), errors="coerce").fillna(0).ge(min_cov).sum())
+        n_pct   = int(pd.to_numeric(df_vfq.get("VFQ_pct_sector", 1.0), errors="coerce").fillna(1.0).ge(min_pct).sum())
         st.info(f"Embudo VFQ → total={n_total} | cobertura≥{min_cov}: {n_cov} | pct≥{min_pct}: {n_pct} | elegibles={len(df_vfq_sel)}")
-
-        # Guardar en sesión para menús extra
-        st.session_state["vfq"] = df_vfq
-        st.session_state["vfq_sel"] = df_vfq_sel
-
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
 
-# ====== Paso 4: SEÑALES (Tendencia & Breakout) ======
+# ====== Paso 4: SEÑALES ======
 with tab4:
     st.subheader("Tendencia & Rompimiento")
     try:
-        syms_vfq = st.session_state.get("vfq_sel", pd.DataFrame()).get("symbol", pd.Series([], dtype=str)).dropna().astype(str).tolist()
+        if not ("vfq_sel" in st.session_state and len(st.session_state["vfq_sel"])>0):
+            st.info("Primero corre **VFQ** (botón Ejecutar).")
+            st.stop()
+
+        df_vfq_sel = st.session_state["vfq_sel"]
+        syms_vfq = df_vfq_sel["symbol"].dropna().astype(str).tolist()
         if len(syms_vfq) == 0:
-            st.warning("Sin símbolos tras VFQ; relaja filtros o amplía universo.")
-        else:
-            # Precios y benchmark
-            panel = load_prices_panel(syms_vfq, start.isoformat(), end.isoformat(), cache_key=cache_tag, force=False)
-            bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
+            st.warning("Sin símbolos tras VFQ; ajusta filtros.")
+            st.stop()
 
-            # Señales
-            trend = apply_trend_filter(panel, use_and_condition=use_and)
-            brk = enrich_with_breakout(
-                panel,
-                rvol_lookback=20,
-                rvol_th=rvol_th,
-                closepos_th=closepos_th,
-                p52_th=p52_th,
-                updown_vol_th=updown_vol_th,
-                bench_series=bench_px["close"] if isinstance(bench_px, pd.DataFrame) and "close" in bench_px.columns else None,
-                **({"min_hits": min_hits} if "min_hits" in enrich_with_breakout.__code__.co_varnames else {}),
-                **({"use_rs_slope": use_rs_slope, "rs_min_slope": 0.0} if "use_rs_slope" in enrich_with_breakout.__code__.co_varnames else {}),
-            )
+        # ↓↓↓ USAR CACHÉ ↓↓↓
+        panel = _cached_load_prices_panel(syms_vfq, start.isoformat(), end.isoformat(), cache_key=cache_tag)
+        bench_px = _cached_load_benchmark(bench, start.isoformat(), end.isoformat())
 
-            base_cols = [c for c in ["symbol","sector","marketCap","VFQ","ValueScore","QualityScore","coverage_count"] if c in st.session_state.get("vfq", pd.DataFrame()).columns]
-            base_for_signals = st.session_state["vfq"][base_cols].drop_duplicates("symbol") if base_cols and "vfq" in st.session_state else pd.DataFrame({"symbol": syms_vfq})
+        trend = apply_trend_filter(panel, use_and_condition=use_and)
+        brk = enrich_with_breakout(
+            panel,
+            rvol_lookback=20,
+            rvol_th=rvol_th,
+            closepos_th=closepos_th,
+            p52_th=p52_th,
+            updown_vol_th=updown_vol_th,
+            bench_series=bench_px["close"] if isinstance(bench_px, pd.DataFrame) and "close" in bench_px.columns else None,
+            **({"min_hits": min_hits} if "min_hits" in enrich_with_breakout.__code__.co_varnames else {}),
+            **({"use_rs_slope": use_rs_slope, "rs_min_slope": 0.0} if "use_rs_slope" in enrich_with_breakout.__code__.co_varnames else {}),
+        )
 
-            df_sig = (
-                base_for_signals
-                .merge(trend if isinstance(trend, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_trend"]), on="symbol", how="left")
-                .merge(brk if isinstance(brk, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_breakout"]), on="symbol", how="left")
-            )
+        base_cols_src = st.session_state.get("vfq", pd.DataFrame())
+        base_cols = [c for c in ["symbol","sector","marketCap","VFQ","ValueScore","QualityScore","coverage_count"] if c in base_cols_src.columns]
+        base_for_signals = base_cols_src[base_cols].drop_duplicates("symbol") if base_cols else pd.DataFrame({"symbol": syms_vfq})
 
-            for col in ("signal_trend","signal_breakout"):
-                if col not in df_sig.columns: df_sig[col] = False
-                df_sig[col] = df_sig[col].fillna(False).astype(bool)
+        df_sig = (
+            base_for_signals
+            .merge(trend if isinstance(trend, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_trend"]), on="symbol", how="left")
+            .merge(brk if isinstance(brk, pd.DataFrame) else pd.DataFrame(columns=["symbol","signal_breakout"]), on="symbol", how="left")
+        )
 
-            for c in ["RVOL20","ClosePos","P52","UDVol20","ATR_pct","rs_ma20_slope","BreakoutScore","hits","c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope"]:
-                if c not in df_sig.columns: df_sig[c] = np.nan
+        for col in ("signal_trend","signal_breakout"):
+            if col not in df_sig.columns: df_sig[col] = False
+            df_sig[col] = df_sig[col].fillna(False).astype(bool)
 
-            df_sig["ENTRY"] = (df_sig["signal_trend"] & df_sig["signal_breakout"]) if require_breakout else df_sig["signal_trend"]
+        for c in ["RVOL20","ClosePos","P52","UDVol20","ATR_pct","rs_ma20_slope","BreakoutScore","hits","c_RVOL","c_ClosePos","c_P52","c_UDVol","c_RSslope"]:
+            if c not in df_sig.columns: df_sig[c] = np.nan
 
-            if risk_on and not market_regime_on(bench_px, panel, ma_bench=200, breadth_ma=50, breadth_min=0.5):
-                st.warning("Régimen OFF (bench ≤ MA200 o breadth ≤ 50%): bloqueando nuevas entradas.")
-                df_sig["ENTRY"] = False
+        df_sig["ENTRY"] = (df_sig["signal_trend"] & df_sig["signal_breakout"]) if require_breakout else df_sig["signal_trend"]
 
-            k1,k2,k3,k4 = st.columns(4)
-            k1.metric("En tendencia", f"{int(df_sig['signal_trend'].sum())}")
-            k2.metric("Breakout", f"{int(df_sig['signal_breakout'].sum())}")
-            k3.metric("ENTRY", f"{int(df_sig['ENTRY'].sum())}")
-            k4.metric("VFQ elegibles", f"{len(st.session_state.get('vfq_sel', pd.DataFrame())):,}")
+        if risk_on and not market_regime_on(bench_px, panel, ma_bench=200, breadth_ma=50, breadth_min=0.5):
+            st.warning("Régimen OFF (bench ≤ MA200 o breadth ≤ 50%): bloqueando nuevas entradas.")
+            df_sig["ENTRY"] = False
 
-            dbg_cols = [c for c in ["symbol","RVOL20","ClosePos","P52","UDVol20","ATR_pct","rs_ma20_slope","hits","signal_trend","signal_breakout","ENTRY"] if c in df_sig.columns]
-            st.caption("Diagnóstico (muestra)")
-            st.dataframe(
-                df_sig[dbg_cols].sort_values(["ENTRY","signal_breakout","hits","RVOL20","ClosePos","P52","UDVol20"], ascending=[False,False,False,False,False,False,False]).head(120),
-                use_container_width=True, hide_index=True
-            )
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("En tendencia", f"{int(df_sig['signal_trend'].sum())}")
+        k2.metric("Breakout", f"{int(df_sig['signal_breakout'].sum())}")
+        k3.metric("ENTRY", f"{int(df_sig['ENTRY'].sum())}")
+        k4.metric("VFQ elegibles", f"{len(df_vfq_sel):,}")
 
-            st.subheader("Entradas")
-            df_candidates = df_sig.loc[df_sig["ENTRY"]].copy()
-            sort_cols = [c for c in ["BreakoutScore","VFQ","ValueScore","QualityScore"] if c in df_candidates.columns]
-            asc = [False] * len(sort_cols) if sort_cols else [False]
-            st.dataframe(
-                df_candidates.sort_values(sort_cols, ascending=asc),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "BreakoutScore": st.column_config.NumberColumn("BreakoutScore", help="0–100", format="%.1f"),
-                    "VFQ": st.column_config.NumberColumn("VFQ", format="%.1f"),
-                    "ValueScore": st.column_config.NumberColumn("Value", format="%.1f"),
-                    "QualityScore": st.column_config.NumberColumn("Quality", format="%.1f"),
-                    "ClosePos": st.column_config.NumberColumn("ClosePos", format="%.2f"),
-                    "P52": st.column_config.NumberColumn("P52", format="%.3f"),
-                    "UDVol20": st.column_config.NumberColumn("UDVol20", format="%.2f"),
-                    "ATR_pct": st.column_config.ProgressColumn("ATR pct", format="%.0f%%", min_value=0, max_value=1),
-                }
-            )
+        dbg_cols = [c for c in ["symbol","RVOL20","ClosePos","P52","UDVol20","ATR_pct","rs_ma20_slope","hits","signal_trend","signal_breakout","ENTRY"] if c in df_sig.columns]
+        st.caption("Diagnóstico (muestra)")
+        st.dataframe(
+            df_sig[dbg_cols].sort_values(["ENTRY","signal_breakout","hits","RVOL20","ClosePos","P52","UDVol20"], ascending=[False]*7).head(120),
+            use_container_width=True, hide_index=True
+        )
 
-            # guarda en session para Export y tabs nuevas
-            st.session_state["uni"] = uni
-            st.session_state["guard_diag"] = diag
-            st.session_state["vfq"] = st.session_state.get("vfq", pd.DataFrame())
-            st.session_state["vfq_sel"] = st.session_state.get("vfq_sel", pd.DataFrame())
-            st.session_state["signals"] = df_sig
+        st.subheader("Entradas")
+        df_candidates = df_sig.loc[df_sig["ENTRY"]].copy()
+        sort_cols = [c for c in ["BreakoutScore","VFQ","ValueScore","QualityScore"] if c in df_candidates.columns]
+        asc = [False] * len(sort_cols) if sort_cols else [False]
+        st.dataframe(
+            df_candidates.sort_values(sort_cols, ascending=asc),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "BreakoutScore": st.column_config.NumberColumn("BreakoutScore", help="0–100", format="%.1f"),
+                "VFQ": st.column_config.NumberColumn("VFQ", format="%.1f"),
+                "ValueScore": st.column_config.NumberColumn("Value", format="%.1f"),
+                "QualityScore": st.column_config.NumberColumn("Quality", format="%.1f"),
+                "ClosePos": st.column_config.NumberColumn("ClosePos", format="%.2f"),
+                "P52": st.column_config.NumberColumn("P52", format="%.3f"),
+                "UDVol20": st.column_config.NumberColumn("UDVol20", format="%.2f"),
+                "ATR_pct": st.column_config.ProgressColumn("ATR pct", format="%.0f%%", min_value=0, max_value=1),
+            }
+        )
+
+        # guarda en session para otras pestañas
+        st.session_state["guard_diag"] = st.session_state.get("guard_diag", pd.DataFrame())
+        st.session_state["signals"] = df_sig
+        st.session_state["pipeline_ready"] = True  # pipeline completo disponible
 
     except Exception as e:
         st.error(f"Error en señales: {e}")
@@ -469,13 +465,10 @@ with tab6:
     st.subheader("🔎 Backtesting (por activo)")
     st.markdown(
         "Regla evaluada: **MA200 OR Momentum 12–1 > 0** (o **AND** si marcas el check). "
-        "Se rebalancea en frecuencia **M/W**. "
-        "Los retornos se calculan entre rebalanceos, **con lag** en días si lo indicas, "
-        "y se resta un **coste** por turnover (bps). "
-        "Las métricas reportadas por símbolo incluyen **CAGR, Sharpe, Sortino, MaxDD, Turnover y #Trades**."
+        "Rebalanceo **M/W**, **lag** opcional (días) y **coste** por turnover (bps). "
+        "Métricas por símbolo: **CAGR, Sharpe, Sortino, MaxDD, Turnover, Trades**."
     )
 
-    # símbolos por defecto
     sig_df = st.session_state.get("signals", pd.DataFrame())
     vfq_sel_df = st.session_state.get("vfq_sel", pd.DataFrame())
     default_syms = []
@@ -495,24 +488,24 @@ with tab6:
     ).strip()
     symbols_bt = [s.strip().upper() for s in syms_text.split(",") if s.strip()] or default_syms
 
-    col_bt1, col_bt2, col_bt3, col_bt4 = st.columns(4)
-    cost_bps = col_bt1.number_input("Coste (bps)", min_value=0, max_value=100, value=10, step=1)
-    lag_days = col_bt2.number_input("Lag (días)", min_value=0, max_value=30, value=0, step=1)
-    use_and_bt = col_bt3.checkbox("Regla AND (MA200 y Mom>0)", value=False)
-    freq_bt = col_bt4.selectbox("Frecuencia", options=["M", "W"], index=0)
+    c1, c2, c3, c4 = st.columns(4)
+    cost_bps = c1.number_input("Coste (bps)", min_value=0, max_value=100, value=10, step=1)
+    lag_days = c2.number_input("Lag (días)", min_value=0, max_value=30, value=0, step=1)
+    use_and_bt = c3.checkbox("Regla AND (MA200 y Mom>0)", value=False)
+    freq_bt = c4.selectbox("Frecuencia", options=["M", "W"], index=0)
 
     run_bt = st.button("▶️ Correr Backtest", use_container_width=True)
     if run_bt:
         if not symbols_bt:
             st.warning("No hay símbolos seleccionados.")
         else:
-            # Extiende ventana de cálculo para evitar NaNs en MA200/Mom
             import pandas as pd
             extend_days = 420
             start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
             end_iso = end.isoformat()
 
-            panel_bt = load_prices_panel(symbols_bt, start_ext, end_iso, cache_key="bt_panel", force=False)
+            # ↓↓↓ USAR CACHÉ ↓↓↓
+            panel_bt = _cached_load_prices_panel(symbols_bt, start_ext, end_iso, cache_key="bt_panel")
             if not panel_bt:
                 st.error("No pude cargar precios para los símbolos.")
             else:
@@ -531,26 +524,21 @@ with tab6:
 with tab7:
     st.subheader("📊 Gestión de Cartera — Persistente (Kelly fracc. + límite por beta)")
     st.markdown(
-        "Esta pestaña calcula pesos **solo** con los símbolos de tu **cartera persistente**. "
-        "Puedes **agregar** entradas actuales (ENTRY=True) o **añadir manualmente** y mantenerlos entre sesiones.  \n"
-        "**Sizing**: Kelly clásico `f* = p − (1−p)/b` con `b = AvgWin/|AvgLoss|`, "
-        "aplicado como **Kelly fraccionado** (slider) + **cap por posición** y normalización `∑(β·w) ≤ beta_cap`."
+        "Calcula pesos **solo** con los símbolos de tu **cartera persistente** (CSV). "
+        "Añade desde **Entradas (ENTRY=True)** o manualmente; remueve cuando vendas.  \n"
+        "**Sizing**: Kelly `f* = p − (1−p)/b` con `b = AvgWin/|AvgLoss|` → **Kelly fracc.** + **cap por símbolo**, "
+        "y normalización `∑(β·w) ≤ beta_cap`."
     )
 
-    # ------ Bloque A: administración de la lista persistente ------
+    # --- Cartera persistente (gestión rápida) ---
     st.markdown("#### Cartera persistente (símbolos en posición)")
     portfolio_df = load_portfolio_df()
     st.dataframe(portfolio_df if not portfolio_df.empty else _portfolio_empty_df(), use_container_width=True, hide_index=True)
     cpa, cpb, cpc = st.columns([0.45, 0.35, 0.20])
 
-    # A1) Agregar desde entradas actuales
     sig_df = st.session_state.get("signals", pd.DataFrame())
-    entry_syms = []
-    if not sig_df.empty and "ENTRY" in sig_df.columns:
-        entry_syms = sig_df.loc[sig_df["ENTRY"], "symbol"].dropna().astype(str).unique().tolist()
-    add_from_entry = cpa.multiselect("Añadir desde entradas actuales (ENTRY=True)", options=entry_syms, default=[])
-
-    # A2) Agregar manualmente
+    entry_syms = sig_df.loc[sig_df["ENTRY"], "symbol"].dropna().astype(str).unique().tolist() if ("ENTRY" in sig_df.columns and not sig_df.empty) else []
+    add_from_entry = cpa.multiselect("Añadir desde entradas (ENTRY=True)", options=entry_syms, default=[])
     manual_add = cpb.text_input("Añadir manual (coma-separado)", value="").strip()
     btn_add = cpc.button("➕ Añadir", use_container_width=True)
     if btn_add:
@@ -561,7 +549,6 @@ with tab7:
         else:
             st.info("No hay símbolos para agregar.")
 
-    # A3) Remover seleccionados
     st.markdown("##### Quitar de la cartera")
     rm_sel = st.multiselect("Selecciona símbolos a remover", options=portfolio_df["symbol"].tolist() if not portfolio_df.empty else [], default=[])
     if st.button("🗑️ Remover seleccionados", use_container_width=True):
@@ -573,7 +560,7 @@ with tab7:
 
     st.markdown("---")
 
-    # ------ Bloque B: cálculo de pesos SOLO con cartera persistente ------
+    # --- Cálculo de pesos (solo cartera persistente) ---
     st.markdown("#### Cálculo de pesos sobre la cartera persistente")
     syms_port = portfolio_df["symbol"].tolist() if not portfolio_df.empty else []
     bench_ticker = st.text_input("Benchmark para beta (ej: SPY)", value=st.session_state.get("bench", "SPY")).strip().upper() or "SPY"
@@ -586,13 +573,13 @@ with tab7:
         if not syms_port:
             st.warning("Tu cartera persistente está vacía. Agrega símbolos primero.")
         else:
-            # Extiende ventana para métricas estables mensuales
             import pandas as pd
             extend_days = 420
             start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
             end_iso = end.isoformat()
 
-            pnl = load_prices_panel(syms_port + [bench_ticker], start_ext, end_iso, cache_key="pm_panel", force=False)
+            # ↓↓↓ USAR CACHÉ ↓↓↓
+            pnl = _cached_load_prices_panel(syms_port + [bench_ticker], start_ext, end_iso, cache_key="pm_panel")
             if bench_ticker not in pnl:
                 st.error("No pude cargar el benchmark para calcular betas.")
             else:
@@ -629,7 +616,6 @@ with tab7:
                 if dfw.empty:
                     st.warning("No se pudieron calcular pesos (verifica datos).")
                 else:
-                    # normalizar por cap de beta
                     dfw['beta_w'] = dfw['Beta'].fillna(1.0) * dfw['Propuesta_w'].fillna(0.0)
                     total_beta_w = dfw['beta_w'].sum()
                     scale = 1.0
@@ -637,9 +623,9 @@ with tab7:
                         scale = beta_cap / total_beta_w
                     dfw['Peso_final'] = dfw['Propuesta_w'] * scale
 
-                    st.subheader("Pesos propuestos (sobre cartera persistente)")
+                    st.subheader("Pesos propuestos (cartera persistente)")
                     st.dataframe(
                         dfw[['symbol','HitRate','AvgWin','AvgLoss','Payoff','Kelly*','Beta','Propuesta_w','Peso_final']],
                         use_container_width=True
                     )
-                    st.caption("Regla: Kelly fraccionado (con tope por posición) y normalización por beta total.")
+                    st.caption("Kelly fracc. + cap por símbolo, normalizado por β total ≤ beta_cap.")
