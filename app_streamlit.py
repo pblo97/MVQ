@@ -48,6 +48,63 @@ from qvm_trend.pipeline import (
 from qvm_trend.backtests import backtest_many  # usa tu backtests.py
 from qvm_trend.stats import beta_vs_bench, win_loss_stats, expectancy
 
+# ------------------ PERSISTENCIA DE CARTERA (NUEVO) ------------------
+PORTFOLIO_PATH = "portfolio_symbols.csv"
+
+def _portfolio_empty_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["symbol", "date_added"]).astype({"symbol":"string","date_added":"string"})
+
+def load_portfolio_df() -> pd.DataFrame:
+    """Carga cartera persistida desde CSV local. Si no existe, DataFrame vacío."""
+    try:
+        if os.path.exists(PORTFOLIO_PATH):
+            df = pd.read_csv(PORTFOLIO_PATH)
+            if "symbol" not in df.columns:
+                return _portfolio_empty_df()
+            # normaliza
+            df["symbol"] = df["symbol"].astype(str).str.upper()
+            if "date_added" not in df.columns:
+                df["date_added"] = datetime.now().strftime("%Y-%m-%d")
+            return df.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+        else:
+            return _portfolio_empty_df()
+    except Exception:
+        return _portfolio_empty_df()
+
+def save_portfolio_df(df: pd.DataFrame) -> None:
+    """Guarda cartera a CSV local (idempotente)."""
+    if df is None or df.empty:
+        _portfolio_empty_df().to_csv(PORTFOLIO_PATH, index=False)
+    else:
+        out = df.copy()
+        out["symbol"] = out["symbol"].astype(str).str.upper()
+        if "date_added" not in out.columns:
+            out["date_added"] = datetime.now().strftime("%Y-%m-%d")
+        out.drop_duplicates(subset=["symbol"]).to_csv(PORTFOLIO_PATH, index=False)
+
+def add_symbols_to_portfolio(symbols: list[str]) -> pd.DataFrame:
+    """Añade símbolos a la cartera (sin duplicar). Devuelve DF resultante."""
+    if not symbols: 
+        return load_portfolio_df()
+    df = load_portfolio_df()
+    add = pd.DataFrame({
+        "symbol": [s.strip().upper() for s in symbols if s and str(s).strip()],
+        "date_added": datetime.now().strftime("%Y-%m-%d")
+    })
+    merged = pd.concat([df, add], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["symbol"]).reset_index(drop=True)
+    save_portfolio_df(merged)
+    return merged
+
+def remove_symbols_from_portfolio(symbols: list[str]) -> pd.DataFrame:
+    """Elimina símbolos de la cartera. Devuelve DF resultante."""
+    df = load_portfolio_df()
+    if df.empty or not symbols:
+        return df
+    keep = df[~df["symbol"].isin([s.strip().upper() for s in symbols])]
+    save_portfolio_df(keep)
+    return keep
+
 # si tienes helpers de performance sin MonteCarlo:
 def perf_summary_from_returns(rets: pd.Series, periods_per_year: int) -> dict:
     r = rets.dropna().astype(float)
@@ -470,45 +527,64 @@ with tab6:
                 for s, eq in curves.items():
                     st.line_chart(eq.rename(s), use_container_width=True)
 
-# ====== Pestaña 7: GESTIÓN DE CARTERA ======
+# ====== Pestaña 7: GESTIÓN DE CARTERA (PERSISTENTE) ======
 with tab7:
-    st.subheader("📊 Gestión de Cartera — Kelly fraccionado + límite por beta")
+    st.subheader("📊 Gestión de Cartera — Persistente (Kelly fracc. + límite por beta)")
     st.markdown(
-        "Se estiman pesos por activo con **Kelly fraccionado** usando retornos **mensuales**: "
-        "**HitRate** (meses ganadores), **AvgWin** y **AvgLoss**. "
-        "Kelly clásico: `f* = p − (1−p)/b`, con `b = AvgWin/|AvgLoss|`. "
-        "Luego aplicamos una **fracción base** (slider) y un **cap por posición** (proxy de volatilidad), "
-        "y normalizamos para cumplir `∑(βᵢ · wᵢ) ≤ beta_cap`, donde β es la beta vs. un **benchmark** elegido."
+        "Esta pestaña calcula pesos **solo** con los símbolos de tu **cartera persistente**. "
+        "Puedes **agregar** entradas actuales (ENTRY=True) o **añadir manualmente** y mantenerlos entre sesiones.  \n"
+        "**Sizing**: Kelly clásico `f* = p − (1−p)/b` con `b = AvgWin/|AvgLoss|`, "
+        "aplicado como **Kelly fraccionado** (slider) + **cap por posición** y normalización `∑(β·w) ≤ beta_cap`."
     )
 
+    # ------ Bloque A: administración de la lista persistente ------
+    st.markdown("#### Cartera persistente (símbolos en posición)")
+    portfolio_df = load_portfolio_df()
+    st.dataframe(portfolio_df if not portfolio_df.empty else _portfolio_empty_df(), use_container_width=True, hide_index=True)
+    cpa, cpb, cpc = st.columns([0.45, 0.35, 0.20])
+
+    # A1) Agregar desde entradas actuales
     sig_df = st.session_state.get("signals", pd.DataFrame())
-    vfq_sel_df = st.session_state.get("vfq_sel", pd.DataFrame())
-    default_syms_pm = []
-    try:
-        if not sig_df.empty and "ENTRY" in sig_df.columns:
-            default_syms_pm = sig_df.loc[sig_df["ENTRY"], "symbol"].dropna().astype(str).unique().tolist()
-        if not default_syms_pm and not vfq_sel_df.empty:
-            default_syms_pm = vfq_sel_df["symbol"].dropna().astype(str).unique().tolist()
-        if not default_syms_pm and 'uni' in st.session_state and isinstance(st.session_state['uni'], pd.DataFrame):
-            default_syms_pm = st.session_state['uni']["symbol"].dropna().astype(str).unique().tolist()[:50]
-    except Exception:
-        pass
+    entry_syms = []
+    if not sig_df.empty and "ENTRY" in sig_df.columns:
+        entry_syms = sig_df.loc[sig_df["ENTRY"], "symbol"].dropna().astype(str).unique().tolist()
+    add_from_entry = cpa.multiselect("Añadir desde entradas actuales (ENTRY=True)", options=entry_syms, default=[])
 
-    syms_text2 = st.text_input(
-        "Símbolos (coma-separados) para la cartera. Si lo dejas vacío uso la selección final.",
-        value=",".join(default_syms_pm) if default_syms_pm else ""
-    ).strip()
-    syms_port = [s.strip().upper() for s in syms_text2.split(",") if s.strip()] or default_syms_pm
+    # A2) Agregar manualmente
+    manual_add = cpb.text_input("Añadir manual (coma-separado)", value="").strip()
+    btn_add = cpc.button("➕ Añadir", use_container_width=True)
+    if btn_add:
+        syms_to_add = add_from_entry + [s.strip().upper() for s in manual_add.split(",") if s.strip()]
+        if syms_to_add:
+            portfolio_df = add_symbols_to_portfolio(syms_to_add)
+            st.success(f"Agregados: {', '.join(syms_to_add)}")
+        else:
+            st.info("No hay símbolos para agregar.")
 
+    # A3) Remover seleccionados
+    st.markdown("##### Quitar de la cartera")
+    rm_sel = st.multiselect("Selecciona símbolos a remover", options=portfolio_df["symbol"].tolist() if not portfolio_df.empty else [], default=[])
+    if st.button("🗑️ Remover seleccionados", use_container_width=True):
+        if rm_sel:
+            portfolio_df = remove_symbols_from_portfolio(rm_sel)
+            st.success(f"Removidos: {', '.join(rm_sel)}")
+        else:
+            st.info("No seleccionaste símbolos.")
+
+    st.markdown("---")
+
+    # ------ Bloque B: cálculo de pesos SOLO con cartera persistente ------
+    st.markdown("#### Cálculo de pesos sobre la cartera persistente")
+    syms_port = portfolio_df["symbol"].tolist() if not portfolio_df.empty else []
     bench_ticker = st.text_input("Benchmark para beta (ej: SPY)", value=st.session_state.get("bench", "SPY")).strip().upper() or "SPY"
     base_kelly = st.slider("Fracción de Kelly base", min_value=0.1, max_value=1.0, value=0.5, step=0.1)
     vol_cap = st.number_input("Cap por posición (proxy vol) [% equity]", min_value=0.01, max_value=0.10, value=0.03, step=0.01, format="%.2f")
     beta_cap = st.number_input("Cap ∑(beta·peso) <=", min_value=0.25, max_value=2.0, value=1.0, step=0.05)
 
-    run_pm = st.button("🧮 Calcular pesos sugeridos", use_container_width=True)
+    run_pm = st.button("🧮 Calcular pesos (cartera persistente)", use_container_width=True)
     if run_pm:
         if not syms_port:
-            st.warning("No hay símbolos para la cartera.")
+            st.warning("Tu cartera persistente está vacía. Agrega símbolos primero.")
         else:
             # Extiende ventana para métricas estables mensuales
             import pandas as pd
@@ -531,7 +607,6 @@ with tab7:
                     ser_m = ser.resample('M').apply(lambda x: (1+x).prod()-1).dropna()
 
                     p, avg_win, avg_loss = win_loss_stats(ser_m)
-                    # Kelly clásico: f* = p - (1-p)/b ; b = avg_win/|avg_loss|
                     b = abs(avg_win / avg_loss) if (avg_loss not in (0, None)) else np.nan
                     kelly = 0.0
                     if b and b > 0:
@@ -562,7 +637,7 @@ with tab7:
                         scale = beta_cap / total_beta_w
                     dfw['Peso_final'] = dfw['Propuesta_w'] * scale
 
-                    st.subheader("Pesos propuestos")
+                    st.subheader("Pesos propuestos (sobre cartera persistente)")
                     st.dataframe(
                         dfw[['symbol','HitRate','AvgWin','AvgLoss','Payoff','Kelly*','Beta','Propuesta_w','Peso_final']],
                         use_container_width=True
