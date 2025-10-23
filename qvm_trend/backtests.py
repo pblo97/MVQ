@@ -1,113 +1,152 @@
-import numpy as np
+# === backtests.py (ADD) ===
+from __future__ import annotations
+import math
 import pandas as pd
-from .pipeline import _ma, _mom_12_1
+import numpy as np
+from dataclasses import dataclass
 
+# --------- Métricas básicas (si no las tienes en stats.py) ----------
+def _cagr(returns: pd.Series, freq_per_year=252) -> float:
+    if len(returns) == 0:
+        return 0.0
+    equity = (1 + returns.fillna(0)).cumprod()
+    n_years = len(returns) / freq_per_year
+    if n_years <= 0 or equity.iloc[-1] <= 0:
+        return 0.0
+    return equity.iloc[-1] ** (1.0 / n_years) - 1.0
 
-def _month_ends(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    df = pd.DataFrame(index=idx)
-    return df.resample("M").last().index
+def _sharpe(returns: pd.Series, freq_per_year=252) -> float:
+    mu = returns.mean() * freq_per_year
+    sd = returns.std(ddof=0) * math.sqrt(freq_per_year)
+    return 0.0 if sd == 0 or np.isnan(sd) else mu / sd
 
+def _sortino(returns: pd.Series, freq_per_year=252) -> float:
+    downside = returns[returns < 0]
+    dd = downside.std(ddof=0) * math.sqrt(freq_per_year)
+    mu = returns.mean() * freq_per_year
+    return 0.0 if dd == 0 or np.isnan(dd) else mu / dd
 
-def build_price_panel(symbols, loader_fn, start, end):
-    panel = {}
-    for s in symbols:
-        df = loader_fn(s, start, end)
-        if df is not None and not df.empty:
-            x = pd.DataFrame({"close": df['close']})
-            x["ma200"] = _ma(x['close'], 200)
-            x["mom_12_1"] = _mom_12_1(x['close'])
-            panel[s] = x
-    return panel
+def _maxdd(equity: pd.Series) -> float:
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    return dd.min() if len(dd) else 0.0
 
+# --------------- Señales: MA200 y Momentum 12-1 ----------------------
+def _ensure_sig_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if 'ma200' not in out.columns:
+        out['ma200'] = out['close'].rolling(200).mean()
+    if 'mom_12_1' not in out.columns:
+        # momentum 12-1: precio actual vs precio de hace 252-21 días aprox
+        lag_12 = out['close'].shift(252)
+        lag_1  = out['close'].shift(21)
+        out['mom_12_1'] = (lag_1 / lag_12) - 1.0
+    return out
 
-def backtest_vfq_trend_v2(
-    df_symbols: pd.DataFrame,
-    price_loader,
-    start="2020-01-01",
-    end=None,
-    hold_top_k=None,
-    rebalance_freq="M",
-    cost_bps=15,
-    use_and_condition=False,
-    lag_days=60,
-    plot=False
-):
-    symbols = df_symbols["symbol"].dropna().astype(str).unique().tolist()
-    panel = build_price_panel(symbols, price_loader, start, end)
+def _passes_signal(row, use_and_condition: bool):
+    cond_ma  = pd.notna(row.get('ma200')) and row['close'] > row['ma200']
+    cond_mom = pd.notna(row.get('mom_12_1')) and row['mom_12_1'] > 0
+    return (cond_ma and cond_mom) if use_and_condition else (cond_ma or cond_mom)
 
-    all_idx = pd.DatetimeIndex(sorted(set().union(*[df.index for df in panel.values()])))
-    mes_ends = _month_ends(all_idx)
-    if len(mes_ends) < 2:
-        raise ValueError("Muy pocos puntos mensuales para backtest.")
+@dataclass
+class BTResult:
+    symbol: str
+    cagr: float
+    sharpe: float
+    sortino: float
+    maxdd: float
+    turnover: float
+    n_trades: int
+    equity: pd.Series
+    rets: pd.Series
+
+def backtest_single_symbol(df_price: pd.DataFrame,
+                           symbol: str,
+                           cost_bps: int = 10,
+                           lag_days: int = 0,
+                           use_and_condition: bool = False,
+                           rebalance_freq: str = 'M') -> BTResult:
+    """
+    Backtest long-only con regla de tendencia (MA200 OR/AND Mom 12-1>0).
+    Rebalancea con frecuencia 'M' por simplicidad; aplica lag sobre precios.
+    """
+    if df_price is None or df_price.empty:
+        return BTResult(symbol, 0,0,0,0,0,0, pd.Series(dtype=float), pd.Series(dtype=float))
+
+    df = df_price[['close']].copy().sort_index()
+    df = _ensure_sig_cols(df)
+
+    lag = pd.Timedelta(days=int(lag_days)) if lag_days else pd.Timedelta(0)
+
+    # Rebalanceo mensual
+    month_ends = df.resample(rebalance_freq).last().index
 
     equity = [1.0]
-    weights_prev = {s: 0.0 for s in symbols}
-    turnover_hist, npos_hist, rets_hist = [], [], []
+    rets = []
+    weights_prev = 0.0  # 0 o 1 (in/out)
+    turnover_hist = []
+    n_trades = 0
 
-    for t0, t1 in zip(mes_ends[:-1], mes_ends[1:]):
-        eligibles = []
-        for sym, df in panel.items():
-            if df.index[0] > t0:
-                continue
-            row = df.loc[:t0].iloc[-1]
-            cond_ma = (row['close'] > row['ma200']) if pd.notna(row['ma200']) else False
-            cond_mom = (row['mom_12_1'] > 0) if pd.notna(row['mom_12_1']) else False
-            pass_sig = (cond_ma and cond_mom) if use_and_condition else (cond_ma or cond_mom)
-            if pass_sig:
-                eligibles.append(sym)
-        chosen = eligibles if hold_top_k is None else eligibles[:hold_top_k]
-        npos = len(chosen)
-        weights_new = {s: (1.0/npos if s in chosen and npos>0 else 0.0) for s in symbols}
+    for t0, t1 in zip(month_ends[:-1], month_ends[1:]):
+        row_t0 = df.loc[:t0].iloc[-1]
+        in_signal = _passes_signal(row_t0, use_and_condition)
 
-        tw = 0.5 * sum(abs(weights_new[s] - weights_prev.get(s, 0.0)) for s in symbols)
+        weight_new = 1.0 if in_signal else 0.0
+
+        # turnover (long-only binario)
+        tw = abs(weight_new - weights_prev) * 0.5  # convención
         turnover_hist.append(tw)
-        npos_hist.append(npos)
+        if weight_new != weights_prev:
+            n_trades += 1
 
-        r_month = 0.0
-        if npos > 0:
-            ret_sum = 0.0
-            for sym in symbols:
-                wgt = weights_new[sym]
-                if wgt == 0.0:
-                    continue
-                df = panel[sym]
-                if df.index[0] > t0:
-                    continue
-                p0 = df.loc[:t0]['close'].iloc[-1]
-                p1 = df.loc[:t1]['close'].iloc[-1]
-                if pd.notna(p0) and pd.notna(p1) and p0 > 0:
-                    ret_sum += wgt * (p1/p0 - 1)
+        # precios con lag
+        p0 = df.loc[:t0+lag]['close'].iloc[-1]
+        p1 = df.loc[:t1+lag]['close'].iloc[-1]
+        r = 0.0
+        if pd.notna(p0) and pd.notna(p1) and p0 > 0:
+            gross = (p1/p0 - 1.0) * weight_new
             cost = tw * (cost_bps / 1e4)
-            r_month = ret_sum - cost
-        rets_hist.append(r_month)
-        equity.append(equity[-1] * (1 + r_month))
-        weights_prev = weights_new
+            r = gross - cost
 
-    eq = pd.Series(equity, index=pd.Index(mes_ends, name="date")).iloc[1:]
-    rets = pd.Series(rets_hist, index=mes_ends[:-1])
+        rets.append(r)
+        equity.append(equity[-1] * (1.0 + r))
+        weights_prev = weight_new
 
-    years = (eq.index[-1] - eq.index[0]).days / 365.25
-    cagr = eq.iloc[-1] ** (1/years) - 1 if years > 0 else np.nan
-    mu, sd = rets.mean(), rets.std()
-    sharpe = (mu*12)/sd if sd and sd>0 else np.nan
-    dd = rets[rets<0].std()
-    sortino = (mu*12)/dd if dd and dd>0 else np.nan
-    rollmax = eq.cummax(); maxdd = (eq/rollmax - 1).min()
+    rets = pd.Series(rets, index=month_ends[1:], name=symbol)
+    equity = pd.Series(equity, index=[month_ends[0]] + list(month_ends[1:]), name=symbol)
+    cagr = _cagr(rets, freq_per_year=12)
+    sharpe = _sharpe(rets, freq_per_year=12)
+    sortino = _sortino(rets, freq_per_year=12)
+    maxdd = _maxdd(equity)
+    turnover = float(np.mean(turnover_hist)) if turnover_hist else 0.0
 
-    summary = {
-        "Inicio": eq.index[0].date().isoformat(),
-        "Fin": eq.index[-1].date().isoformat(),
-        "CAGR": float(cagr),
-        "Sharpe_anual": float(sharpe),
-        "Sortino_anual": float(sortino),
-        "MaxDD": float(maxdd),
-        "Turnover_medio": float(np.mean(turnover_hist)),
-        "N_posiciones_medio": float(np.mean(npos_hist)),
-        "Periodos": int(len(rets)),
-        "Coste_bps": int(cost_bps),
-        "Regla_tendencia": "MA200 AND 12-1>0" if use_and_condition else "MA200 OR 12-1>0",
-        "Rebalance": "Mensual",
-        "TopK": hold_top_k if hold_top_k is not None else "all",
-        "Lag_dias": int(lag_days)
-    }
-    return eq, rets, summary
+    return BTResult(symbol, cagr, sharpe, sortino, maxdd, turnover, n_trades, equity, rets)
+
+def backtest_many(panel: dict[str, pd.DataFrame],
+                  symbols: list[str],
+                  cost_bps: int = 10,
+                  lag_days: int = 0,
+                  use_and_condition: bool = False,
+                  rebalance_freq: str = 'M') -> tuple[pd.DataFrame, dict[str, pd.Series]]:
+    """
+    Corre backtest por símbolo y devuelve tabla de métricas + curvas de equity.
+    """
+    rows = []
+    curves = {}
+    for s in symbols:
+        df = panel.get(s)
+        if df is None or df.empty:
+            continue
+        res = backtest_single_symbol(df, s, cost_bps, lag_days, use_and_condition, rebalance_freq)
+        rows.append({
+            'symbol': s,
+            'CAGR': res.cagr,
+            'Sharpe': res.sharpe,
+            'Sortino': res.sortino,
+            'MaxDD': res.maxdd,
+            'Turnover': res.turnover,
+            'Trades': res.n_trades
+        })
+        curves[s] = res.equity
+    metrics = pd.DataFrame(rows).sort_values('CAGR', ascending=False)
+    return metrics, curves

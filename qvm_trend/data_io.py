@@ -373,6 +373,55 @@ def load_prices_panel(symbols: List[str],
     panel = _process_symbols(symbols, fetch, batch=batch, pause=pause)
     return panel
 
+def _normalize_close(df: pd.DataFrame) -> pd.DataFrame:
+    """Garantiza columna 'close' a partir de variantes comunes."""
+    if df is None or df.empty:
+        return df
+    if 'close' in df.columns:
+        return df[['close']].sort_index()
+    df = df.copy()
+    for cand in ('adjClose', 'Close', 'close_price', 'c'):
+        if cand in df.columns:
+            df['close'] = df[cand]
+            return df[['close']].sort_index()
+    # último recurso: si hay OHLC tipo 'o','h','l','c'
+    if 'c' in df.columns:
+        df['close'] = df['c']
+        return df[['close']].sort_index()
+    # si no conseguimos, devolvemos vacío (el backtest lo ignorará)
+    return pd.DataFrame()
+
+def load_price_panel(symbols: List[str],
+                     start: str | None = None,
+                     end: str | None = None,
+                     *,
+                     cache_key: str | None = None,
+                     force: bool = False,
+                     batch: int = 40,
+                     pause: float = 1.0) -> Dict[str, pd.DataFrame]:
+    """
+    Wrapper de compatibilidad para backtesting/gestión.
+    Llama a tu load_prices_panel(...) y normaliza 'close'.
+    """
+    raw = load_prices_panel(symbols, start, end,
+                            cache_key=cache_key,
+                            force=force,
+                            batch=batch,
+                            pause=pause)
+    panel: Dict[str, pd.DataFrame] = {}
+    for s, df in (raw or {}).items():
+        try:
+            norm = _normalize_close(df)
+            if norm is not None and not norm.empty:
+                # quitar tz si viene con zona horaria
+                if getattr(norm.index, "tz", None) is not None:
+                    norm.index = norm.index.tz_localize(None)
+                panel[s] = norm
+        except Exception:
+            # continúa con los demás símbolos
+            continue
+    return panel
+
 def load_benchmark(symbol: str,
                    start: str | None = None,
                    end: str | None = None) -> pd.DataFrame | None:

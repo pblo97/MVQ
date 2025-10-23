@@ -259,3 +259,28 @@ def market_regime_on(
             breadth_ok = bool(breadth >= float(breadth_min))
 
     return bool(bench_ok and breadth_ok)
+
+# === pipeline.py (ADD) ===
+def get_final_symbols_safe(locals_or_state: dict) -> list[str]:
+    """
+    Intenta extraer la lista final de símbolos desde varias variables comunes.
+    """
+    for key in ('kept_syms', 'final_symbols', 'kept'):
+        if key in locals_or_state:
+            val = locals_or_state[key]
+            try:
+                if isinstance(val, list):
+                    return [str(x) for x in val]
+                # si es DataFrame con col 'symbol'
+                if hasattr(val, 'columns') and 'symbol' in val.columns:
+                    return val['symbol'].dropna().astype(str).unique().tolist()
+            except Exception:
+                pass
+    # fallback: si existe df_vfq con col 'symbol'
+    if 'df_vfq' in locals_or_state:
+        df = locals_or_state['df_vfq']
+        try:
+            return df['symbol'].dropna().astype(str).unique().tolist()
+        except Exception:
+            pass
+    return []
