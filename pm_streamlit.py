@@ -201,8 +201,8 @@ with tab_macro:
         with c_s2:
             dfov = h[["overlay"]].astype(int).reset_index()
             import plotly.express as px
-            fig = px.step(dfov, x="ts", y="overlay", title="Overlay (0/1)")
-            st.plotly_chart(fig, use_container_width=True)
+            fig = px.line(dfov, x="ts", y="overlay", title="Overlay (0/1)")
+            fig.update_traces(line_shape="hv")  # estilo “step” (horizontal-verti
 
         # Banda de régimen
         st.caption("Timeline de régimen (OFF/NEU/ON) según z_ema + histéresis")
@@ -243,8 +243,8 @@ with tab_macro:
                     dfr["EQ_naive"] = (1 + dfr["Excess_Ret"]).cumprod()
                     dfr["EQ_filtered"] = (1 + dfr["Ret_Filtered"]).cumprod()
                     import plotly.express as px
-                    fig = px.line(dfr.rename_axis("Date").reset_index(),
-                                  x="Date", y=["EQ_naive","EQ_filtered"], title="Curva de capital (bundle)")
+                    fig = px.line(mb["Overlay_Signal"].rename_axis("Date").reset_index(), x="Date", y="Overlay_Signal", title="Overlay bundle (0/1)")
+                    fig.update_traces(line_shape="hv")
                     st.plotly_chart(fig, use_container_width=True)
             except Exception as e:
                 st.error(f"Error leyendo bundle: {e}")
