@@ -3,6 +3,11 @@ import pandas as pd
 import streamlit as st
 from datetime import date
 
+import os, sys
+ROOT = os.path.abspath(os.path.dirname(__file__))  # carpeta donde vive pm_streamlit.py
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 # ==== imports del paquete ====
 from qvm_trend.data_io import load_prices_panel, load_benchmark, DEFAULT_START, DEFAULT_END
 from qvm_trend.pm.orchestrator import build_portfolio
