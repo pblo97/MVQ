@@ -262,7 +262,9 @@ def quality_history_from_fmp(symbols: List[str], api_key: str) -> pd.DataFrame:
     out_rows = []
     for sym in [s.upper() for s in symbols]:
         data = fetch_quarterly(sym, api_key)
-        inc, bal, cfs, rat, met = data["income"], data["balance"], data["ratios"], data["metrics"]
+        # ✅ FIX: incluye "cash"
+        inc, bal, cfs, rat, met = data["income"], data["balance"], data["cash"], data["ratios"], data["metrics"]
+
 
         # Alineamos un índice trimestral base (el de income por lo general es el más completo)
         if inc.empty:

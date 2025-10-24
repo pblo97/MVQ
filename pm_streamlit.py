@@ -394,55 +394,78 @@ with tab_port:
 # ------------------ SALIDAS ------------------
 # ------------------ SALIDAS ------------------
 # ------------------ SALIDAS ------------------
+# ------------------ SALIDAS ------------------
 with tab_exits:
     st.subheader("Reglas de salida por símbolo (MA200, Mom 12-1, Calidad 1Q)")
 
+    # Parámetros
     colE1, colE2, colE3 = st.columns(3)
     with colE1:
         ma_window = st.number_input("MA (días)", 100, 400, 200, 10, key="ex_ma")
     with colE2:
         mom_lookback = st.number_input("Lookback Momentum (días)", 120, 400, 252, 5, key="ex_mom")
     with colE3:
-        vfq_delta_thr = st.number_input("Umbral ΔVFQ 1Q (degradación)", 0.00, 1.00, 0.10, 0.01, format="%.2f", key="ex_vfq_thr")
+        vfq_delta_thr = st.number_input(
+            "Umbral ΔVFQ 1Q (degradación)", 0.00, 1.00, 0.10, 0.01, format="%.2f", key="ex_vfq_thr"
+        )
 
     st.caption(
         "Salida si: rompe MA200 y/o Momentum 12-1 < 0; "
         "se refuerza con degradación de calidad (ΔVFQ 1Q < -umbral). Revisión trimestral."
     )
 
+    # Símbolos desde Entradas
     symbols = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
     if not symbols:
         st.warning("Ingresa símbolos en la pestaña Entradas.")
         st.stop()
 
+    # ==== VFQ histórico automático desde FMP (sin CSV) ====
     fmp_key = st.secrets.get("FMP_API_KEY", "")
     if not fmp_key:
         st.error("Falta **FMP_API_KEY** en `st.secrets` para construir el histórico de calidad (VFQ).")
         st.stop()
 
-    from qvm_trend.fundamentals.fmp_quality import quality_history_from_fmp
+    try:
+        from qvm_trend.fundamentals.fmp_quality import quality_history_from_fmp
+    except Exception as e:
+        st.error(f"No pude importar quality_history_from_fmp: {e}")
+        st.stop()
 
     @st.cache_data(show_spinner=True, ttl=60*60)
     def _fetch_vfq_history(symbols_list: list[str], fmp_key: str) -> pd.DataFrame:
-        # Devuelve columnas: symbol, date, VFQ (trimestral)
+        """
+        Devuelve columnas: ['symbol','date','VFQ'] (trimestral).
+        Usa rolling 4Q para TTM aprox y z-scores winsorizados antes de ponderar.
+        """
         return quality_history_from_fmp(symbols_list, fmp_key)
 
-    # 1) Traemos el histórico trimestral de VFQ desde FMP (sin CSV)
+    # Construimos histórico VFQ
     try:
-        with st.spinner("Descargando histórico de calidad (VFQ) desde FMP…"):
+        with st.spinner("Construyendo histórico de calidad (VFQ) desde FMP…"):
             vfq_hist = _fetch_vfq_history(symbols, fmp_key)
         if vfq_hist is None or vfq_hist.empty:
-            st.warning("No se pudo construir el histórico VFQ desde FMP (Starter puede no cubrir todos los símbolos).")
+            st.warning(
+                "No se pudo construir el histórico VFQ desde FMP. "
+                "Starter plan puede no cubrir todos los símbolos o endpoints."
+            )
+        else:
+            # Vista corta de control
+            st.dataframe(
+                vfq_hist.sort_values(["symbol", "date"]).groupby("symbol").tail(4),
+                use_container_width=True
+            )
+            st.caption("Muestra de VFQ (últimos 4 trimestres por símbolo).")
     except Exception as e:
         st.error(f"No pude obtener VFQ histórico desde FMP: {e}")
         vfq_hist = None
 
-    # 2) Construcción de tabla de salidas
+    # ==== Tabla de salidas ====
     try:
         panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
         bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
 
-        from qvm_trend.pm.exits import build_exit_table  # versión que calcula vfq_prev/delta/flag
+        from qvm_trend.pm.exits import build_exit_table  # versión que calcula vfq_prev / vfq_delta / quality_flag
 
         table = build_exit_table(
             panel=panel,
@@ -450,7 +473,7 @@ with tab_exits:
             ma_window=int(ma_window),
             mom_lookback=int(mom_lookback),
             review_freq="Q",
-            vfq_hist=vfq_hist,    # histórico 100% FMP
+            vfq_hist=vfq_hist,           # histórico 100% desde FMP
             vfq_col="VFQ",
             vfq_delta_thr=float(vfq_delta_thr),
         )
@@ -458,6 +481,7 @@ with tab_exits:
         if table is None or table.empty:
             st.warning("No se pudo generar la tabla de salidas.")
         else:
+            # Orden/columnas sugeridas si existen
             preferred_cols = [
                 "symbol", "price_last", "ma_flag", "mom_flag",
                 "vfq_last", "vfq_prev", "vfq_delta", "quality_flag",
@@ -466,23 +490,37 @@ with tab_exits:
             cols_show = [c for c in preferred_cols if c in table.columns] or table.columns.tolist()
             table = table[cols_show].copy()
 
-            act_sel = st.multiselect("Filtrar por acción", options=["EXIT", "TRIM", "HOLD"], default=["EXIT", "TRIM"])
+            # Filtros
+            act_sel = st.multiselect(
+                "Filtrar por acción",
+                options=["EXIT", "TRIM", "HOLD"],
+                default=["EXIT", "TRIM"]
+            )
             if act_sel:
                 table = table[table["action"].isin(act_sel)]
 
-            sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
+            sym_del = st.multiselect(
+                "Eliminar símbolos de la tabla",
+                options=sorted(table["symbol"].unique().tolist())
+            )
             if sym_del:
                 table = table[~table["symbol"].isin(sym_del)]
 
-            # Formato
+            # Formato numérico
             num_cols = [c for c in ["price_last", "vfq_last", "vfq_prev", "vfq_delta"] if c in table.columns]
             for c in num_cols:
                 if c == "vfq_delta":
-                    table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:+.2f}" if pd.notna(x) else "")
+                    table[c] = pd.to_numeric(table[c], errors="coerce").map(
+                        lambda x: f"{x:+.2f}" if pd.notna(x) else ""
+                    )
                 elif c == "price_last":
-                    table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
+                    table[c] = pd.to_numeric(table[c], errors="coerce").map(
+                        lambda x: f"{x:,.2f}" if pd.notna(x) else ""
+                    )
                 else:
-                    table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+                    table[c] = pd.to_numeric(table[c], errors="coerce").map(
+                        lambda x: f"{x:.2f}" if pd.notna(x) else ""
+                    )
 
             st.dataframe(table, use_container_width=True)
 
@@ -496,6 +534,7 @@ with tab_exits:
 
     except Exception as e:
         st.error(f"Error generando salidas: {e}")
+
 
 
 # ------------------ DIAGNÓSTICO ------------------
