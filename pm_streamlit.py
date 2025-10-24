@@ -111,124 +111,60 @@ with tab_in:
 
 # ------------------ MACRO ------------------
 with tab_macro:
-    st.subheader("Macro Monitor: bundle o slider")
-    c1, c2 = st.columns(2)
+    st.subheader("Macro Monitor: control interno (sin CSV) + bundle opcional")
 
-    macro_z_val = None
-    beta_cap_sug = None
-    pos_cap_sug  = None
-    overlay_gate_series = None
-    macro_bundle = None
-
-    with c1:
-        up_macro = st.file_uploader("macro_monitor_bundle.csv", type=["csv"])
-        if up_macro is not None:
-            try:
-                mb = pd.read_csv(up_macro, index_col=0, parse_dates=True)
-                macro_bundle = mb.sort_index()
-                st.success(f"Bundle macro cargado: {macro_bundle.shape[0]} filas, {macro_bundle.shape[1]} columnas")
-
-                # 1) macro_z directo si viene; si no, intenta COMPOSITE_Z / COMPOSITE_PCA usando macro_z_from_series
-                if "macro_z" in macro_bundle.columns and pd.notna(macro_bundle["macro_z"]).any():
-                    macro_z_val = float(macro_bundle["macro_z"].dropna().iloc[-1])
-                else:
-                    if "COMPOSITE_Z" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_Z"]).any():
-                        macro_z_val = float(macro_z_from_series(macro_bundle["COMPOSITE_Z"]))
-                    elif "COMPOSITE_PCA" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_PCA"]).any():
-                        macro_z_val = float(macro_z_from_series(macro_bundle["COMPOSITE_PCA"]))
-                    else:
-                        macro_z_val = 0.0  # fallback
-
-                if "beta_cap_sug" in macro_bundle.columns:
-                    beta_cap_sug = float(macro_bundle["beta_cap_sug"].dropna().iloc[-1])
-                if "pos_cap_sug" in macro_bundle.columns:
-                    pos_cap_sug  = float(macro_bundle["pos_cap_sug"].dropna().iloc[-1])
-
-                overlay_gate_series = macro_bundle.get("Overlay_Signal")
-                st.success(f"Macro listo (z={macro_z_val:.2f})")
-
-                # ==== Visualizaciones interactivas ====
-                st.markdown("### Gráficos del bundle")
-                g1, g2 = st.columns(2)
-                with g1:
-                    cols_plot = [c for c in ["COMPOSITE_Z","COMPOSITE_PCA"] if c in macro_bundle.columns]
-                    if cols_plot:
-                        dfp = macro_bundle[cols_plot].rename_axis("Date").reset_index()
-                        import plotly.express as px
-                        fig = px.line(dfp, x="Date", y=cols_plot, title="Composites macro")
-                        st.plotly_chart(fig, use_container_width=True)
-                with g2:
-                    if "Overlay_Signal" in macro_bundle.columns:
-                        dfov = macro_bundle["Overlay_Signal"].rename_axis("Date").reset_index()
-                        import plotly.express as px
-                        fig = px.step(dfov, x="Date", y="Overlay_Signal", title="Overlay (0/1)", markers=False)
-                        st.plotly_chart(fig, use_container_width=True)
-
-                g3, g4 = st.columns(2)
-                with g3:
-                    # Régimen derivado desde macro_z (o desde composite si no hay)
-                    reg_series = None
-                    try:
-                        mz_series = None
-                        if "macro_z" in macro_bundle.columns:
-                            mz_series = macro_bundle["macro_z"]
-                        elif "COMPOSITE_Z" in macro_bundle.columns:
-                            mz_series = macro_bundle["COMPOSITE_Z"]
-                        if mz_series is not None:
-                            # mapa simple a régimen usando z_to_regime por punto
-                            reg_series = mz_series.dropna().apply(lambda z: z_to_regime(float(z)).label)
-                            dfreg = reg_series.rename("Regime").rename_axis("Date").reset_index()
-                            import plotly.express as px
-                            fig = px.area(dfreg, x="Date", y=dfreg["Regime"].apply(lambda r: 1 if r=="ON" else (0 if r=="OFF" else 0.5)),
-                                          title="Régimen (OFF/NEU/ON)", range_y=[-0.1, 1.1])
-                            fig.update_yaxes(tickvals=[0,0.5,1.0], ticktext=["OFF","NEU","ON"])
-                            st.plotly_chart(fig, use_container_width=True)
-                    except Exception as _:
-                        pass
-                with g4:
-                    # Equity naive vs filtered si están
-                    if {"Excess_Ret","Ret_Filtered"}.issubset(macro_bundle.columns):
-                        df_ret = macro_bundle[["Excess_Ret","Ret_Filtered"]].dropna().copy()
-                        df_ret["EQ_naive"] = (1 + df_ret["Excess_Ret"]).cumprod()
-                        df_ret["EQ_filtered"] = (1 + df_ret["Ret_Filtered"]).cumprod()
-                        import plotly.express as px
-                        fig = px.line(df_ret.rename_axis("Date").reset_index(),
-                                      x="Date", y=["EQ_naive","EQ_filtered"],
-                                      title="Curva de capital: naive vs filtrado")
-                        st.plotly_chart(fig, use_container_width=True)
-
-                # KPIs rápidos si hay retornos
-                if {"Excess_Ret","Ret_Filtered"}.issubset(macro_bundle.columns):
-                    ret = macro_bundle["Excess_Ret"].dropna()
-                    ref = macro_bundle["Ret_Filtered"].dropna()
-                    def _safe_sharpe(x):
-                        x = x.dropna()
-                        return float(x.mean()/x.std()) if x.std() not in (None,0,np.nan) and np.isfinite(x.std()) else np.nan
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("Sharpe naive", f"{_safe_sharpe(ret):.3f}")
-                    k2.metric("Sharpe filtrado", f"{_safe_sharpe(ref):.3f}")
-                    k3.metric("% tiempo ON", f"{100.0*float(macro_bundle.get('Overlay_Signal', pd.Series()).mean()):.1f}%" if "Overlay_Signal" in macro_bundle.columns else "—")
-
-            except Exception as e:
-                st.error(f"Error leyendo macro bundle: {e}")
-                macro_z_val = None
-
-    with c2:
-        st.caption("Si no subes bundle, usa el slider:")
+    # ---------- Parámetros anti-ruido / histéresis ----------
+    ctop1, ctop2, ctop3, ctop4 = st.columns(4)
+    with ctop1:
         macro_z_slider = st.slider("macro_z (manual)", -2.5, 2.5, 0.0, 0.1)
+    with ctop2:
+        ema_alpha = st.slider("Suavizado EMA (α)", 0.05, 0.50, 0.20, 0.01,
+                              help="Más alto = reacciona más rápido (menos suavizado).")
+    with ctop3:
+        thr_on  = st.number_input("Umbral ON (≥)", value=0.50, step=0.05, format="%.2f",
+                                  help="Si z_suav ≥ este nivel → estado ON.")
+    with ctop4:
+        thr_off = st.number_input("Umbral OFF (≤)", value=-0.50, step=0.05, format="%.2f",
+                                  help="Si z_suav ≤ este nivel → estado OFF. Entre ambos = NEUTRAL.")
 
-    macro_z_eff = macro_z_val if macro_z_val is not None else macro_z_slider
+    # ---------- Estado y buffers en sesión ----------
+    hist = st.session_state.get("macro_hist", pd.DataFrame(columns=["ts","z_raw","z_ema","overlay"]))
+    last_state = st.session_state.get("overlay_state", 1)  # 1=ON por defecto
+    last_z_ema = float(hist["z_ema"].iloc[-1]) if not hist.empty else macro_z_slider
 
-    # Régimen y multiplicadores (desde z_to_regime)
-    reg = z_to_regime(float(macro_z_eff))
+    # EMA
+    z_ema = (1-ema_alpha)*last_z_ema + ema_alpha*float(macro_z_slider) if not hist.empty else float(macro_z_slider)
+
+    # Histéresis de overlay
+    state = last_state
+    if z_ema >= float(thr_on):
+        state = 1
+    elif z_ema <= float(thr_off):
+        state = 0
+
+    # Append punto actual (tipo “streaming”)
+    new_row = pd.DataFrame([{"ts": pd.Timestamp.utcnow(), "z_raw": float(macro_z_slider),
+                             "z_ema": z_ema, "overlay": int(state)}])
+    hist = pd.concat([hist, new_row], ignore_index=True)
+    # Mantén sólo los últimos N puntos (evitar crecer sin límite)
+    N = 600
+    if len(hist) > N:
+        hist = hist.iloc[-N:].reset_index(drop=True)
+
+    # Guarda sesión
+    st.session_state["macro_hist"] = hist
+    st.session_state["overlay_state"] = state
+
+    # ---------- Métricas del régimen usando z_ema ----------
+    reg = z_to_regime(float(z_ema))
     k1,k2,k3,k4 = st.columns(4)
-    k1.metric("macro_z", f"{reg.z:.2f}")
+    k1.metric("macro_z (EMA)", f"{reg.z:.2f}")
     k2.metric("Régimen", reg.label)
     k3.metric("M_macro", f"{reg.m_multiplier:.2f}")
     k4.metric("β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
 
-    
-
+    # ---------- Visual mínimo siempre disponible ----------
+    import plotly.graph_objects as go
     c_g1, c_g2 = st.columns(2)
     with c_g1:
         fig = go.Figure(go.Indicator(
@@ -238,7 +174,6 @@ with tab_macro:
             gauge={"axis": {"range": [0.5, 1.5]}}
         ))
         st.plotly_chart(fig, use_container_width=True)
-
     with c_g2:
         caps_df = pd.DataFrame({
             "Cap": ["β·w total", "Posición"],
@@ -247,16 +182,79 @@ with tab_macro:
         st.bar_chart(caps_df.set_index("Cap"))
         st.caption("Caps sugeridos por régimen")
 
-    if macro_bundle is None:
-        st.info("Sube **macro_monitor_bundle.csv** para ver históricos de Composite, Overlay y equity filtrado.")
+    # ---------- Series internas (línea y step) ----------
+    st.markdown("### Serie interna (z & overlay)")
+    if not hist.empty:
+        h = hist.copy()
+        h["ts"] = pd.to_datetime(h["ts"])
+        h = h.set_index("ts").tail(400)  # muestra última ventana
 
-    # Guardar en sesión para otras pestañas
-    # Guardar en sesión para otras pestañas
-    st.session_state["macro_z_eff"] = macro_z_eff
-    # Si el bundle trae sugerencias, priorízalas; si no, usa las del régimen base
-    st.session_state["beta_cap_sug"] = beta_cap_sug if beta_cap_sug is not None else reg.beta_cap
-    st.session_state["pos_cap_sug"]  = pos_cap_sug  if pos_cap_sug  is not None else reg.vol_cap
-    st.session_state["overlay_gate_series"] = overlay_gate_series
+        c_s1, c_s2 = st.columns(2)
+        with c_s1:
+            import plotly.express as px
+            dfz = h[["z_raw","z_ema"]].rename(columns={"z_raw":"z", "z_ema":"z_ema"})
+            fig = px.line(dfz.reset_index(), x="ts", y=["z","z_ema"], title="macro_z crudo vs EMA")
+            # bandas de histéresis
+            fig.add_hline(y=float(thr_on), line_dash="dot", line_color="green")
+            fig.add_hline(y=float(thr_off), line_dash="dot", line_color="red")
+            st.plotly_chart(fig, use_container_width=True)
+        with c_s2:
+            dfov = h[["overlay"]].astype(int).reset_index()
+            import plotly.express as px
+            fig = px.step(dfov, x="ts", y="overlay", title="Overlay (0/1)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Banda de régimen
+        st.caption("Timeline de régimen (OFF/NEU/ON) según z_ema + histéresis")
+        reg_series = h["z_ema"].apply(lambda z: z_to_regime(float(z)).label)
+        dfreg = pd.DataFrame({"ts": h.index, "Regime": reg_series.values})
+        import plotly.express as px
+        fig = px.area(dfreg, x="ts",
+                      y=dfreg["Regime"].apply(lambda r: 1 if r=="ON" else (0 if r=="OFF" else 0.5)),
+                      title="Régimen", range_y=[-0.1, 1.1])
+        fig.update_yaxes(tickvals=[0,0.5,1.0], ticktext=["OFF","NEU","ON"])
+        st.plotly_chart(fig, use_container_width=True)
+
+        # KPI derivados de overlay interno
+        pct_on = float(h["overlay"].mean()) if len(h) else 0.0
+        st.metric("% tiempo ON (ventana)", f"{100*pct_on:.1f}%")
+
+    # ---------- Bundle OPCIONAL (si quieres ver compuestos y equity) ----------
+    with st.expander("Cargar bundle macro (opcional)"):
+        up_macro = st.file_uploader("macro_monitor_bundle.csv", type=["csv"], key="macro_bundle_file")
+        if up_macro is not None:
+            try:
+                mb = pd.read_csv(up_macro, index_col=0, parse_dates=True).sort_index()
+                st.success(f"Bundle macro cargado: {mb.shape[0]} filas, {mb.shape[1]} columnas")
+                # z opcional desde bundle (no pisa el control interno, solo visual)
+                cols_plot = [c for c in ["COMPOSITE_Z","COMPOSITE_PCA"] if c in mb.columns]
+                if cols_plot:
+                    import plotly.express as px
+                    fig = px.line(mb[cols_plot].rename_axis("Date").reset_index(),
+                                  x="Date", y=cols_plot, title="Composites macro (bundle)")
+                    st.plotly_chart(fig, use_container_width=True)
+                if "Overlay_Signal" in mb.columns:
+                    import plotly.express as px
+                    fig = px.step(mb["Overlay_Signal"].rename_axis("Date").reset_index(),
+                                  x="Date", y="Overlay_Signal", title="Overlay bundle (0/1)")
+                    st.plotly_chart(fig, use_container_width=True)
+                if {"Excess_Ret","Ret_Filtered"}.issubset(mb.columns):
+                    dfr = mb[["Excess_Ret","Ret_Filtered"]].dropna().copy()
+                    dfr["EQ_naive"] = (1 + dfr["Excess_Ret"]).cumprod()
+                    dfr["EQ_filtered"] = (1 + dfr["Ret_Filtered"]).cumprod()
+                    import plotly.express as px
+                    fig = px.line(dfr.rename_axis("Date").reset_index(),
+                                  x="Date", y=["EQ_naive","EQ_filtered"], title="Curva de capital (bundle)")
+                    st.plotly_chart(fig, use_container_width=True)
+            except Exception as e:
+                st.error(f"Error leyendo bundle: {e}")
+
+    # ---------- Variables compartidas con otras pestañas ----------
+    st.session_state["macro_z_eff"] = float(z_ema)  # usamos z suavizado como “efectivo”
+    st.session_state["beta_cap_sug"] = reg.beta_cap
+    st.session_state["pos_cap_sug"]  = reg.vol_cap
+    # Gate táctico (usa el último de nuestra serie interna)
+    st.session_state["overlay_gate_series"] = st.session_state["macro_hist"]["overlay"] if "macro_hist" in st.session_state else None
 
 # ------------------ CARTERA ------------------
 with tab_port:
