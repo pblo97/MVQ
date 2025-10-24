@@ -422,13 +422,36 @@ def load_price_panel(symbols: List[str],
             continue
     return panel
 
+# reemplaza tu load_benchmark por este:
+
+_BENCH_ALIAS = {
+    "SP500": "^GSPC",
+    "S&P 500": "^GSPC",
+    "GSPC": "^GSPC",
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "^GSPC": "^GSPC",
+}
+
 def load_benchmark(symbol: str,
                    start: str | None = None,
-                   end: str | None = None) -> pd.DataFrame | None:
+                   end: str | None = None) -> pd.DataFrame:
     """
-    Descarga la serie de un benchmark (p.ej. 'SPY', 'QQQ', 'IPSA').
+    Descarga el benchmark desde FMP y devuelve OHLCV (index fecha).
+    Exige columna 'close'. Lanza error con mensaje útil si no hay datos.
     """
-    return get_prices_fmp(symbol, start, end)
+    sym = _BENCH_ALIAS.get(symbol, symbol)
+    df = get_prices_fmp(sym, start, end)
+    if df is None or df.empty or "close" not in df.columns:
+        raise RuntimeError(f"No hay datos de benchmark para '{sym}' desde FMP. "
+                           f"Revisa FMP_API_KEY / símbolo / rango de fechas.")
+    # Asegura timezone naive y orden
+    if getattr(df.index, "tz", None) is not None:
+        df = df.copy()
+        df.index = df.index.tz_localize(None)
+    df = df.sort_index()
+    return df
+
 
 def fmp_probe(symbol: str = "AAPL") -> dict:
     """
