@@ -120,7 +120,7 @@ with tab_in:
 with tab_macro:
     st.subheader("Macro Monitor: control interno (sin CSV) + bundle opcional ↪")
 
-    # === 0) Buscar bundle automáticamente (sin pedir upload) ===
+    # --- 0) Cargar bundle automático o por upload ---
     macro_bundle = None
     auto_paths = [
         "./macro_monitor_bundle.csv",
@@ -137,7 +137,6 @@ with tab_macro:
         except Exception as e:
             st.warning(f"No pude leer {p}: {e}")
 
-    # (opcional) además permitir upload manual
     up_macro = st.file_uploader("Subir macro_monitor_bundle.csv (opcional)", type=["csv"])
     if up_macro is not None:
         try:
@@ -147,69 +146,84 @@ with tab_macro:
             st.error(f"Error leyendo bundle: {e}")
             macro_bundle = None
 
-    # === 1) Control interno (slider + EMA + umbrales) ===
+    # --- 1) Controles manuales (slider/EMA/umbrales) ---
     c_top = st.columns([1,1,1,1])
     with c_top[0]:
         macro_z_manual = st.slider("macro_z (manual)", -2.5, 2.5, 0.0, 0.05)
         alpha = st.slider("Suavizado EMA (α)", 0.05, 0.50, 0.20, 0.01,
                           help="Qué tan rápido reacciona el macro_z suavizado.")
-        # simple EMA local (solo para visual)
+        # EMA simple local (visual). Si quieres EMA real histórica, cámbialo por una serie.
         macro_z_ema = (1 - alpha) * 0.0 + alpha * macro_z_manual
         st.metric("macro_z (EMA)", f"{macro_z_ema:.2f}")
     with c_top[1]:
-        # umbrales editables (documentados en el panel de ayuda que añadimos antes)
-        thr_on = st.number_input("Umbral ON (≥)", value=0.50, step=0.05, format="%.2f")
+        thr_on  = st.number_input("Umbral ON (≥)", value=0.50,  step=0.05, format="%.2f")
         thr_off = st.number_input("Umbral OFF (≤)", value=-0.50, step=0.05, format="%.2f")
-    with c_top[2]:
-        # Mapear a régimen via z_to_regime (fallback o el real)
-        reg = z_to_regime(float(macro_z_ema))
-        st.metric("Régimen", reg.label)
-        st.metric("M_macro", f"{reg.m_multiplier:.2f}")
-    with c_top[3]:
-        st.metric("β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
 
-    # Gauge y barras de caps
+    # --- 2) Si hay bundle, tomar macro_z del bundle y sugerencias ---
+    macro_z_from_bundle = None
+    beta_cap_sug = None
+    pos_cap_sug  = None
+    overlay_gate_series = None
+
+    if macro_bundle is not None:
+        try:
+            if "macro_z" in macro_bundle.columns and pd.notna(macro_bundle["macro_z"]).any():
+                macro_z_from_bundle = float(macro_bundle["macro_z"].dropna().iloc[-1])
+            elif "COMPOSITE_Z" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_Z"]).any():
+                macro_z_from_bundle = float(macro_z_from_series(macro_bundle["COMPOSITE_Z"]))
+            elif "COMPOSITE_PCA" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_PCA"]).any():
+                macro_z_from_bundle = float(macro_z_from_series(macro_bundle["COMPOSITE_PCA"]))
+
+            if "beta_cap_sug" in macro_bundle.columns:
+                beta_cap_sug = float(macro_bundle["beta_cap_sug"].dropna().iloc[-1])
+            if "pos_cap_sug" in macro_bundle.columns:
+                pos_cap_sug  = float(macro_bundle["pos_cap_sug"].dropna().iloc[-1])
+
+            overlay_gate_series = macro_bundle.get("Overlay_Signal")
+        except Exception as e:
+            st.warning(f"No pude derivar macro_z del bundle: {e}")
+
+    # --- 3) Decidir macro_z EFECTIVO y mapear a régimen ---
+    macro_z_eff = float(macro_z_from_bundle) if macro_z_from_bundle is not None else float(macro_z_ema)
+    reg_eff = z_to_regime(macro_z_eff)
+
+    # KPIs (usar SIEMPRE el efectivo)
+    with c_top[2]:
+        st.metric("Régimen", reg_eff.label)
+        st.metric("M_macro", f"{reg_eff.m_multiplier:.2f}")
+    with c_top[3]:
+        st.metric("β cap / pos cap", f"{reg_eff.beta_cap:.2f} / {reg_eff.vol_cap:.2f}")
+
+    # Fuente del z efectivo
+    st.caption(f"Fuente de macro_z: **{'bundle' if macro_z_from_bundle is not None else 'manual/EMA'}** — macro_z (efectivo) = {macro_z_eff:.2f}")
+
+    # --- 4) Gauge y barras de caps (con el efectivo) ---
     g1, g2 = st.columns(2)
     with g1:
         try:
             import plotly.graph_objects as go
             gauge = go.Figure(go.Indicator(
                 mode="gauge+number",
-                value=reg.m_multiplier,
+                value=reg_eff.m_multiplier,
                 gauge={"axis": {"range": [0.7, 1.3]}},
                 title={"text": "M_macro (×)"}
             ))
             st.plotly_chart(gauge, use_container_width=True)
         except Exception:
-            st.write("M_macro:", reg.m_multiplier)
+            st.write("M_macro:", reg_eff.m_multiplier)
     with g2:
-        st.bar_chart(pd.Series(
-            {"Posición": reg.vol_cap, "β·w total": reg.beta_cap}
-        ).to_frame("caps"))
+        st.bar_chart(pd.Series({"Posición": reg_eff.vol_cap, "β·w total": reg_eff.beta_cap}).to_frame("caps"))
 
-    # === 2) Si hay bundle (auto o upload) dibujamos LOS HISTÓRICOS ===
-    macro_z_val = float(macro_z_ema)
-    beta_cap_sug = None
-    pos_cap_sug  = None
-    overlay_gate_series = None
+    # --- 5) Gráficos históricos del bundle (si existe) ---
+    try:
+        import plotly.express as px
+        HAVE_PX = True
+    except Exception:
+        HAVE_PX = False
 
-    if macro_bundle is not None:
-        cols_plot = [c for c in ["COMPOSITE_Z", "COMPOSITE_PCA"] if c in macro_bundle.columns]
-        if "macro_z" in macro_bundle.columns and pd.notna(macro_bundle["macro_z"]).any():
-            macro_z_val = float(macro_bundle["macro_z"].dropna().iloc[-1])
-        elif "COMPOSITE_Z" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_Z"]).any():
-            macro_z_val = float(macro_z_from_series(macro_bundle["COMPOSITE_Z"]))
-        elif "COMPOSITE_PCA" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_PCA"]).any():
-            macro_z_val = float(macro_z_from_series(macro_bundle["COMPOSITE_PCA"]))
-
-        if "beta_cap_sug" in macro_bundle.columns:
-            beta_cap_sug = float(macro_bundle["beta_cap_sug"].dropna().iloc[-1])
-        if "pos_cap_sug" in macro_bundle.columns:
-            pos_cap_sug  = float(macro_bundle["pos_cap_sug"].dropna().iloc[-1])
-
-        overlay_gate_series = macro_bundle.get("Overlay_Signal")
-
+    if macro_bundle is not None and HAVE_PX:
         st.markdown("### Históricos (del bundle)")
+        cols_plot = [c for c in ["COMPOSITE_Z", "COMPOSITE_PCA"] if c in macro_bundle.columns]
         if cols_plot:
             st.plotly_chart(
                 px.line(macro_bundle[cols_plot].rename_axis("Date").reset_index(),
@@ -232,15 +246,13 @@ with tab_macro:
                 use_container_width=True
             )
 
-    # === 3) Propagar a otras pestañas ===
-    st.session_state["macro_z_eff"]   = macro_z_val if macro_bundle is not None else float(macro_z_ema)
-    st.session_state["beta_cap_sug"]  = beta_cap_sug if beta_cap_sug is not None else reg.beta_cap
-    st.session_state["pos_cap_sug"]   = pos_cap_sug  if pos_cap_sug  is not None else reg.vol_cap
+    # --- 6) Propagar a otras pestañas (EFECTIVO + sugerencias) ---
+    st.session_state["macro_z_eff"] = macro_z_eff
+    st.session_state["beta_cap_sug"] = beta_cap_sug if beta_cap_sug is not None else reg_eff.beta_cap
+    st.session_state["pos_cap_sug"]  = pos_cap_sug  if pos_cap_sug  is not None else reg_eff.vol_cap
     st.session_state["overlay_gate_series"] = overlay_gate_series
 
-    # pequeña ayuda
     st.caption("Sube **macro_monitor_bundle.csv** o déjalo vacío para usar el control interno.")
-
 
 
 # ------------------ CARTERA ------------------
