@@ -1,449 +1,190 @@
-# pm_streamlit.py
-import os, io
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
+from datetime import date
 
-# === Loaders / Helpers tuyos ===
+# ==== imports del paquete ====
 from qvm_trend.data_io import load_prices_panel, load_benchmark, DEFAULT_START, DEFAULT_END
-from qvm_trend.stats import beta_vs_bench, win_loss_stats  # asumimos existen
+from qvm_trend.pm.orchestrator import build_portfolio
+from qvm_trend.pm.exits import build_exit_table
+from qvm_trend.macro.macro_score import z_to_regime, macro_z_from_series
 
-# ===================== CONFIG & ESTILO =====================
-st.set_page_config(page_title="Gestión de Cartera", page_icon="🧮", layout="wide")
-st.markdown("""
-<style>
-.block-container { padding-top: 1rem; padding-bottom: 2rem; }
-[data-testid="stDataFrame"] tbody tr:hover { background: rgba(59,130,246,.08) !important; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Gestión de Cartera", page_icon="🧭", layout="wide")
 
-# ===================== PERSISTENCIA REMOTA (GitHub Gist) =====================
-# Secrets necesarios en Streamlit Cloud (Settings → Secrets):
-# GITHUB_TOKEN  = "ghp_..."
-# GIST_ID       = "abc123..."          (id del gist)
-# GIST_FILENAME = "portfolio_symbols.csv"
-from github import Github, InputFileContent
+st.title("🧭 Gestión de Cartera — Kelly + Macro")
+st.caption("Pesos por Kelly robusto, tilt por calidad, caps por régimen macro, y reglas de salida.")
 
-def _gh():
-    return Github(st.secrets["GITHUB_TOKEN"])
+# ------------------ TABS ------------------
+tab_in, tab_macro, tab_port, tab_exits, tab_diag = st.tabs(
+    ["Entradas", "Macro", "Cartera", "Salidas", "Diagnóstico"]
+)
 
-def load_portfolio_remote() -> pd.DataFrame:
-    """Lee el CSV 'portfolio_symbols.csv' desde el Gist y devuelve DataFrame ['symbol','date_added']"""
-    try:
-        gh = _gh()
-        gist = gh.get_gist(st.secrets["GIST_ID"])
-        fname = st.secrets["GIST_FILENAME"]
-        if fname not in gist.files:
-            return pd.DataFrame(columns=["symbol","date_added"])
-        content = gist.files[fname].content
-        df = pd.read_csv(io.StringIO(content))
-        if df.empty:
-            return pd.DataFrame(columns=["symbol","date_added"])
-        df["symbol"] = df["symbol"].astype(str).str.upper()
-        if "date_added" not in df.columns:
-            df["date_added"] = datetime.now().strftime("%Y-%m-%d")
-        return df[["symbol","date_added"]].drop_duplicates("symbol").reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame(columns=["symbol","date_added"])
+# ------------------ ENTRADAS ------------------
+with tab_in:
+    c1, c2, c3 = st.columns([2,1,1])
+    with c1:
+        symbols_txt = st.text_area("Símbolos (coma-separados)", "CHDN,CNR,GOOGL,MMM,PYPL,PZZA,UBER", height=80)
+    with c2:
+        bench = st.text_input("Benchmark", value="SPY").strip().upper()
+        start = st.date_input("Inicio", value=pd.to_datetime(DEFAULT_START).date())
+        end   = st.date_input("Fin", value=pd.to_datetime(DEFAULT_END).date())
+    with c3:
+        base_kelly = st.slider("Fracción Kelly base", 0.1, 1.0, 0.5, 0.05)
+        pos_cap = st.number_input("Cap por posición", 0.01, 0.10, 0.05, 0.01, format="%.2f")
+        beta_cap = st.number_input("Cap ∑(β·w)", 0.25, 2.00, 1.00, 0.05)
 
-def save_portfolio_remote(df: pd.DataFrame):
-    """Escribe el CSV al Gist (sobrescribe)."""
-    gh = _gh()
-    gist = gh.get_gist(st.secrets["GIST_ID"])
-    fname = st.secrets["GIST_FILENAME"]
-    if df is None or df.empty:
-        csv_txt = "symbol,date_added\n"
-    else:
-        out = df.copy()
-        out["symbol"] = out["symbol"].astype(str).str.upper()
-        if "date_added" not in out.columns:
-            out["date_added"] = datetime.now().strftime("%Y-%m-%d")
-        out = out[["symbol","date_added"]].drop_duplicates("symbol")
-        csv_txt = out.to_csv(index=False)
-    gist.edit(files={fname: InputFileContent(csv_txt)})
+    st.markdown("**(Opcional) CSV de calidad (VFQ o QualityScore)**")
+    up_vfq = st.file_uploader("vfq.csv (de tu screener)", type=["csv"])
 
-def init_portfolio_session():
-    if "pm_portfolio" not in st.session_state:
-        st.session_state["pm_portfolio"] = load_portfolio_remote()
-
-def add_symbols(symbols: list[str]):
-    df = st.session_state.get("pm_portfolio", pd.DataFrame(columns=["symbol","date_added"])).copy()
-    add = pd.DataFrame({
-        "symbol": [s.strip().upper() for s in symbols if s and str(s).strip()],
-        "date_added": datetime.now().strftime("%Y-%m-%d")
-    })
-    out = pd.concat([df, add], ignore_index=True).drop_duplicates("symbol").reset_index(drop=True)
-    st.session_state["pm_portfolio"] = out
-    save_portfolio_remote(out)
-
-def remove_symbols(symbols: list[str]):
-    df = st.session_state.get("pm_portfolio", pd.DataFrame(columns=["symbol","date_added"])).copy()
-    keep = df[~df["symbol"].isin([s.strip().upper() for s in symbols])]
-    st.session_state["pm_portfolio"] = keep
-    save_portfolio_remote(keep)
-
-# ===================== CACHÉ DE I/O =====================
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_prices(symbols, start, end, cache_key=""):
-    return load_prices_panel(symbols, start, end, cache_key=cache_key, force=False)
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _cached_bench(bench, start, end):
-    return load_benchmark(bench, start, end)
-
-# ===================== UI PRINCIPAL =====================
-st.title("🧮 Gestión de Cartera (Gist + Kelly robusto)")
-
-with st.sidebar:
-    st.markdown("### Parámetros de sizing")
-    method = st.selectbox(
-        "Método de pesos",
-        ["Kelly fraccionado", "Equal Weight", "Risk Parity (Inv-Vol)", "Mean–Variance (Σ⁻¹μ, heur.)"],
-        index=0
-    )
-    base_kelly = st.slider("Fracción Kelly", 0.1, 1.0, 0.5, 0.1)
-    vol_cap = st.number_input("Cap por posición (fracción del equity)", 0.01, 0.20, 0.05, 0.01, format="%.2f")
-    beta_cap = st.number_input("Cap ∑(β·w) <=", 0.25, 2.0, 1.0, 0.05)
-    enforce_sum1 = st.toggle("Forzar ∑w = 1.0 (después de beta cap)", value=True)
-
-    st.markdown("---")
-    st.markdown("### Kelly avanzado")
-    winsor_p = st.slider("Winsor p (cola)", 0.0, 0.10, 0.05, 0.01)
-    t0 = st.slider("Umbral t-stat (prudencia)", 1.0, 4.0, 2.0, 0.1)
-    lam_blend = st.slider("λ (mezcla con μ/σ²)", 0.0, 0.5, 0.2, 0.05)
-    min_months = st.number_input("Mín. meses por activo", 6, 120, 36, 6)
-
-    st.markdown("---")
-    st.markdown("### Datos")
-    bench = st.text_input("Benchmark", value="SPY").strip().upper() or "SPY"
-    start = st.date_input("Inicio", pd.to_datetime(DEFAULT_START).date())
-    end = st.date_input("Fin", pd.to_datetime(DEFAULT_END).date())
-    extend_months = st.slider("Meses extra de historial\n(para estadísticas)", 6, 24, 14)
-
-init_portfolio_session()
-
-# ===================== BLOQUE: GESTIÓN DE LISTA =====================
-st.subheader("Cartera persistente (Gist)")
-c0, c1 = st.columns([0.65, 0.35], vertical_alignment="bottom")
-
-with c0:
-    st.dataframe(
-        st.session_state["pm_portfolio"] if not st.session_state["pm_portfolio"].empty else pd.DataFrame(columns=["symbol","date_added"]),
-        use_container_width=True, hide_index=True
-    )
-
-with c1:
-    pf = st.session_state["pm_portfolio"]
-    st.download_button(
-        "⬇️ Descargar cartera (CSV)",
-        (pf if not pf.empty else pd.DataFrame(columns=["symbol","date_added"])).to_csv(index=False).encode(),
-        file_name="portfolio_symbols.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-    up = st.file_uploader("Subir cartera (CSV)", type=["csv"])
-    replace = st.toggle("Reemplazar completamente al subir", value=False)
-    if up is not None:
+    quality_df = None
+    if up_vfq is not None:
         try:
-            up_df = pd.read_csv(up)
-            if "symbol" not in up_df.columns:
-                st.error("El CSV debe contener una columna 'symbol'.")
+            qdf = pd.read_csv(up_vfq)
+            if "symbol" in qdf.columns:
+                keep_cols = [c for c in ["symbol","VFQ","QualityScore"] if c in qdf.columns]
+                quality_df = qdf[keep_cols].copy()
+                st.success(f"Cargado VFQ/Quality: {quality_df.shape}")
             else:
-                up_df["symbol"] = up_df["symbol"].astype(str).str.upper()
-                if "date_added" not in up_df.columns:
-                    up_df["date_added"] = datetime.now().strftime("%Y-%m-%d")
-                up_df = up_df[["symbol","date_added"]].drop_duplicates("symbol")
-                if replace:
-                    st.session_state["pm_portfolio"] = up_df
-                else:
-                    merged = pd.concat([st.session_state["pm_portfolio"], up_df], ignore_index=True)\
-                              .drop_duplicates("symbol").reset_index(drop=True)
-                    st.session_state["pm_portfolio"] = merged
-                save_portfolio_remote(st.session_state["pm_portfolio"])
-                st.success("Cartera actualizada desde CSV.")
+                st.warning("El CSV no tiene columna 'symbol'.")
         except Exception as e:
-            st.error(f"Error leyendo CSV: {e}")
+            st.error(f"No pude leer VFQ: {e}")
 
-st.markdown("#### Alta / Baja")
-a1, a2, a3 = st.columns([0.6, 0.2, 0.2])
-with a1:
-    add_text = st.text_input("Agregar símbolos (coma-separado)", placeholder="AAPL, MSFT, NVDA")
-with a2:
-    ok_add = st.button("➕ Añadir", use_container_width=True)
-with a3:
-    current_syms = st.session_state["pm_portfolio"]["symbol"].tolist()
-    rm_sel = st.multiselect("Remover", options=current_syms, default=[])
-    ok_rm = st.button("🗑️ Remover", use_container_width=True)
+# ------------------ MACRO ------------------
+with tab_macro:
+    st.subheader("Macro Monitor: bundle o slider")
+    c1, c2 = st.columns(2)
 
-if ok_add:
-    syms = [s.strip().upper() for s in add_text.split(",") if s.strip()]
-    if syms:
-        add_symbols(syms)
-        st.success(f"Agregados: {', '.join(syms)}")
-    else:
-        st.info("No hay símbolos para agregar.")
+    with c1:
+        up_macro = st.file_uploader("macro_monitor_bundle.csv", type=["csv"])
+        macro_z_val = None
+        beta_cap_sug = None
+        pos_cap_sug  = None
+        overlay_gate_series = None
+        if up_macro is not None:
+            try:
+                mb = pd.read_csv(up_macro, index_col=0, parse_dates=True)
+                macro_z_val = float(mb.get("macro_z", pd.Series([0])).iloc[-1])
+                beta_cap_sug = float(mb.get("beta_cap_sug", pd.Series([np.nan])).iloc[-1])
+                pos_cap_sug  = float(mb.get("pos_cap_sug",  pd.Series([np.nan])).iloc[-1])
+                overlay_gate_series = mb.get("Overlay_Signal")
+                st.success(f"Macro bundle OK (z={macro_z_val:.2f})")
+            except Exception as e:
+                st.error(f"Error leyendo macro bundle: {e}")
 
-if ok_rm:
-    if rm_sel:
-        remove_symbols(rm_sel)
-        st.success(f"Removidos: {', '.join(rm_sel)}")
-    else:
-        st.info("No seleccionaste símbolos.")
+    with c2:
+        st.caption("Si no subes bundle, usa el slider:")
+        macro_z_slider = st.slider("macro_z (manual)", -2.5, 2.5, 0.0, 0.1)
+        st.caption("Tip: puedes obtener macro_z = macro_z_from_series(COMPOSITE_Z).")
 
-st.markdown("---")
+    macro_z_eff = macro_z_val if macro_z_val is not None else macro_z_slider
+    reg = z_to_regime(float(macro_z_eff))
+    k1,k2,k3,k4 = st.columns(4)
+    k1.metric("macro_z", f"{reg.z:.2f}")
+    k2.metric("Régimen", reg.label)
+    k3.metric("M_macro", f"{reg.m_multiplier:.2f}")
+    k4.metric("Sugerencia β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
 
-# ===================== KELLY ROBUSTO & MÉTRICAS =====================
-def _winsor_series(x: pd.Series, p: float) -> pd.Series:
-    if p <= 0 or x.empty: return x
-    lo, hi = x.quantile(p), x.quantile(1-p)
-    return x.clip(lower=lo, upper=hi)
+    # Guardar en sesión para pestañas siguientes
+    st.session_state["macro_z_eff"] = macro_z_eff
+    st.session_state["beta_cap_sug"] = beta_cap_sug
+    st.session_state["pos_cap_sug"]  = pos_cap_sug
+    st.session_state["overlay_gate_series"] = overlay_gate_series
 
-def _kelly_p_b(p: float, payoff: float) -> float:
-    if payoff is None or payoff <= 0: return 0.0
-    k = p - (1-p)/payoff
-    return float(max(0.0, min(1.0, k)))
+# ------------------ CARTERA ------------------
+with tab_port:
+    st.subheader("Pesos y métricas (Kelly + Macro + Quality)")
+    symbols = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
+    if not symbols:
+        st.warning("Ingrese símbolos en la pestaña Entradas.")
+        st.stop()
 
-def _kelly_merton(mu: float, sigma: float) -> float:
-    if sigma is None or sigma <= 1e-9: return 0.0
-    k = mu / (sigma**2)
-    return float(max(0.0, min(1.0, k)))
+    # Caps efectivos = min(usuario, sugerido por régimen si viene del bundle)
+    beta_cap_eff = beta_cap
+    pos_cap_eff  = pos_cap
+    if st.session_state.get("beta_cap_sug") is not None:
+        beta_cap_eff = min(beta_cap_eff, float(st.session_state["beta_cap_sug"]))
+    if st.session_state.get("pos_cap_sug") is not None:
+        pos_cap_eff = min(pos_cap_eff, float(st.session_state["pos_cap_sug"]))
 
-def _monthly(series_daily: pd.Series) -> pd.Series:
-    series_daily = series_daily.dropna()
-    if series_daily.empty: return series_daily
-    return series_daily.resample("M").apply(lambda x: (1 + x).prod() - 1).dropna()
-
-def _stats_per_symbol(ser_m: pd.Series, bench_m: pd.Series,
-                      winsor_p: float, t0: float, min_months: int, lam_blend: float):
-    ser_m = ser_m.dropna()
-    n = len(ser_m)
-    if n < min_months:
-        return dict(valid=False)
-
-    rw = _winsor_series(ser_m, winsor_p)
-    wins = (rw > 0).sum()
-    p_hat = (wins + 0.5) / (n + 1)  # Jeffreys prior
-
-    avg_win = rw[rw > 0].mean() if (rw > 0).any() else np.nan
-    avg_loss = rw[rw < 0].mean() if (rw < 0).any() else np.nan
-    payoff = abs(avg_win / avg_loss) if (avg_loss not in (0, None)) else np.nan
-
-    mu = rw.mean()
-    sigma = rw.std(ddof=1)
-    se = sigma / np.sqrt(n) if sigma and sigma>0 else np.nan
-    t_stat = float(mu / se) if (se and se>0) else 0.0
-
-    beta = beta_vs_bench(rw, bench_m.reindex(rw.index).dropna())
-
-    k1 = _kelly_p_b(p_hat, payoff) if not np.isnan(payoff) else 0.0
-    k2 = _kelly_merton(mu, sigma)
-    u = float(np.clip(t_stat / max(t0, 1e-9), 0.0, 1.0))
-    k_blend = u * ((1 - lam_blend) * k1 + lam_blend * k2)
-
-    return dict(valid=True, HitRate=p_hat, AvgWin=avg_win, AvgLoss=avg_loss,
-                Payoff=payoff, Kelly_raw=k1, Kelly_blend=k_blend,
-                Beta=beta, Mu=mu, Sigma=sigma, Sharpe_m=(mu/sigma if sigma and sigma>0 else np.nan),
-                n_months=n, t_stat=t_stat)
-
-def _risk_parity_weights(sigmas: np.ndarray, cap: float):
-    inv = np.where(sigmas>0, 1.0/np.maximum(sigmas, 1e-8), 0.0)
-    if inv.sum() == 0: return np.zeros_like(inv)
-    w = inv / inv.sum()
-    w = np.minimum(w, cap)
-    s = w.sum()
-    return w / s if s>0 else w
-
-def _mean_variance_weights(mu: np.ndarray, cov: np.ndarray, cap: float):
-    try:
-        inv = np.linalg.pinv(cov + 1e-8*np.eye(len(cov)))
-        raw = inv @ mu
-        raw = np.maximum(raw, 0.0)        # no short
-        w = raw / raw.sum() if raw.sum() > 0 else np.ones_like(raw)/len(raw)
-        w = np.minimum(w, cap)
-        s = w.sum()
-        return w / s if s>0 else w
-    except Exception:
-        return np.ones_like(mu) / len(mu)
-
-def _apply_beta_cap(weights: np.ndarray, betas: np.ndarray, beta_cap: float):
-    total_beta_w = float(np.nansum(weights * np.nan_to_num(betas, nan=1.0)))
-    scale = 1.0
-    if total_beta_w > beta_cap and total_beta_w > 0:
-        scale = beta_cap / total_beta_w
-    return weights * scale
-
-# ===================== CÁLCULO DE PESOS + ANÁLISIS =====================
-st.subheader("Cálculo de pesos y análisis")
-run_btn = st.button("🧮 Calcular", type="primary", use_container_width=True)
-
-if run_btn:
-    pf = st.session_state["pm_portfolio"]
-    syms = pf["symbol"].tolist() if not pf.empty else []
-    if not syms:
-        st.warning("Cartera vacía. Agrega símbolos arriba.")
-    else:
-        extend_days = int(extend_months * 30)
-        start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
-        end_iso = end.isoformat()
-
+    # Gate táctico con overlay (si el último valor es 0 → bloquear nuevas)
+    allow_new_when_z_below = -0.5
+    ov = st.session_state.get("overlay_gate_series")
+    if ov is not None:
         try:
-            pnl = _cached_prices(syms + [bench], start_ext, end_iso, cache_key="pm_panel")
-            if bench not in pnl:
-                st.error(f"No pude cargar el benchmark '{bench}'.")
-            else:
-                bench_daily = pnl[bench]["close"].pct_change().dropna()
-                bench_m = _monthly(bench_daily)
+            if int(pd.Series(ov).astype(int).iloc[-1]) == 0:
+                allow_new_when_z_below = 10.0  # bloquea nuevas totalmente
+        except Exception:
+            pass
 
-                # --- Métricas por símbolo ---
-                rows, used = [], []
-                sym_series_m = {}
-                for s in syms:
-                    if s not in pnl or "close" not in pnl[s].columns:
-                        continue
-                    ser_d = pnl[s]["close"].pct_change().dropna()
-                    ser_m = _monthly(ser_d)
-                    common = ser_m.index.intersection(bench_m.index)
-                    if len(common) < min_months:
-                        continue
-                    ser_m = ser_m.loc[common]
-                    bench_mc = bench_m.loc[common]
+    dfw = build_portfolio(
+        symbols=symbols,
+        bench=bench,
+        start=start.isoformat(),
+        end=end.isoformat(),
+        base_kelly=base_kelly,
+        macro_z=float(st.session_state.get("macro_z_eff", 0.0)),
+        quality_df=quality_df,
+        pos_cap=pos_cap_eff,
+        beta_cap_user=beta_cap_eff,
+        allow_new_when_z_below=allow_new_when_z_below,
+        current_holdings=None  # o lista de tus posiciones ya abiertas
+    )
 
-                    stt = _stats_per_symbol(ser_m, bench_mc, winsor_p, t0, min_months, lam_blend)
-                    if not stt.get("valid", False):
-                        continue
-                    rows.append(dict(symbol=s, **stt))
-                    used.append(s)
-                    sym_series_m[s] = ser_m
+    if dfw.empty:
+        st.warning("No se pudieron calcular pesos (verifica precios/fechas).")
+        st.stop()
 
-                dfm = pd.DataFrame(rows)
-                if dfm.empty:
-                    st.warning("No hay datos suficientes (historial mensual insuficiente).")
-                    st.stop()
+    st.dataframe(dfw, use_container_width=True)
 
-                # --- Pesos según método ---
-                n = len(used)
-                betas = dfm["Beta"].values
-                caps = float(vol_cap)
+    c1,c2 = st.columns(2)
+    with c1:
+        st.bar_chart(dfw.set_index("symbol")["weight"])
+        st.caption("Pesos finales (w)")
+    with c2:
+        st.bar_chart(dfw.set_index("symbol")["beta_w"])
+        st.caption("Contribución β·w")
 
-                if method == "Equal Weight":
-                    w = np.ones(n) / n
-                    w = np.minimum(w, caps); w = w / w.sum()
-                elif method == "Risk Parity (Inv-Vol)":
-                    sigmas = dfm["Sigma"].values
-                    w = _risk_parity_weights(sigmas, caps)
-                elif method == "Mean–Variance (Σ⁻¹μ, heur.)":
-                    mu = dfm["Mu"].values
-                    mret = pd.DataFrame({s: sym_series_m[s] for s in used}).dropna()
-                    cov = np.cov(mret.values.T)
-                    w = _mean_variance_weights(mu, cov, caps)
-                else:  # Kelly fraccionado ROBUSTO
-                    kelly_vec = dfm["Kelly_blend"].fillna(0).values
-                    w = np.minimum(base_kelly * kelly_vec, caps)
-                    if w.sum() == 0:
-                        w = np.ones(n) / n
-                    else:
-                        w = w / w.sum()
+# ------------------ SALIDAS ------------------
+with tab_exits:
+    st.subheader("Reglas de salida por símbolo")
+    try:
+        panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
+        bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
+        table = build_exit_table(
+            panel=panel,
+            bench_close=None if bench_px is None else bench_px["close"],
+            ma_window=200,
+            mom_lookback=252,
+            review_freq="Q"   # revisión trimestral
+        )
+        st.dataframe(table, use_container_width=True)
+        st.caption("Salida si: rompe MA200 y/o Mom 12-1 < 0 en revisión trimestral; motivos y fecha estimada.")
+    except Exception as e:
+        st.error(f"Error generando salidas: {e}")
 
-                # --- Cap de beta ---
-                w_beta = _apply_beta_cap(w, betas, float(beta_cap))
-
-                # --- Forzar suma 1 (opcional) ---
-                w_final = w_beta.copy()
-                if enforce_sum1 and w_final.sum() > 0:
-                    w_final = w_final / w_final.sum()
-
-                dfm["w_prop"] = w
-                dfm["w_final"] = w_final
-                dfm["beta_contrib"] = dfm["Beta"].fillna(1.0) * dfm["w_final"]
-
-                st.subheader("Métricas por símbolo & Pesos")
-                st.dataframe(
-                    dfm[["symbol","n_months","HitRate","AvgWin","AvgLoss","Payoff",
-                         "Kelly_raw","Kelly_blend","t_stat","Beta","Mu","Sigma","Sharpe_m",
-                         "w_final","beta_contrib"]]\
-                       .rename(columns={"w_final":"weight","beta_contrib":"beta_w","Mu":"Mu_m","Sigma":"Sigma_m"}),
-                    use_container_width=True, hide_index=True
-                )
-
-                # --- Gráficos de pesos ---
-                st.markdown("### Pesos y Exposición β")
-                c1, c2 = st.columns(2)
-                with c1:
-                    fig, ax = plt.subplots()
-                    ax.bar(dfm["symbol"], dfm["w_final"])
-                    ax.set_title("Pesos finales (w)")
-                    ax.set_xticklabels(dfm["symbol"], rotation=45, ha="right")
-                    st.pyplot(fig, use_container_width=True)
-                with c2:
-                    fig, ax = plt.subplots()
-                    ax.bar(dfm["symbol"], dfm["beta_contrib"])
-                    ax.set_title("Contribución beta (beta_w)")
-                    ax.set_xticklabels(dfm["symbol"], rotation=45, ha="right")
-                    st.pyplot(fig, use_container_width=True)
-
-                st.info(f"sum(beta_w) = {dfm['beta_contrib'].sum():.3f} (cap={beta_cap})   |   sum(w) = {dfm['w_final'].sum():.3f}")
-
-                # --- Correlaciones (mensual) ---
-                st.markdown("### Correlaciones (mensuales)")
-                mret = pd.DataFrame({s: sym_series_m[s] for s in used}).dropna()
-                corr = mret.corr()
-                fig, ax = plt.subplots()
-                sns.heatmap(corr, annot=False, cmap="vlag", center=0, ax=ax)
-                ax.set_title("Matriz de correlaciones mensuales")
-                st.pyplot(fig, use_container_width=True)
-
-                # --- Cartera vs Benchmark (w constantes) ---
-                st.markdown("### Cartera vs Benchmark (estática con w constantes)")
-                daily = pd.DataFrame({
-                    s: pnl[s]["close"].pct_change() for s in used
-                    if s in pnl and "close" in pnl[s].columns
-                }).dropna(how="all")
-                common_days = daily.dropna(axis=1, how="all").columns.intersection(used)
-                w_map = dict(zip(used, w_final))
-                r_p = (daily[common_days].fillna(0) * pd.Series({k: w_map.get(k, 0.0) for k in common_days})).sum(axis=1)
-                eq_p = (1 + r_p.fillna(0)).cumprod()
-
-                bench_d = pnl[bench]["close"].pct_change().reindex(eq_p.index).fillna(0)
-                eq_b = (1 + bench_d).cumprod()
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    fig, ax = plt.subplots()
-                    ax.plot(eq_p.index, eq_p.values, label="Portfolio")
-                    ax.plot(eq_b.index, eq_b.values, label=bench)
-                    ax.set_title("Cartera vs Benchmark (w constantes)")
-                    ax.legend()
-                    st.pyplot(fig, use_container_width=True)
-                with c2:
-                    dd = eq_p/eq_p.cummax() - 1.0
-                    fig, ax = plt.subplots()
-                    ax.plot(dd.index, dd.values)
-                    ax.set_title("Drawdown (cartera)")
-                    ax.axhline(0, color="black", lw=0.5)
-                    st.pyplot(fig, use_container_width=True)
-
-                # --- Histograma de retornos mensuales (cartera) ---
-                st.markdown("### Distribución de retornos mensuales (cartera)")
-                r_p_m = _monthly(r_p)
-                fig, ax = plt.subplots()
-                ax.hist(r_p_m.dropna(), bins=20)
-                ax.set_title("Histograma retornos mensuales")
-                st.pyplot(fig, use_container_width=True)
-
-                # --- Descarga pesos (CSV, ASCII) ---
-                out = dfm[["symbol","w_final","beta_contrib"]].rename(
-                    columns={"w_final":"weight", "beta_contrib":"beta_w"}
-                )
-                st.download_button(
-                    "⬇️ Descargar pesos (CSV)",
-                    out.to_csv(index=False).encode(),
-                    file_name="pesos_portafolio.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
-
-        except Exception as e:
-            st.error(f"Error calculando: {e}")
+# ------------------ DIAGNÓSTICO ------------------
+with tab_diag:
+    st.subheader("Equity (pesos estáticos) y diagnóstico")
+    try:
+        pnl = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
+        # equity estática con pesos w
+        merged = None
+        for s in symbols:
+            if s in pnl and "close" in pnl[s].columns:
+                r = pnl[s]["close"].pct_change().rename(s)
+                merged = r if merged is None else merged.join(r, how="outer")
+        merged = merged.dropna(how="all").fillna(0.0)
+        weights = dfw.set_index("symbol")["weight"].reindex(merged.columns).fillna(0.0).values
+        port_ret = (merged * weights).sum(axis=1)
+        bench_ret = None
+        bdf = load_benchmark(bench, start.isoformat(), end.isoformat())
+        if bdf is not None and "close" in bdf.columns:
+            bench_ret = bdf["close"].pct_change().reindex(port_ret.index).fillna(0.0)
+        eq = (1+port_ret).cumprod().rename("Portfolio")
+        if bench_ret is not None:
+            eq_b = (1+bench_ret).cumprod().rename(bench)
+            st.line_chart(pd.concat([eq, eq_b], axis=1))
+        else:
+            st.line_chart(eq)
+    except Exception as e:
+        st.error(f"Diag error: {e}")
