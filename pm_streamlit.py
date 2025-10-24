@@ -11,7 +11,7 @@ from qvm_trend.macro.macro_score import z_to_regime, macro_z_from_series
 
 st.set_page_config(page_title="Gestión de Cartera", page_icon="🧭", layout="wide")
 
-st.title("🧭 Gestión de Cartera — Kelly + Macro")
+st.title("Gestión de Cartera")
 st.caption("Pesos por Kelly robusto, tilt por calidad, caps por régimen macro, y reglas de salida.")
 
 # ------------------ TABS ------------------
@@ -50,33 +50,55 @@ with tab_in:
             st.error(f"No pude leer VFQ: {e}")
 
 # ------------------ MACRO ------------------
+# ------------------ MACRO ------------------
 with tab_macro:
     st.subheader("Macro Monitor: bundle o slider")
     c1, c2 = st.columns(2)
 
+    macro_z_val = None
+    beta_cap_sug = None
+    pos_cap_sug  = None
+    overlay_gate_series = None
+
     with c1:
         up_macro = st.file_uploader("macro_monitor_bundle.csv", type=["csv"])
-        macro_z_val = None
-        beta_cap_sug = None
-        pos_cap_sug  = None
-        overlay_gate_series = None
         if up_macro is not None:
             try:
                 mb = pd.read_csv(up_macro, index_col=0, parse_dates=True)
-                macro_z_val = float(mb.get("macro_z", pd.Series([0])).iloc[-1])
-                beta_cap_sug = float(mb.get("beta_cap_sug", pd.Series([np.nan])).iloc[-1])
-                pos_cap_sug  = float(mb.get("pos_cap_sug",  pd.Series([np.nan])).iloc[-1])
+
+                # 1) Intentar usar macro_z del bundle
+                if "macro_z" in mb.columns and pd.notna(mb["macro_z"]).any():
+                    macro_z_val = float(mb["macro_z"].dropna().iloc[-1])
+                else:
+                    # 2) Si no viene, calcúlalo del composite
+                    from qvm_trend.macro.macro_score import macro_z_from_series
+                    if "COMPOSITE_Z" in mb.columns and pd.notna(mb["COMPOSITE_Z"]).any():
+                        macro_z_val = float(macro_z_from_series(mb["COMPOSITE_Z"]))
+                    elif "COMPOSITE_PCA" in mb.columns and pd.notna(mb["COMPOSITE_PCA"]).any():
+                        macro_z_val = float(macro_z_from_series(mb["COMPOSITE_PCA"]))
+                    else:
+                        macro_z_val = 0.0  # fallback
+
+                # Sugerencias de caps (si el bundle las trae)
+                if "beta_cap_sug" in mb.columns:
+                    beta_cap_sug = float(mb["beta_cap_sug"].dropna().iloc[-1])
+                if "pos_cap_sug" in mb.columns:
+                    pos_cap_sug  = float(mb["pos_cap_sug"].dropna().iloc[-1])
+
                 overlay_gate_series = mb.get("Overlay_Signal")
                 st.success(f"Macro bundle OK (z={macro_z_val:.2f})")
+
             except Exception as e:
                 st.error(f"Error leyendo macro bundle: {e}")
+                macro_z_val = None
 
     with c2:
         st.caption("Si no subes bundle, usa el slider:")
         macro_z_slider = st.slider("macro_z (manual)", -2.5, 2.5, 0.0, 0.1)
-        st.caption("Tip: puedes obtener macro_z = macro_z_from_series(COMPOSITE_Z).")
 
     macro_z_eff = macro_z_val if macro_z_val is not None else macro_z_slider
+
+    # Régimen y multiplicadores
     reg = z_to_regime(float(macro_z_eff))
     k1,k2,k3,k4 = st.columns(4)
     k1.metric("macro_z", f"{reg.z:.2f}")
@@ -84,11 +106,12 @@ with tab_macro:
     k3.metric("M_macro", f"{reg.m_multiplier:.2f}")
     k4.metric("Sugerencia β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
 
-    # Guardar en sesión para pestañas siguientes
+    # Guardar en sesión para otras pestañas
     st.session_state["macro_z_eff"] = macro_z_eff
     st.session_state["beta_cap_sug"] = beta_cap_sug
     st.session_state["pos_cap_sug"]  = pos_cap_sug
     st.session_state["overlay_gate_series"] = overlay_gate_series
+
 
 # ------------------ CARTERA ------------------
 with tab_port:

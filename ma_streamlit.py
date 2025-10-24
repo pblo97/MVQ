@@ -512,3 +512,14 @@ if st.button("Ejecutar pipeline"):
 
 else:
     st.info("Configura la API key de FRED, ajusta parámetros y pulsa Ejecutar pipeline.")
+
+from qvm_trend.macro.macro_score import macro_z_from_series, z_to_regime
+
+# z-score macro a partir del composite ponderado (o usa el PCA si prefieres)
+macro_z_val = macro_z_from_series(comp_w)
+reg = z_to_regime(macro_z_val)
+
+# Añadir columnas al bundle (constantes en el tiempo, práctico para consumir desde PM)
+bundle["macro_z"] = macro_z_val
+bundle["beta_cap_sug"] = reg.beta_cap
+bundle["pos_cap_sug"]  = reg.vol_cap
