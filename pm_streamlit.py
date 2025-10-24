@@ -322,7 +322,7 @@ if run_btn:
                 st.subheader("Métricas por símbolo & Pesos")
                 st.dataframe(
                     dfm[["symbol","HitRate","AvgWin","AvgLoss","Payoff","Kelly","Beta","Mu","Sigma","Sharpe_m","w_final","beta_contrib"]]\
-                       .rename(columns={"Mu":"Mu_m","Sigma":"Sigma_m","Sharpe_m":"Sharpe (m)","w_final":"Peso","beta_contrib":"β·w"}),
+                       .rename(columns={"Mu":"Mu_m","Sigma":"Sigma_m","Sharpe_m":"Sharpe_m","w_final":"weight","beta_contrib":"beta_w"}),
                     use_container_width=True, hide_index=True
                 )
 
@@ -338,11 +338,11 @@ if run_btn:
                 with c2:
                     fig, ax = plt.subplots()
                     ax.bar(dfm["symbol"], dfm["beta_contrib"])
-                    ax.set_title("Contribución β (β·w)")
+                    ax.set_title("Contribución beta (beta_w)")
                     ax.set_xticklabels(dfm["symbol"], rotation=45, ha="right")
                     st.pyplot(fig, use_container_width=True)
 
-                st.info(f"∑β·w = {dfm['beta_contrib'].sum():.3f} (cap={beta_cap})   |   ∑w = {dfm['w_final'].sum():.3f}")
+                st.info(f"sum(beta_w) = {dfm['beta_contrib'].sum():.3f} (cap={beta_cap})   |   sum(w) = {dfm['w_final'].sum():.3f}")
 
                 # --- Correlación (mensual) ---
                 st.markdown("### Correlaciones (mensuales)")
@@ -353,14 +353,13 @@ if run_btn:
                 ax.set_title("Matriz de correlaciones mensuales")
                 st.pyplot(fig, use_container_width=True)
 
-                # --- Backtest estático de la cartera (w_final constantes) ---
+                # --- Cartera vs Benchmark (estática con w constantes) ---
                 st.markdown("### Cartera vs Benchmark (estática con w constantes)")
-                # construye serie diaria de portafolio con w_final constantes
+                # Serie diaria de portafolio con w_final constantes
                 daily = pd.DataFrame({
                     s: pnl[s]["close"].pct_change() for s in used
                     if s in pnl and "close" in pnl[s].columns
                 }).dropna(how="all")
-                # alinear con pesos (símbolos con series)
                 common_days = daily.dropna(axis=1, how="all").columns.intersection(used)
                 w_map = dict(zip(used, w_final))
                 r_p = (daily[common_days].fillna(0) * pd.Series({k: w_map.get(k, 0.0) for k in common_days})).sum(axis=1)
@@ -371,7 +370,12 @@ if run_btn:
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.line_chart(pd.DataFrame({"Portfolio": eq_p, bench: eq_b}), use_container_width=True)
+                    fig, ax = plt.subplots()
+                    ax.plot(eq_p.index, eq_p.values, label="Portfolio")
+                    ax.plot(eq_b.index, eq_b.values, label=bench)
+                    ax.set_title("Cartera vs Benchmark (w constantes)")
+                    ax.legend()
+                    st.pyplot(fig, use_container_width=True)
                 with c2:
                     dd = eq_p/eq_p.cummax() - 1.0
                     fig, ax = plt.subplots()
@@ -388,8 +392,10 @@ if run_btn:
                 ax.set_title("Histograma retornos mensuales")
                 st.pyplot(fig, use_container_width=True)
 
-                # --- Descarga pesos ---
-                out = dfm[["symbol","Peso","β·w"]].rename(columns={"β·w":"beta_contrib"})
+                # --- Descarga pesos (ASCII) ---
+                out = dfm[["symbol","w_final","beta_contrib"]].rename(
+                    columns={"w_final":"weight", "beta_contrib":"beta_w"}
+                )
                 st.download_button(
                     "⬇️ Descargar pesos (CSV)",
                     out.to_csv(index=False).encode(),
