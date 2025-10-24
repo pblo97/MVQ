@@ -5,7 +5,7 @@ import streamlit as st
 from datetime import datetime, date
 
 # ==== QVM / VFQ ====
-from qvm_trend.fundamentals import build_vfq_scores_dynamic
+
 
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
@@ -32,7 +32,7 @@ from qvm_trend.data_io import (
     DEFAULT_START, DEFAULT_END
 )
 from qvm_trend.fundamentals import (
-    download_fundamentals, build_vfq_scores,
+    download_fundamentals,  build_vfq_scores_dynamic,
     download_guardrails_batch, apply_quality_guardrails
 )
 from qvm_trend.pipeline import (
