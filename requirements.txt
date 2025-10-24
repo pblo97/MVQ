@@ -1,10 +1,16 @@
-streamlit
-pandas
-numpy
-requests
 tqdm
 matplotlib
 scipy
 pyarrow
 seaborn
 PyGithub
+streamlit>=1.37
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+urllib3>=2.2
+scikit-learn>=1.4
+statsmodels>=0.14
+plotly>=5.22
+matplotlib>=3.8
+arch>=6.4 ; extra == "macro"  
