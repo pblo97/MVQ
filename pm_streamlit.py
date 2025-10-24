@@ -183,11 +183,13 @@ with tab_macro:
     k4.metric("β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
 
     # Guardar en sesión para otras pestañas
+    # Guardar en sesión para otras pestañas
     st.session_state["macro_z_eff"] = macro_z_eff
-    # Si bundle trae sugerencias, priorízalas; si no, usa las del régimen base
+    # Si el bundle trae sugerencias, priorízalas; si no, usa las del régimen base
     st.session_state["beta_cap_sug"] = beta_cap_sug if beta_cap_sug is not None else reg.beta_cap
     st.session_state["pos_cap_sug"]  = pos_cap_sug  if pos_cap_sug  is not None else reg.vol_cap
     st.session_state["overlay_gate_series"] = overlay_gate_series
+
 # ------------------ CARTERA ------------------
 with tab_port:
     st.subheader("Pesos y métricas (Kelly + Macro + Quality)")
