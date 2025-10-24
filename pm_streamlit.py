@@ -100,40 +100,37 @@ with tab_in:
     with ck5:
         shrink_kappa = st.slider("Shrink κ (p/payoff)", 0, 50, 20, 1)
 
-    st.markdown("**(Opcional) CSV de calidad (VFQ o QualityScore)**")
-    up_vfq = st.file_uploader(
-        "vfq.csv (de tu screener)",
-        type=["csv"],
-        key="vfq_uploader"  # clave única
-    )
+    # === QualityScore SIEMPRE desde FMP (sin CSV) ===
+    @st.cache_data(show_spinner=False, ttl=60*60)  # cachea 1 hora
+    def _fetch_quality_from_fmp(symbols_list: list[str], fmp_key: str) -> pd.DataFrame:
+        # Nota: no hace falta import global; evitamos errores si el módulo no existe al cargar
+        from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
+        # include_components=False devuelve solo ['symbol','QualityScore']
+        return compute_quality_from_fmp(symbols_list, fmp_key, include_components=False)
+
+    symbols_for_fmp = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
+    fmp_key = st.secrets.get("FMP_API_KEY", "")
 
     quality_df = None
-    if up_vfq is not None:
+    if not fmp_key:
+        st.warning("Falta **FMP_API_KEY** en `st.secrets` para calcular QualityScore automáticamente.")
+    elif symbols_for_fmp:
         try:
-            qdf = pd.read_csv(up_vfq)
-            if "symbol" in qdf.columns:
-                keep_cols = [c for c in ["symbol", "VFQ", "QualityScore"] if c in qdf.columns]
-                quality_df = qdf[keep_cols].copy()
-                st.success(f"Cargado VFQ/Quality: {quality_df.shape}")
+            with st.spinner("Calculando QualityScore desde FMP…"):
+                qdf = _fetch_quality_from_fmp(symbols_for_fmp, fmp_key)
+            if qdf is not None and not qdf.empty:
+                quality_df = qdf[["symbol", "QualityScore"]].copy()
+                st.info("QualityScore obtenido automáticamente desde FMP.")
+                # (opcional) muestrita del ranking
+                st.dataframe(
+                    quality_df.sort_values("QualityScore", ascending=False),
+                    use_container_width=True
+                )
             else:
-                st.warning("El CSV no tiene columna 'symbol'.")
+                st.warning("FMP no devolvió datos de calidad para estos símbolos.")
         except Exception as e:
-            st.error(f"No pude leer VFQ: {e}")
+            st.error(f"No pude calcular QualityScore con FMP: {e}")
 
-    # Fallback automático a FMP SOLO si no subiste CSV
-    if quality_df is None:
-        fmp_key = st.secrets.get("FMP_API_KEY", "")
-        symbols_for_fmp = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
-        if fmp_key and symbols_for_fmp:
-            try:
-                with st.spinner("Descargando fundamentals (FMP) para QualityScore..."):
-                    from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
-                    qdf = compute_quality_from_fmp(symbols_for_fmp, fmp_key)
-                    if not qdf.empty:
-                        quality_df = qdf[["symbol", "QualityScore"]].copy()
-                        st.info("QualityScore obtenido automáticamente desde FMP.")
-            except Exception as e:
-                st.warning(f"No pude calcular QualityScore con FMP: {e}")
 
 # ------------------ MACRO ------------------
 # ------------------ MACRO ------------------
