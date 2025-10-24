@@ -442,3 +442,121 @@ with tab_diag:
             st.line_chart(eq)
     except Exception as e:
         st.error(f"Diag error: {e}")
+
+# ======= GUIA / INSTRUCCIONES (debajo de las pestañas) =======
+st.markdown(
+    """
+    <style>
+      .guide-card {
+        padding: 18px 20px;
+        border-radius: 14px;
+        background: linear-gradient(180deg, #0f172a0a, #0f172a08);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        margin-top: 8px; margin-bottom: 16px;
+      }
+      .guide-title {
+        font-size: 1.05rem; font-weight: 700;
+        margin-bottom: 6px;
+      }
+      .guide-sub {
+        color: #64748b; margin-bottom: 10px;
+      }
+      .guide-badge {
+        display:inline-block; padding:3px 10px; border-radius:999px;
+        background: #0ea5e91a; color:#0369a1; font-weight:600; font-size:12px;
+        border: 1px solid #0ea5e955; margin-right:6px;
+      }
+      .pill {
+        display:inline-block; padding:2px 8px; border-radius:999px;
+        background:#22c55e1a; color:#15803d; font-size:12px; border:1px solid #22c55e55;
+        margin-left:6px;
+      }
+      .small-muted { color:#718096; font-size:12px; }
+      ul.compact li { margin-bottom: 4px; }
+      code.k { background:#111827; color:#e5e7eb; padding:2px 6px; border-radius:6px; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+with st.container():
+    st.markdown("<div class='guide-card'>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class='guide-title'>Guía rápida de uso</div>
+        <div class='guide-sub'>Resumen de flujo: Entradas → Macro → Cartera → Salidas → Diagnóstico</div>
+        """,
+        unsafe_allow_html=True
+    )
+    cA, cB, cC = st.columns(3)
+    with cA:
+        st.markdown(
+            """
+            **1) Entradas**  
+            - Carga *símbolos*, *benchmark* y *fechas*  
+            - Ajusta **Kelly base** (0.15–0.30 recomendado)  
+            - Define *caps* del usuario  
+            - (Opcional) sube `VFQ/QualityScore`  
+            """)
+    with cB:
+        st.markdown(
+            """
+            **2) Macro**  
+            - Ajusta `macro_z` (manual)  
+            - Define **EMA α** y **umbrales ON/OFF**  
+            - Edita **M_macro**, **β cap**, **pos cap** por régimen  
+            - (Opcional) Exporta/Importa JSON
+            """)
+    with cC:
+        st.markdown(
+            """
+            **3) Cartera / Sizing**  
+            - Calcula **Kelly robusto** por activo  
+            - (Opcional) Multiplicar por **M_macro**  
+            - Respeta **caps** y **gate** (overlay=0)  
+            - Sizing con capital ficticio + export CSV
+            """)
+    st.markdown("<span class='small-muted'>Tip: usa presets (Conservador / Balanceado / Agresivo) como atajos y luego ajusta según tu bibliografía.</span>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with st.expander("📘 Detalle técnico: Kelly robusto + macro (clic para abrir)"):
+    st.markdown(
+        """
+        **Kelly por activo (mensual, en exceso del benchmark)**  
+        - **Binomial**: estima _hit rate_ **p** y _payoff_ **b**, con *shrinkage* a 0.5/1.0.  
+          Fórmula: \\( f^* = p - \\frac{1-p}{b} \\) → `k_bin` (cap 0..1).  
+        - **Continuo**: \\( \\mu/\\sigma^2 \\) con **EWMA** y **winsorize**, restando **costos** → `k_cont`.  
+        - **Mezcla**: `k_raw = 0.5·k_bin + 0.5·k_cont`  
+        - **Penalización por correlación**:  
+          \\( k' = k_{raw} / (1 + \\lambda·\\max(0,\\rho_{i,proto})) \\) → `k_pen`.
+
+        **Kelly fraccionado y normalización**  
+        - Peso base:  
+          \\[
+          w^{(0)}_i = \\text{base\\_kelly}\\cdot
+          \\frac{k_{pen,i}}{\\sum_j k_{pen,j}}
+          \\]
+        - (Opcional) **Macro**: multiplicar por **M_macro** del régimen.  
+        - **Caps** efectivos (mínimo entre usuario y régimen):  
+          - **Cap por posición**: \\( w_i \\leq \\text{pos\\_cap} \\)  
+          - **Cap de beta**: \\( \\sum_i \\beta_i w_i \\leq \\beta\\_cap \\)  
+        - **Gate** (overlay=0): impide **nuevas** entradas, mantiene existentes.
+
+        **Macro (sin CSV, configurable)**  
+        - Usamos `macro_z` **suavizado** con **EMA (α)**.  
+        - **Histéresis** con dos umbrales:  
+          - ON si \\( z_{EMA} \\geq \\text{thr\\_on} \\)  
+          - OFF si \\( z_{EMA} \\leq \\text{thr\\_off} \\)  
+          - Intermedio = NEU  
+        - Cada régimen mapea a tus parámetros: **M_macro**, **β cap**, **pos cap** (100% editables).  
+
+        **Quality tilt (opcional)**  
+        - Multiplicador suave: \\( \\exp(\\alpha · z(q)) \\) (acotado), con **α** menor en OFF.
+
+        ---
+        **Export/Import de parámetros**  
+        - Guarda tus *umbrales, α de EMA y parámetros por régimen* como JSON.  
+        - Carga el JSON para trabajar con tus presets de bibliografía.
+        """,
+        unsafe_allow_html=False
+    )
