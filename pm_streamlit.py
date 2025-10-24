@@ -29,9 +29,24 @@ with tab_in:
         start = st.date_input("Inicio", value=pd.to_datetime(DEFAULT_START).date())
         end   = st.date_input("Fin", value=pd.to_datetime(DEFAULT_END).date())
     with c3:
-        base_kelly = st.slider("Fracción Kelly base", 0.1, 1.0, 0.5, 0.05)
+        base_kelly = st.slider("Fracción Kelly base", 0.05, 0.50, 0.25, 0.01)
         pos_cap = st.number_input("Cap por posición", 0.01, 0.10, 0.05, 0.01, format="%.2f")
         beta_cap = st.number_input("Cap ∑(β·w)", 0.25, 2.00, 1.00, 0.05)
+
+    st.markdown("### Ajustes Kelly avanzados")
+    ck1, ck2, ck3 = st.columns(3)
+    with ck1:
+        winsor_p = st.slider("Winsor p (%)", 0.0, 5.0, 2.0, 0.25) / 100.0
+    with ck2:
+        costs_per_period = st.number_input("Costos mensuales (bps)", 0, 100, 10, 1) / 10_000.0
+    with ck3:
+        lambda_corr = st.slider("Penalización correlación λ", 0.0, 1.0, 0.50, 0.05)
+
+    ck4, ck5 = st.columns(2)
+    with ck4:
+        ewm_span = st.slider("EWMA span (meses)", 6, 24, 12, 1)
+    with ck5:
+        shrink_kappa = st.slider("Shrink κ (p/payoff)", 0, 50, 20, 1)
 
     st.markdown("**(Opcional) CSV de calidad (VFQ o QualityScore)**")
     up_vfq = st.file_uploader("vfq.csv (de tu screener)", type=["csv"])
@@ -49,7 +64,6 @@ with tab_in:
         except Exception as e:
             st.error(f"No pude leer VFQ: {e}")
 
-# ------------------ MACRO ------------------
 # ------------------ MACRO ------------------
 with tab_macro:
     st.subheader("Macro Monitor: bundle o slider")
@@ -71,7 +85,6 @@ with tab_macro:
                     macro_z_val = float(mb["macro_z"].dropna().iloc[-1])
                 else:
                     # 2) Si no viene, calcúlalo del composite
-                    from qvm_trend.macro.macro_score import macro_z_from_series
                     if "COMPOSITE_Z" in mb.columns and pd.notna(mb["COMPOSITE_Z"]).any():
                         macro_z_val = float(macro_z_from_series(mb["COMPOSITE_Z"]))
                     elif "COMPOSITE_PCA" in mb.columns and pd.notna(mb["COMPOSITE_PCA"]).any():
@@ -144,7 +157,14 @@ with tab_port:
         bench=bench,
         start=start.isoformat(),
         end=end.isoformat(),
+        # === Kelly pro ===
         base_kelly=base_kelly,
+        winsor_p=winsor_p,
+        costs_per_period=costs_per_period,
+        ewm_span=ewm_span,
+        shrink_kappa=shrink_kappa,
+        lambda_corr=lambda_corr,
+        # === Macro / Quality / Caps ===
         macro_z=float(st.session_state.get("macro_z_eff", 0.0)),
         quality_df=quality_df,
         pos_cap=pos_cap_eff,
@@ -238,36 +258,23 @@ with tab_exits:
             mom_lookback=252,
             review_freq="Q"   # revisión trimestral
         )
+        # Filtro para eliminar símbolos
+        sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
+        if sym_del:
+            table = table[~table["symbol"].isin(sym_del)]
+
         st.dataframe(table, use_container_width=True)
         st.caption("Salida si: rompe MA200 y/o Mom 12-1 < 0 en revisión trimestral; motivos y fecha estimada.")
+
+        st.download_button(
+            "Descargar salidas (CSV)",
+            table.to_csv(index=False).encode(),
+            file_name="exits.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
     except Exception as e:
         st.error(f"Error generando salidas: {e}")
-    st.subheader("Reglas de salida por símbolo")
-
-    panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
-    bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
-
-    table = build_exit_table(
-        panel=panel,
-        bench_close=None if bench_px is None else bench_px["close"],
-        ma_window=200,
-        mom_lookback=252,
-        review_freq="Q"
-    )
-
-    sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
-    if sym_del:
-        table = table[~table["symbol"].isin(sym_del)]
-
-    st.dataframe(table, use_container_width=True)
-
-    st.download_button(
-        "Descargar salidas (CSV)",
-        table.to_csv(index=False).encode(),
-        file_name="exits.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
 
 # ------------------ DIAGNÓSTICO ------------------
 with tab_diag:
