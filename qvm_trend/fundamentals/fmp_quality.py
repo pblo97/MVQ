@@ -1,228 +1,243 @@
 # qvm_trend/fundamentals/fmp_quality.py
 from __future__ import annotations
-
-import time
-from typing import List, Dict, Optional
-
+import time, math
+from typing import List, Dict, Tuple
 import numpy as np
 import pandas as pd
 import requests
 
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
+# Profundidad razonable para Starter (≈ 5 años trimestral)
+Q_LIMIT = 20
+SLEEP = 0.12  # pequeño backoff para no gatillar rate limit
 
-
-# --------------------------- utilidades básicas --------------------------- #
-def _z(s: pd.Series) -> pd.Series:
-    """Z-score con winsor 2% y guardas para series cortas."""
-    s = pd.to_numeric(s, errors="coerce")
-    s = s.replace([np.inf, -np.inf], np.nan)
-    if s.dropna().size < 5:  # muy pocos datos -> todo NaN para no inventar
-        return pd.Series(np.nan, index=s.index)
-    lo, hi = s.quantile(0.02), s.quantile(0.98)
+# ==========================
+# Utils
+# ==========================
+def _winsor_z(s: pd.Series, p: float = 0.02) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if s.dropna().empty:
+        return s
+    lo, hi = s.quantile(p), s.quantile(1-p)
     s = s.clip(lo, hi)
-    std = s.std(ddof=1)
-    if not np.isfinite(std) or std == 0:
-        return pd.Series(np.nan, index=s.index)
-    return (s - s.mean()) / std
+    return (s - s.mean()) / (s.std(ddof=1) + 1e-12)
 
+def _get(url: str, params: dict, retries: int = 2) -> list | dict | None:
+    for t in range(retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=25)
+            if r.status_code == 200:
+                return r.json()
+            # Backoff simple ante 429 u otros
+            time.sleep(SLEEP * (t + 1) * 2)
+        except Exception:
+            time.sleep(SLEEP * (t + 1))
+    return None
 
-def _safe(d: dict, keys: List[str], default=np.nan):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return default
+def _quarter_df(js: list, index_col: str = "date") -> pd.DataFrame:
+    if not isinstance(js, list) or not js:
+        return pd.DataFrame()
+    df = pd.DataFrame(js)
+    if index_col in df.columns:
+        df[index_col] = pd.to_datetime(df[index_col], errors="coerce")
+        df = df.dropna(subset=[index_col]).set_index(index_col).sort_index()
+    else:
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.sort_index()
+    return df
 
+def _last4_med(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna().tail(4)
+    return float(s.median()) if len(s) else np.nan
 
-def _sleep_between(i: int, base: float = 0.12):
-    # pequeña espera progresiva para respetar rate limits free
-    time.sleep(base + 0.02 * (i % 5))
+def _last4_sum(series: pd.Series) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna().tail(4)
+    return float(s.sum()) if len(s) else np.nan
 
-
-class _HTTP:
-    """Cliente simple con reintentos."""
-    def __init__(self):
-        self.s = requests.Session()
-        self.s.headers.update({"User-Agent": "mvq-quality/1.0"})
-
-    def get_json(self, url: str, params: dict, retry: int = 2, backoff: float = 0.5) -> Optional[dict]:
-        last_err = None
-        for t in range(retry + 1):
-            try:
-                r = self.s.get(url, params=params, timeout=20)
-                if r.status_code == 200:
-                    return r.json()
-                last_err = f"HTTP {r.status_code}: {r.text[:120]}"
-            except Exception as e:
-                last_err = str(e)
-            time.sleep(backoff * (t + 1))
-        # Devuelve None en error; el llamador decide
-        return None
-
-
-# --------------------------- fetchers de FMP --------------------------- #
-def fetch_ttm(symbols: List[str], api_key: str) -> Dict[str, dict]:
+# ==========================
+# Fetchers (quarterly history)
+# ==========================
+def fetch_quarterly(symbol: str, api_key: str) -> dict[str, pd.DataFrame]:
     """
-    Devuelve dict[symbol] -> mezcla de 'ratios-ttm' y 'key-metrics-ttm' (último dato).
-    Importante: estos endpoints NO soportan batch estable, se consulta por símbolo.
+    Descarga tablas trimestrales para un símbolo:
+      - income-statement, balance-sheet-statement, cash-flow-statement,
+      - ratios, key-metrics
     """
-    http = _HTTP()
-    out: Dict[str, dict] = {s: {} for s in symbols}
-    for i, s in enumerate(symbols):
-        # ratios-ttm/{symbol}
-        rj = http.get_json(f"{FMP_BASE}/ratios-ttm/{s}", {"apikey": api_key}) or []
-        if isinstance(rj, list) and rj:
-            out[s].update(rj[0])  # último TTM
-        _sleep_between(i)
+    params_q = {"apikey": api_key, "period": "quarter", "limit": Q_LIMIT}
+    inc  = _quarter_df(_get(f"{FMP_BASE}/income-statement/{symbol}", params_q))
+    bal  = _quarter_df(_get(f"{FMP_BASE}/balance-sheet-statement/{symbol}", params_q))
+    cfs  = _quarter_df(_get(f"{FMP_BASE}/cash-flow-statement/{symbol}", params_q))
+    rat  = _quarter_df(_get(f"{FMP_BASE}/ratios/{symbol}", params_q))
+    met  = _quarter_df(_get(f"{FMP_BASE}/key-metrics/{symbol}", params_q))
+    time.sleep(SLEEP)
+    return {"income": inc, "balance": bal, "cash": cfs, "ratios": rat, "metrics": met}
 
-        # key-metrics-ttm/{symbol}
-        kj = http.get_json(f"{FMP_BASE}/key-metrics-ttm/{s}", {"apikey": api_key}) or []
-        if isinstance(kj, list) and kj:
-            out[s].update(kj[0])
-        _sleep_between(i)
-    return out
-
-
-def fetch_growth(symbols: List[str], api_key: str) -> Dict[str, dict]:
-    """financial-growth anual (último registro) por símbolo."""
-    http = _HTTP()
-    out: Dict[str, dict] = {}
-    for i, s in enumerate(symbols):
-        js = http.get_json(f"{FMP_BASE}/financial-growth/{s}",
-                           {"apikey": api_key, "period": "annual", "limit": 8}) or []
-        if isinstance(js, list) and js:
-            out[s] = js[0]
-        _sleep_between(i)
-    return out
-
-
-def fetch_eps_series(symbols: List[str], api_key: str) -> Dict[str, pd.Series]:
-    """Serie trimestral de EPS diluido para estabilidad/crecimiento."""
-    http = _HTTP()
-    out: Dict[str, pd.Series] = {}
-    for i, s in enumerate(symbols):
-        js = http.get_json(f"{FMP_BASE}/income-statement/{s}",
-                           {"apikey": api_key, "period": "quarter", "limit": 40}) or []
-        if isinstance(js, list) and js:
-            df = pd.DataFrame(js)
-            col = "epsdiluted" if "epsdiluted" in df.columns else ("eps" if "eps" in df.columns else None)
-            if col and "date" in df.columns:
-                ser = pd.to_numeric(df.set_index("date")[col], errors="coerce").sort_index()
-                out[s] = ser
-        _sleep_between(i)
-    return out
-
-
-# --------------------------- features y scoring --------------------------- #
-FEATURE_WEIGHTS = {
-    # Rentabilidad
-    "roic":           +1.0,  # roicTTM / returnOnInvestedCapitalTTM
-    "gross_margin":   +0.5,  # grossProfitMarginTTM
-    "op_margin":      +0.6,  # operatingProfitMarginTTM / operatingMarginTTM
-
-    # Apalancamiento / calidad
-    "debt_to_equity": -0.4,  # debtToEquityTTM
-    "interest_cov":   +0.6,  # interestCoverageTTM
-
-    # Devengos (menor, mejor)
-    "accruals":       -0.8,  # accrualsTTM / accrualRatioTTM
-
-    # Inversión y retorno al accionista
-    "asset_growth":   -0.7,  # financial-growth.assetGrowth
-    "buyback":        +0.5,  # buybackRatioTTM / sharesBuybackRatioTTM
-
-    # Calidad de ganancias
-    "eps_cagr":       +0.8,  # CAGR ~5y desde serie trimestral
-    "eps_var":        -0.6,  # volatilidad de cambios trimestrales (menor, mejor)
-}
-
-
-def _eps_features(eps_q: pd.Series) -> Dict[str, float]:
-    eps_q = pd.to_numeric(eps_q, errors="coerce").dropna()
+# ==========================
+# Features
+# ==========================
+def _eps_features(inc: pd.DataFrame) -> Tuple[float, float]:
+    """
+    Devuelve (eps_cagr, eps_var) usando epsdiluted trimestral.
+    eps_var = std de variación porcentual trimestral.
+    eps_cagr ~ CAGR anualizado aprox (usando últimos 16-20 trimestres).
+    """
+    if inc.empty or "epsdiluted" not in inc.columns:
+        return (np.nan, np.nan)
+    eps_q = pd.to_numeric(inc["epsdiluted"], errors="coerce").dropna().tail(20)
     if len(eps_q) < 8:
-        return {"eps_cagr": np.nan, "eps_var": np.nan}
-
-    eps_q = eps_q.replace(0, np.nan).dropna()
-    if len(eps_q) < 8:
-        return {"eps_cagr": np.nan, "eps_var": np.nan}
-
-    eps_q = eps_q.tail(20)  # ~5 años
-    pct = eps_q.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    eps_var = float(pct.std()) if pct.size else np.nan
-
+        return (np.nan, np.nan)
+    # variabilidad de EPS QoQ
+    eps_var = float(eps_q.pct_change().replace([np.inf, -np.inf], np.nan).std())
+    # CAGR aprox (4 trimestres ~ 1 año)
     start, end = float(eps_q.iloc[0]), float(eps_q.iloc[-1])
     n_years = max(1.0, len(eps_q) / 4.0)
-    eps_cagr = ((end / start) ** (1.0 / n_years) - 1.0) if (start > 0 and end > 0) else np.nan
-    return {"eps_cagr": eps_cagr, "eps_var": eps_var}
+    if start <= 0 or end <= 0:
+        eps_cagr = np.nan
+    else:
+        eps_cagr = (end / start) ** (1.0 / n_years) - 1.0
+    return (eps_cagr, eps_var)
 
-
-def compute_quality_from_fmp(
-    symbols: List[str],
-    api_key: str,
-    include_components: bool = False,
-) -> pd.DataFrame:
+def _buyback_ratio_from_shares(metrics: pd.DataFrame) -> float:
     """
-    Calcula QualityScore para 'symbols' usando FMP.
-    Devuelve DataFrame con: symbol, QualityScore (+ opcionalmente features y z-scores).
+    Aproxima buyback ratio como % reducción de shares outstanding en el último año (4Q).
+    Busca 'sharesOutstanding'; si no existe, devuelve NaN.
+    """
+    col_candidates = [c for c in metrics.columns if c.lower().startswith("shares") and "outstanding" in c.lower()]
+    if metrics.empty or not col_candidates:
+        return np.nan
+    s = pd.to_numeric(metrics[col_candidates[0]], errors="coerce").dropna().tail(5)
+    if len(s) < 5:  # necesitamos comparar t y t-4 (aprox 1 año)
+        return np.nan
+    last, prev4 = float(s.iloc[-1]), float(s.iloc[-5])
+    if prev4 <= 0:
+        return np.nan
+    chg = (last - prev4) / prev4  # negativo = reducción
+    return float(-chg)  # reducción de acciones => buyback positivo
+
+def _accruals_proxy(inc: pd.DataFrame, bal: pd.DataFrame, cfs: pd.DataFrame) -> float:
+    """
+    Si el endpoint ratios no trae accrualsTTM, aproximamos:
+      accruals ≈ (ΔWC - CFO) / Assets
+    con WC ~ currentAssets - currentLiabilities, todo rolling 4Q.
+    """
+    try:
+        if {"netCashProvidedByOperatingActivities"} - set(cfs.columns):
+            # fallback nombre alternativo
+            cf_col = next((c for c in cfs.columns if "operat" in c.lower() and "net" in c.lower()), None)
+        else:
+            cf_col = "netCashProvidedByOperatingActivities"
+        if cf_col is None:
+            return np.nan
+
+        WC = None
+        if {"totalCurrentAssets", "totalCurrentLiabilities"}.issubset(bal.columns):
+            WC = (pd.to_numeric(bal["totalCurrentAssets"], errors="coerce") -
+                  pd.to_numeric(bal["totalCurrentLiabilities"], errors="coerce"))
+        if WC is None or WC.dropna().empty:
+            return np.nan
+
+        dWC_4Q = _last4_sum(WC.diff())  # suma de deltas ~ 4Q
+        CFO_4Q = _last4_sum(pd.to_numeric(cfs[cf_col], errors="coerce"))
+        assets_4Q = _last4_med(pd.to_numeric(bal.get("totalAssets", pd.Series()), errors="coerce"))
+        if not np.isfinite(dWC_4Q) or not np.isfinite(CFO_4Q) or not np.isfinite(assets_4Q) or assets_4Q == 0:
+            return np.nan
+        return float((dWC_4Q - CFO_4Q) / abs(assets_4Q))
+    except Exception:
+        return np.nan
+
+# Pesos (puede afinarlos a gusto)
+FEATURE_WEIGHTS = {
+    # Profitability
+    "roic":         +1.0,  # mediana 4Q de roic (ratios/metrics)
+    "gross_margin": +0.5,  # grossProfitMargin
+    "op_margin":    +0.6,  # operatingMargin / operatingProfitMargin
+
+    # Leverage & quality
+    "debt_to_equity": -0.4,
+    "interest_cov":   +0.6,
+
+    # Accruals (menor es mejor)
+    "accruals":     -0.8,
+
+    # Investment/returns to shareholders
+    "asset_growth": -0.7,  # de financial-growth o derivado (si no, NaN)
+    "buyback":      +0.5,  # reducción de shares aprox
+
+    # Earnings quality
+    "eps_cagr":     +0.8,
+    "eps_var":      -0.6,
+}
+
+# ==========================
+# Main
+# ==========================
+def compute_quality_from_fmp(symbols: List[str], api_key: str) -> pd.DataFrame:
+    """
+    Descarga historia trimestral (Starter plan friendly) y construye QualityScore.
+    Devuelve DataFrame con columnas: symbol, QualityScore y features individuales.
     """
     symbols = [s.upper() for s in symbols if s and isinstance(s, str)]
-    if not symbols:
-        return pd.DataFrame(columns=["symbol", "QualityScore"])
-
-    ttm = fetch_ttm(symbols, api_key)
-    grw = fetch_growth(symbols, api_key)
-    eps = fetch_eps_series(symbols, api_key)
-
     rows = []
-    for s in symbols:
-        d = ttm.get(s, {}) or {}
-        g = grw.get(s, {}) or {}
-        e = eps.get(s, pd.Series(dtype=float))
 
-        roic = _safe(d, ["roicTTM", "returnOnInvestedCapitalTTM"])
-        gm = _safe(d, ["grossProfitMarginTTM"])
-        opm = _safe(d, ["operatingProfitMarginTTM", "operatingMarginTTM"])
-        dte = _safe(d, ["debtToEquityTTM", "debttoequityTTM"])
-        icov = _safe(d, ["interestCoverageTTM", "interestCoverage"])
-        accr = _safe(d, ["accrualsTTM", "accrualRatioTTM", "accruals"])
-        asetg = _safe(g, ["assetGrowth", "assetgrowth"])
-        buyb = _safe(d, ["buybackRatioTTM", "sharesbuybackratioTTM", "shareBuybackRatioTTM"])
+    for sym in symbols:
+        data = fetch_quarterly(sym, api_key)
+        inc, bal, cfs, rat, met = data["income"], data["balance"], data["cash"], data["ratios"], data["metrics"]
 
-        ef = _eps_features(e)
+        # --- Profitability (mediana de últimos 4Q) ---
+        roic = _last4_med(met.get("roic", pd.Series())) if "roic" in met.columns else \
+               _last4_med(rat.get("returnOnInvestedCapital", pd.Series()))
+        gross_margin = _last4_med(rat.get("grossProfitMargin", pd.Series()))
+        op_margin = _last4_med(rat.get("operatingProfitMargin", pd.Series()) if "operatingProfitMargin" in rat.columns
+                               else rat.get("operatingMargin", pd.Series()))
+
+        # --- Leverage & coverage (últimos 4Q median) ---
+        dte = _last4_med(rat.get("debtEquityRatio", pd.Series()) if "debtEquityRatio" in rat.columns
+                         else rat.get("debtToEquity", pd.Series()))
+        icov = _last4_med(rat.get("interestCoverage", pd.Series()))
+
+        # --- Accruals ---
+        accr = _last4_med(rat.get("accruals", pd.Series()))  # si el endpoint lo trae
+        if not np.isfinite(accr):
+            accr = _accruals_proxy(inc, bal, cfs)
+
+        # --- Investment / buybacks ---
+        # Asset growth anual (de financial-growth ANUAL si querés; Starter suele permitirlo).
+        fg = _get(f"{FMP_BASE}/financial-growth/{sym}", {"apikey": api_key, "period": "annual", "limit": 6})
+        time.sleep(SLEEP)
+        asset_growth = np.nan
+        if isinstance(fg, list) and fg:
+            df_g = _quarter_df(fg, index_col="date")  # fechas anuales igual sirven
+            col_candidates = [c for c in df_g.columns if "assetgrowth" in c.lower()]
+            if col_candidates:
+                asset_growth = float(pd.to_numeric(df_g[col_candidates[0]], errors="coerce").dropna().iloc[-1]) \
+                               if not df_g[col_candidates[0]].dropna().empty else np.nan
+
+        buyback = _buyback_ratio_from_shares(met)
+
+        # --- Earnings quality ---
+        eps_cagr, eps_var = _eps_features(inc)
+
         rows.append({
-            "symbol": s,
-            "roic": roic,
-            "gross_margin": gm,
-            "op_margin": opm,
-            "debt_to_equity": dte,
-            "interest_cov": icov,
-            "accruals": accr,
-            "asset_growth": asetg,
-            "buyback": buyb,
-            "eps_cagr": ef["eps_cagr"],
-            "eps_var": ef["eps_var"],
+            "symbol": sym,
+            "roic": roic, "gross_margin": gross_margin, "op_margin": op_margin,
+            "debt_to_equity": dte, "interest_cov": icov,
+            "accruals": accr, "asset_growth": asset_growth, "buyback": buyback,
+            "eps_cagr": eps_cagr, "eps_var": eps_var,
         })
 
-    feats = pd.DataFrame(rows).set_index("symbol")
+    df = pd.DataFrame(rows).set_index("symbol")
 
-    # z-scores por columna (si no hay datos suficientes -> NaN)
-    Z = pd.DataFrame({k: _z(feats[k]) if k in feats.columns else pd.Series(np.nan, index=feats.index)
+    # Z-scores robustos y score final
+    Z = pd.DataFrame({k: _winsor_z(df[k]) if k in df.columns else pd.Series(np.nan, index=df.index)
                       for k in FEATURE_WEIGHTS.keys()})
-
     weights = pd.Series(FEATURE_WEIGHTS)
 
-    def _row_score(zrow: pd.Series) -> float:
-        mask = zrow.notna()
-        if not mask.any():
+    def row_score(zrow: pd.Series) -> float:
+        m = zrow.notna()
+        if not m.any():
             return np.nan
-        w = weights[mask]
-        # media ponderada por el valor absoluto de los pesos (para no sesgar por signo)
-        return float((zrow[mask] * w).sum() / np.abs(w).sum())
+        w = weights[m]
+        return float((zrow[m] * w).sum() / abs(w).sum())
 
-    quality = Z.apply(_row_score, axis=1).rename("QualityScore")
-
-    if include_components:
-        out = pd.concat([feats, Z.add_prefix("z_"), quality], axis=1).reset_index()
-    else:
-        out = quality.reset_index()
-
-    return out
+    df["QualityScore"] = Z.apply(row_score, axis=1)
+    return df.reset_index()[["symbol", "QualityScore"] + list(FEATURE_WEIGHTS.keys())]
