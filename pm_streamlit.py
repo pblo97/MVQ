@@ -375,35 +375,76 @@ with tab_port:
     )
 
 # ------------------ SALIDAS ------------------
+# ------------------ SALIDAS ------------------
 with tab_exits:
-    st.subheader("Reglas de salida por símbolo")
+    st.subheader("Reglas de salida por símbolo (MA200, Mom 12-1, Calidad 1Q)")
+
+    # Parámetros
+    colE1, colE2, colE3 = st.columns(3)
+    with colE1:
+        ma_window = st.number_input("MA (días)", 100, 400, 200, 10)
+    with colE2:
+        mom_lookback = st.number_input("Lookback Momentum (días)", 120, 400, 252, 5)
+    with colE3:
+        vfq_delta_thr = st.number_input("Umbral ΔVFQ 1Q (degradación)", 0.00, 1.00, 0.10, 0.01, format="%.2f")
+
+    st.caption("Salida si: rompe MA200 y/o Momentum 12-1 < 0; se refuerza con degradación de calidad (ΔVFQ 1Q < -umbral). Revisión trimestral.")
+
+    # Carga opcional de histórico de calidad
+    vfq_hist = None
+    up_vfq_hist = st.file_uploader("Histórico de calidad (opcional) — columnas: symbol,date,VFQ", type=["csv"])
+    if up_vfq_hist is not None:
+        try:
+            vfq_hist = pd.read_csv(up_vfq_hist)
+            # normalizamos nombres
+            vfq_hist.columns = [c.strip() for c in vfq_hist.columns]
+            st.success(f"Histórico de calidad cargado: {vfq_hist.shape}")
+        except Exception as e:
+            st.error(f"No pude leer histórico de calidad: {e}")
+
     try:
         panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
         bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
+
+        from qvm_trend.pm.exits import build_exit_table  # usa el parche nuevo
+
         table = build_exit_table(
             panel=panel,
-            bench_close=None if bench_px is None else bench_px["close"],
-            ma_window=200,
-            mom_lookback=252,
-            review_freq="Q"   # revisión trimestral
+            bench_close=None if bench_px is None else bench_px.get("close"),
+            ma_window=int(ma_window),
+            mom_lookback=int(mom_lookback),
+            review_freq="Q",
+            vfq_hist=vfq_hist,
+            vfq_col="VFQ",
+            vfq_delta_thr=float(vfq_delta_thr),
         )
-        # Filtro para eliminar símbolos
-        sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
-        if sym_del:
-            table = table[~table["symbol"].isin(sym_del)]
 
-        st.dataframe(table, use_container_width=True)
-        st.caption("Salida si: rompe MA200 y/o Mom 12-1 < 0 en revisión trimestral; motivos y fecha estimada.")
+        if table.empty:
+            st.warning("No se pudo generar la tabla de salidas.")
+        else:
+            # Filtro por acción
+            act_sel = st.multiselect("Filtrar por acción", options=["EXIT","TRIM","HOLD"], default=["EXIT","TRIM"])
+            if act_sel:
+                table = table[table["action"].isin(act_sel)]
 
-        st.download_button(
-            "Descargar salidas (CSV)",
-            table.to_csv(index=False).encode(),
-            file_name="exits.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
+            # Quita símbolos manualmente si quieres
+            sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
+            if sym_del:
+                table = table[~table["symbol"].isin(sym_del)]
+
+            st.dataframe(table, use_container_width=True)
+
+            st.download_button(
+                "Descargar salidas (CSV)",
+                table.to_csv(index=False).encode(),
+                file_name="exits.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
     except Exception as e:
         st.error(f"Error generando salidas: {e}")
+
 
 # ------------------ DIAGNÓSTICO ------------------
 with tab_diag:

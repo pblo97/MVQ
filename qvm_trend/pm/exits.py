@@ -1,106 +1,141 @@
-# qvm_trend/pm/exits.py
 from __future__ import annotations
-
 import numpy as np
 import pandas as pd
-from typing import Dict, Optional
 
+def _q_end(d: pd.Timestamp) -> pd.Timestamp:
+    """Fin de trimestre del timestamp dado."""
+    q = (d.month - 1)//3 + 1
+    last_month = q*3
+    last_day = pd.Period(f"{d.year}-{last_month:02d}").days_in_month
+    return pd.Timestamp(d.year, last_month, last_day)
 
-def _ma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window, min_periods=window).mean()
+def _next_q_end(d: pd.Timestamp) -> pd.Timestamp:
+    qe = _q_end(d)
+    return qe if d <= qe else _q_end(d + pd.offsets.QuarterEnd())
 
-def _mom_12_1(close: pd.Series) -> pd.Series:
+def _mom_12_1(px: pd.Series, lb_12m: int = 252, lb_1m: int = 21) -> float:
+    px = pd.to_numeric(px, errors="coerce").dropna()
+    if len(px) < max(lb_12m, lb_1m)+1: 
+        return np.nan
+    r12 = px.iloc[-1]/px.iloc[-1-lb_12m] - 1.0
+    r1  = px.iloc[-1]/px.iloc[-1-lb_1m]  - 1.0
+    return float(r12 - r1)
+
+def _ma(px: pd.Series, win: int = 200) -> float:
+    px = pd.to_numeric(px, errors="coerce").dropna()
+    if len(px) < win: 
+        return np.nan
+    return float(px.rolling(win).mean().iloc[-1])
+
+def _vfq_trend(vfq_hist: pd.DataFrame, symbol: str, score_col: str = "VFQ", delta_thr: float = 0.10) -> dict:
     """
-    Momento 12-1 clásico: retorno 12m excluyendo el último mes.
-    Señal 'negativa' cuando < 0.
+    vfq_hist: DataFrame con columnas ['symbol','date', score_col] (date parseable)
+    Devuelve: {'vfq_last':..., 'vfq_chg_1q':..., 'vfq_trend':'Improving/Degrading/Flat'}
     """
-    mret = close.pct_change()
-    # retorno acumulado últimos 12m
-    r12 = (1.0 + mret).rolling(252, min_periods=252).apply(lambda x: float(np.prod(1.0 + x) - 1.0))
-    # excluir el último mes ~21d
-    r1  = (1.0 + mret).rolling(21,  min_periods=21 ).apply(lambda x: float(np.prod(1.0 + x) - 1.0))
-    return (r12 - r1).rename("mom_12_1")
-
-
-def _quarter_ends(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    if not isinstance(idx, pd.DatetimeIndex) or idx.empty:
-        return pd.DatetimeIndex([])
-    # fin de trimestre naturales
-    qe = pd.date_range(idx.min().normalize(), idx.max().normalize(), freq="Q")
-    # ajusta al índice disponible (tomar el último día disponible <= fin de trimestre)
-    out = []
-    for d in qe:
-        s = idx[idx <= d]
-        if len(s) > 0:
-            out.append(s[-1])
-    return pd.DatetimeIndex(out).unique()
-
+    if vfq_hist is None or vfq_hist.empty or score_col not in vfq_hist.columns:
+        return dict(vfq_last=np.nan, vfq_chg_1q=np.nan, vfq_trend="N/A")
+    df = vfq_hist[vfq_hist["symbol"].astype(str).str.upper() == str(symbol).upper()].copy()
+    if df.empty:
+        return dict(vfq_last=np.nan, vfq_chg_1q=np.nan, vfq_trend="N/A")
+    # index temporal trimestral
+    if "date" in df.columns:
+        idx = pd.to_datetime(df["date"], errors="coerce")
+        df = df.assign(date=idx).dropna(subset=["date"]).set_index("date").sort_index()
+    else:
+        df = df.sort_index()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return dict(vfq_last=np.nan, vfq_chg_1q=np.nan, vfq_trend="N/A")
+    q = df[[score_col]].resample("Q").last().dropna()
+    if q.shape[0] < 2:
+        return dict(vfq_last=float(q.iloc[-1][score_col]) if not q.empty else np.nan,
+                    vfq_chg_1q=np.nan, vfq_trend="N/A")
+    last = float(q.iloc[-1][score_col])
+    prev = float(q.iloc[-2][score_col])
+    d1 = last - prev
+    if d1 > delta_thr:
+        trend = "Improving"
+    elif d1 < -delta_thr:
+        trend = "Degrading"
+    else:
+        trend = "Flat"
+    return dict(vfq_last=last, vfq_chg_1q=d1, vfq_trend=trend)
 
 def build_exit_table(
-    panel: Dict[str, pd.DataFrame],
-    bench_close: Optional[pd.Series] = None,
     *,
+    panel: dict[str, pd.DataFrame],
+    bench_close: pd.Series | None = None,
     ma_window: int = 200,
     mom_lookback: int = 252,
-    review_freq: str = "Q",   # por ahora soportado: 'Q'
+    review_freq: str = "Q",
+    vfq_hist: pd.DataFrame | None = None,   # opcional histórico de calidad
+    vfq_col: str = "VFQ",
+    vfq_delta_thr: float = 0.10,            # umbral mejora/degradación 1 trimestre
 ) -> pd.DataFrame:
     """
-    Devuelve tabla de salida por símbolo con:
-      symbol, last_date, close, ma200, below_ma200, mom_12_1, mom_neg, exit_flag, reason
+    Devuelve una tabla por símbolo con señales de salida y recomendación:
+    columnas:
+      ['symbol','close','MA200','MA_breach','Mom12-1','Mom_neg',
+       'vfq_last','vfq_chg_1q','vfq_trend','review_next','action','reasons']
     Reglas:
-      - Revisión por trimestre (último día hábil del trimestre).
-      - Señal de salida si (close < MA200) o (mom_12_1 < 0) en la revisión.
+      - MA_breach: close < MA200
+      - Mom_neg: (12-1) < 0
+      - Calidad: 'Degrading' si ΔVFQ_1Q < -vfq_delta_thr
+      - Acción:
+           EXIT si (MA_breach y Mom_neg) o (MA_breach y Degrading)
+           TRIM si (MA_breach) o (Mom_neg) o (Degrading)
+           HOLD en caso contrario
     """
     rows = []
     for sym, df in (panel or {}).items():
         if df is None or df.empty or "close" not in df.columns:
             continue
-
         px = pd.to_numeric(df["close"], errors="coerce").dropna()
-        if len(px) < max(ma_window, mom_lookback) + 5:
-            # poca historia — no emitimos señal
-            rows.append({
-                "symbol": sym, "last_date": px.index.max() if len(px) else pd.NaT,
-                "close": float(px.iloc[-1]) if len(px) else np.nan,
-                "ma200": np.nan, "below_ma200": False,
-                "mom_12_1": np.nan, "mom_neg": False,
-                "exit_flag": False, "reason": "historia insuficiente"
-            })
+        if px.empty:
             continue
 
         ma = _ma(px, ma_window)
-        mom = _mom_12_1(px)
+        ma_breach = bool(px.iloc[-1] < ma) if np.isfinite(ma) else False
+        mom = _mom_12_1(px, lb_12m=mom_lookback, lb_1m=21)
+        mom_neg = bool(np.isfinite(mom) and mom < 0)
 
-        # fecha de revisión (último fin de trimestre disponible)
-        qends = _quarter_ends(px.index)
-        if len(qends) == 0:
-            review_dt = px.index.max()
-        else:
-            review_dt = qends[-1]
+        qinfo = _vfq_trend(vfq_hist, sym, score_col=vfq_col, delta_thr=vfq_delta_thr)
 
-        # tomar valores a la fecha de revisión
-        c_rev   = float(px.reindex(px.index).ffill().loc[review_dt])
-        ma_rev  = float(ma.reindex(px.index).ffill().loc[review_dt]) if not ma.dropna().empty else np.nan
-        mom_rev = float(mom.reindex(px.index).ffill().loc[review_dt]) if not mom.dropna().empty else np.nan
+        reasons = []
+        if ma_breach: reasons.append(f"Close<{ma_window}MA")
+        if mom_neg:  reasons.append("Momentum 12-1 < 0")
+        if qinfo["vfq_trend"] == "Degrading": reasons.append("Calidad ↓ (1Q)")
 
-        below = bool(c_rev < ma_rev) if np.isfinite(ma_rev) else False
-        mneg  = bool(mom_rev < 0.0)   if np.isfinite(mom_rev) else False
+        # Acción
+        action = "HOLD"
+        if (ma_breach and mom_neg) or (ma_breach and qinfo["vfq_trend"] == "Degrading"):
+            action = "EXIT"
+        elif ma_breach or mom_neg or (qinfo["vfq_trend"] == "Degrading"):
+            action = "TRIM"
 
-        reason = []
-        if below: reason.append("close<MA200")
-        if mneg:  reason.append("Mom12-1<0")
+        today = px.index[-1]
+        review_next = _next_q_end(today) if review_freq.upper().startswith("Q") else today
 
-        rows.append({
-            "symbol": sym,
-            "last_date": review_dt,
-            "close": c_rev,
-            "ma200": ma_rev,
-            "below_ma200": below,
-            "mom_12_1": mom_rev,
-            "mom_neg": mneg,
-            "exit_flag": bool(below or mneg),
-            "reason": " & ".join(reason) if reason else "mantener",
-        })
+        rows.append(dict(
+            symbol=sym,
+            close=float(px.iloc[-1]),
+            MA200=float(ma) if np.isfinite(ma) else np.nan,
+            MA_breach=ma_breach,
+            **{"Mom12-1": float(mom) if np.isfinite(mom) else np.nan},
+            Mom_neg=mom_neg,
+            vfq_last=float(qinfo["vfq_last"]) if np.isfinite(qinfo["vfq_last"]) else np.nan,
+            vfq_chg_1q=float(qinfo["vfq_chg_1q"]) if np.isfinite(qinfo["vfq_chg_1q"]) else np.nan,
+            vfq_trend=qinfo["vfq_trend"],
+            review_next=review_next.date(),
+            action=action,
+            reasons="; ".join(reasons) if reasons else "—",
+        ))
 
-    out = pd.DataFrame(rows).sort_values(["exit_flag","symbol"], ascending=[False, True])
-    return out.reset_index(drop=True)
+    tbl = pd.DataFrame(rows)
+    if tbl.empty:
+        return tbl
+
+    # Prioriza EXIT > TRIM > HOLD
+    order = {"EXIT": 0, "TRIM": 1, "HOLD": 2}
+    tbl["priority"] = tbl["action"].map(order).fillna(3)
+    tbl = tbl.sort_values(["priority", "symbol"]).drop(columns=["priority"]).reset_index(drop=True)
+    return tbl
