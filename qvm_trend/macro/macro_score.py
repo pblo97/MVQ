@@ -119,30 +119,29 @@ def compute_macro_overlay(series_z: pd.Series, params: MacroOverlayParams | None
     out["gate_new"] = gate_list
     return out
 
+__all__ = ["Regime", "z_to_regime", "macro_z_from_series"]
+
 @dataclass(frozen=True)
 class Regime:
-    label: str
+    label: str          # "OFF" | "NEUTRAL" | "ON"
     z: float
-    m_multiplier: float
-    beta_cap: float
-    vol_cap: float
+    m_multiplier: float # multiplicador que usarás en sizing
+    beta_cap: float     # sugerencia de cap a ∑(β·w)
+    vol_cap: float      # sugerencia de cap por posición
 
 def z_to_regime(z: float) -> Regime:
     z = float(z)
-    if z <= -0.5:
-        return Regime("OFF", z, 0.70, 0.60, 0.03)
     if z >= 0.5:
-        return Regime("ON",  z, 1.25, 1.25, 0.07)
-    return Regime("NEUTRAL", z, 0.95, 1.00, 0.05)
-
-def macro_z_from_series(s: pd.Series, window: int | None = None) -> float:
-    x = pd.to_numeric(s, errors="coerce").dropna()
-    if x.empty: return 0.0
-    if window and len(x) >= max(24, window):
-        mu = float(x.rolling(window, min_periods=max(12, window//3)).mean().iloc[-1])
-        sd = float(x.rolling(window, min_periods=max(12, window//3)).std().iloc[-1])
+        return Regime("ON", z, 1.25, 1.25, 0.07)
+    elif z <= -0.5:
+        return Regime("OFF", z, 0.70, 0.60, 0.03)
     else:
-        mu = float(x.mean()); sd = float(x.std(ddof=1))
-    return 0.0 if not np.isfinite(sd) or sd <= 1e-12 else float((x.iloc[-1]-mu)/sd)
+        return Regime("NEUTRAL", z, 0.95, 1.00, 0.05)
 
-__all__ = ["Regime", "z_to_regime", "macro_z_from_series"]
+def macro_z_from_series(s: pd.Series, window: int = 36) -> float:
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    if s.size < window:
+        return float("nan")
+    r = s.rolling(window, min_periods=window)
+    z = (s - r.mean()) / r.std()
+    return float(z.iloc[-1])
