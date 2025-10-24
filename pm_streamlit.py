@@ -82,8 +82,8 @@ with tab_in:
         end   = st.date_input("Fin", value=pd.to_datetime(DEFAULT_END).date())
     with c3:
         base_kelly = st.slider("Fracción Kelly base", 0.05, 0.50, 0.25, 0.01)
-        pos_cap = st.number_input("Cap por posición", 0.01, 0.10, 0.05, 0.01, format="%.2f")
-        beta_cap = st.number_input("Cap ∑(β·w)", 0.25, 2.00, 1.00, 0.05)
+        pos_cap    = st.number_input("Cap por posición", 0.01, 0.10, 0.05, 0.01, format="%.2f")
+        beta_cap   = st.number_input("Cap ∑(β·w)", 0.25, 2.00, 1.00, 0.05)
 
     st.markdown("### Ajustes Kelly avanzados")
     ck1, ck2, ck3 = st.columns(3)
@@ -100,36 +100,36 @@ with tab_in:
     with ck5:
         shrink_kappa = st.slider("Shrink κ (p/payoff)", 0, 50, 20, 1)
 
-    # === QualityScore SIEMPRE desde FMP (sin CSV) ===
-    @st.cache_data(show_spinner=False, ttl=60*60)  # cachea 1 hora
+    # === QualityScore SIEMPRE desde FMP ===
+    from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
+
+    @st.cache_data(show_spinner=False, ttl=60*60)
     def _fetch_quality_from_fmp(symbols_list: list[str], fmp_key: str) -> pd.DataFrame:
-        # Nota: no hace falta import global; evitamos errores si el módulo no existe al cargar
-        from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
-        # include_components=False devuelve solo ['symbol','QualityScore']
-        return compute_quality_from_fmp(symbols_list, fmp_key, include_components=False)
+        return compute_quality_from_fmp(symbols_list, fmp_key)  # devuelve symbol, QualityScore, features
 
     symbols_for_fmp = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
     fmp_key = st.secrets.get("FMP_API_KEY", "")
 
     quality_df = None
     if not fmp_key:
-        st.warning("Falta **FMP_API_KEY** en `st.secrets` para calcular QualityScore automáticamente.")
+        st.error("Falta **FMP_API_KEY** en `st.secrets` para calcular QualityScore automáticamente.")
     elif symbols_for_fmp:
         try:
             with st.spinner("Calculando QualityScore desde FMP…"):
                 qdf = _fetch_quality_from_fmp(symbols_for_fmp, fmp_key)
             if qdf is not None and not qdf.empty:
                 quality_df = qdf[["symbol", "QualityScore"]].copy()
-                st.info("QualityScore obtenido automáticamente desde FMP.")
-                # (opcional) muestrita del ranking
+                st.success("QualityScore obtenido automáticamente desde FMP.")
                 st.dataframe(
-                    quality_df.sort_values("QualityScore", ascending=False),
+                    qdf.sort_values("QualityScore", ascending=False),
                     use_container_width=True
                 )
             else:
                 st.warning("FMP no devolvió datos de calidad para estos símbolos.")
         except Exception as e:
             st.error(f"No pude calcular QualityScore con FMP: {e}")
+
+    # deja la calidad disponible para Cartera / Salidas
     st.session_state["quality_df"] = quality_df
 
 # ------------------ MACRO ------------------
@@ -393,10 +393,10 @@ with tab_port:
 
 # ------------------ SALIDAS ------------------
 # ------------------ SALIDAS ------------------
+# ------------------ SALIDAS ------------------
 with tab_exits:
     st.subheader("Reglas de salida por símbolo (MA200, Mom 12-1, Calidad 1Q)")
 
-    # Parámetros
     colE1, colE2, colE3 = st.columns(3)
     with colE1:
         ma_window = st.number_input("MA (días)", 100, 400, 200, 10, key="ex_ma")
@@ -410,55 +410,47 @@ with tab_exits:
         "se refuerza con degradación de calidad (ΔVFQ 1Q < -umbral). Revisión trimestral."
     )
 
-    # 1) Carga opcional de histórico de calidad
-    vfq_hist = None
-    up_vfq_hist = st.file_uploader(
-        "Histórico de calidad (opcional) — columnas: symbol,date,VFQ",
-        type=["csv"],
-        key="vfq_hist_uploader"
-    )
-    if up_vfq_hist is not None:
-        try:
-            vfq_hist = pd.read_csv(up_vfq_hist)
-            vfq_hist.columns = [c.strip() for c in vfq_hist.columns]
-            # normaliza tipos
-            if "date" in vfq_hist.columns:
-                vfq_hist["date"] = pd.to_datetime(vfq_hist["date"])
-            st.success(f"Histórico de calidad cargado: {vfq_hist.shape}")
-        except Exception as e:
-            st.error(f"No pude leer histórico de calidad: {e}")
-            vfq_hist = None
+    symbols = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
+    if not symbols:
+        st.warning("Ingresa símbolos en la pestaña Entradas.")
+        st.stop()
 
-    # 2) Fallback: si NO subiste histórico pero sí hay Quality (FMP) en Entradas,
-    # construimos una "foto actual" para mostrar VFQ y habilitar columna de calidad.
-    if vfq_hist is None and st.session_state.get("quality_df") is not None:
-        qdf_ss = st.session_state["quality_df"]
-        if isinstance(qdf_ss, pd.DataFrame) and not qdf_ss.empty:
-            cols_ok = {"symbol", "QualityScore"}.issubset(set(qdf_ss.columns))
-            if cols_ok:
-                vfq_hist = (
-                    qdf_ss.rename(columns={"QualityScore": "VFQ"})[["symbol", "VFQ"]]
-                          .assign(date=pd.to_datetime(pd.Timestamp.today().date()))
-                )
-                st.info(
-                    "Usando QualityScore de FMP (foto actual) para reforzar reglas de salida. "
-                    "Sube un CSV histórico para evaluar ΔVFQ trimestral real."
-                )
+    fmp_key = st.secrets.get("FMP_API_KEY", "")
+    if not fmp_key:
+        st.error("Falta **FMP_API_KEY** en `st.secrets` para construir el histórico de calidad (VFQ).")
+        st.stop()
 
-    # 3) Construcción de tabla de salidas
+    from qvm_trend.fundamentals.fmp_quality import quality_history_from_fmp
+
+    @st.cache_data(show_spinner=True, ttl=60*60)
+    def _fetch_vfq_history(symbols_list: list[str], fmp_key: str) -> pd.DataFrame:
+        # Devuelve columnas: symbol, date, VFQ (trimestral)
+        return quality_history_from_fmp(symbols_list, fmp_key)
+
+    # 1) Traemos el histórico trimestral de VFQ desde FMP (sin CSV)
+    try:
+        with st.spinner("Descargando histórico de calidad (VFQ) desde FMP…"):
+            vfq_hist = _fetch_vfq_history(symbols, fmp_key)
+        if vfq_hist is None or vfq_hist.empty:
+            st.warning("No se pudo construir el histórico VFQ desde FMP (Starter puede no cubrir todos los símbolos).")
+    except Exception as e:
+        st.error(f"No pude obtener VFQ histórico desde FMP: {e}")
+        vfq_hist = None
+
+    # 2) Construcción de tabla de salidas
     try:
         panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
         bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
 
-        from qvm_trend.pm.exits import build_exit_table  # versión parcheada que acepta vfq_hist
+        from qvm_trend.pm.exits import build_exit_table  # versión que calcula vfq_prev/delta/flag
 
         table = build_exit_table(
             panel=panel,
             bench_close=None if bench_px is None else bench_px.get("close"),
             ma_window=int(ma_window),
             mom_lookback=int(mom_lookback),
-            review_freq="Q",              # revisión trimestral
-            vfq_hist=vfq_hist,            # puede venir del CSV o del fallback FMP (foto actual)
+            review_freq="Q",
+            vfq_hist=vfq_hist,    # histórico 100% FMP
             vfq_col="VFQ",
             vfq_delta_thr=float(vfq_delta_thr),
         )
@@ -466,7 +458,6 @@ with tab_exits:
         if table is None or table.empty:
             st.warning("No se pudo generar la tabla de salidas.")
         else:
-            # Orden y columnas sugeridas
             preferred_cols = [
                 "symbol", "price_last", "ma_flag", "mom_flag",
                 "vfq_last", "vfq_prev", "vfq_delta", "quality_flag",
@@ -475,7 +466,6 @@ with tab_exits:
             cols_show = [c for c in preferred_cols if c in table.columns] or table.columns.tolist()
             table = table[cols_show].copy()
 
-            # Filtros rápidos
             act_sel = st.multiselect("Filtrar por acción", options=["EXIT", "TRIM", "HOLD"], default=["EXIT", "TRIM"])
             if act_sel:
                 table = table[table["action"].isin(act_sel)]
@@ -486,14 +476,13 @@ with tab_exits:
 
             # Formato
             num_cols = [c for c in ["price_last", "vfq_last", "vfq_prev", "vfq_delta"] if c in table.columns]
-            if num_cols:
-                for c in num_cols:
-                    if c == "vfq_delta":
-                        table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:+.2f}" if pd.notna(x) else "")
-                    elif c == "price_last":
-                        table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
-                    else:
-                        table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+            for c in num_cols:
+                if c == "vfq_delta":
+                    table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:+.2f}" if pd.notna(x) else "")
+                elif c == "price_last":
+                    table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
+                else:
+                    table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
 
             st.dataframe(table, use_container_width=True)
 
