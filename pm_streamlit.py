@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import date
+import plotly.graph_objects as go
 
 # --- RUTA DEL PROYECTO ---
 ROOT = os.path.abspath(os.path.dirname(__file__))          # .../mvq
@@ -225,6 +226,29 @@ with tab_macro:
     k2.metric("Régimen", reg.label)
     k3.metric("M_macro", f"{reg.m_multiplier:.2f}")
     k4.metric("β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
+
+    
+
+    c_g1, c_g2 = st.columns(2)
+    with c_g1:
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=float(reg.m_multiplier),
+            title={"text": "M_macro (×)"},
+            gauge={"axis": {"range": [0.5, 1.5]}}
+        ))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c_g2:
+        caps_df = pd.DataFrame({
+            "Cap": ["β·w total", "Posición"],
+            "Valor": [float(reg.beta_cap), float(reg.vol_cap)]
+        })
+        st.bar_chart(caps_df.set_index("Cap"))
+        st.caption("Caps sugeridos por régimen")
+
+    if macro_bundle is None:
+        st.info("Sube **macro_monitor_bundle.csv** para ver históricos de Composite, Overlay y equity filtrado.")
 
     # Guardar en sesión para otras pestañas
     # Guardar en sesión para otras pestañas
