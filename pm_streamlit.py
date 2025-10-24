@@ -167,6 +167,64 @@ with tab_port:
         st.bar_chart(dfw.set_index("symbol")["beta_w"])
         st.caption("Contribución β·w")
 
+    st.markdown("---")
+    st.subheader("Sizing con capital ficticio")
+
+    col_cap1, col_cap2, col_cap3 = st.columns([1,1,1])
+    with col_cap1:
+        capital_usd = st.number_input("Capital (USD)", value=380000, min_value=0, step=1000, format="%.0f")
+    with col_cap2:
+        cash_pct = st.slider("Cash %", 0.0, 1.0, 0.00, 0.01)
+    with col_cap3:
+        use_macro_mult = st.toggle("Multiplicar por M_macro del régimen", value=True)
+
+    # multiplicador macro desde pestaña Macro
+    M_macro = 1.0
+    if use_macro_mult:
+        reg_here = z_to_regime(float(st.session_state.get("macro_z_eff", 0.0)))
+        M_macro = reg_here.m_multiplier
+
+    alloc_capital = capital_usd * (1.0 - cash_pct)
+    w = dfw.set_index("symbol")["weight"].astype(float)
+    alloc = (w * alloc_capital * M_macro).rename("usd_alloc")
+
+    # (Opcional) cantidades aproximadas: usa último precio disponible
+    last_prices = {}
+    panel_tmp = load_prices_panel(symbols, start.isoformat(), end.isoformat(), cache_key="pm_panel")
+    for s in w.index:
+        try:
+            last_p = float(panel_tmp.get(s, {}).get("close", pd.Series(dtype=float)).dropna().iloc[-1])
+        except Exception:
+            last_p = float("nan")
+        last_prices[s] = last_p
+    px = pd.Series(last_prices, name="last_price")
+
+    qty = (alloc / px).fillna(0.0).apply(lambda x: int(max(0, np.floor(x))))  # enteros
+    alloc_eff = (qty * px).rename("usd_used")
+    cash_left = float(capital_usd - cash_pct*capital_usd - alloc_eff.sum())
+
+    sizing_tbl = pd.concat([w.rename("weight"), px, alloc, qty.rename("qty"), alloc_eff], axis=1).reset_index().rename(columns={"index":"symbol"})
+    st.dataframe(sizing_tbl, use_container_width=True)
+    st.caption(f"Cash libre aprox.: **${cash_left:,.0f}** (M_macro={M_macro:.2f})")
+
+    # Export rápido a CSV
+    st.download_button(
+        "Descargar sizing (CSV)",
+        sizing_tbl.to_csv(index=False).encode(),
+        file_name="sizing.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # Export de calidad/Kelly de la tabla principal
+    st.download_button(
+        "Descargar métricas Kelly/β (CSV)",
+        dfw.to_csv(index=False).encode(),
+        file_name="kelly_metrics.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
 # ------------------ SALIDAS ------------------
 with tab_exits:
     st.subheader("Reglas de salida por símbolo")
@@ -184,28 +242,64 @@ with tab_exits:
         st.caption("Salida si: rompe MA200 y/o Mom 12-1 < 0 en revisión trimestral; motivos y fecha estimada.")
     except Exception as e:
         st.error(f"Error generando salidas: {e}")
+    st.subheader("Reglas de salida por símbolo")
+
+    panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
+    bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
+
+    table = build_exit_table(
+        panel=panel,
+        bench_close=None if bench_px is None else bench_px["close"],
+        ma_window=200,
+        mom_lookback=252,
+        review_freq="Q"
+    )
+
+    sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
+    if sym_del:
+        table = table[~table["symbol"].isin(sym_del)]
+
+    st.dataframe(table, use_container_width=True)
+
+    st.download_button(
+        "Descargar salidas (CSV)",
+        table.to_csv(index=False).encode(),
+        file_name="exits.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
 # ------------------ DIAGNÓSTICO ------------------
 with tab_diag:
     st.subheader("Equity (pesos estáticos) y diagnóstico")
     try:
         pnl = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
-        # equity estática con pesos w
-        merged = None
+
+        rets_cols = []
         for s in symbols:
             if s in pnl and "close" in pnl[s].columns:
                 r = pnl[s]["close"].pct_change().rename(s)
-                merged = r if merged is None else merged.join(r, how="outer")
+                rets_cols.append(r)
+
+        if not rets_cols:
+            st.warning("Sin retornos para diagnóstico.")
+            st.stop()
+
+        # Asegura DataFrame multicolumna
+        merged = pd.concat(rets_cols, axis=1).sort_index()
         merged = merged.dropna(how="all").fillna(0.0)
+
         weights = dfw.set_index("symbol")["weight"].reindex(merged.columns).fillna(0.0).values
         port_ret = (merged * weights).sum(axis=1)
+
         bench_ret = None
         bdf = load_benchmark(bench, start.isoformat(), end.isoformat())
         if bdf is not None and "close" in bdf.columns:
             bench_ret = bdf["close"].pct_change().reindex(port_ret.index).fillna(0.0)
-        eq = (1+port_ret).cumprod().rename("Portfolio")
+
+        eq = (1 + port_ret).cumprod().rename("Portfolio")
         if bench_ret is not None:
-            eq_b = (1+bench_ret).cumprod().rename(bench)
+            eq_b = (1 + bench_ret).cumprod().rename(bench)
             st.line_chart(pd.concat([eq, eq_b], axis=1))
         else:
             st.line_chart(eq)
