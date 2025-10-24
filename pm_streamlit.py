@@ -115,6 +115,37 @@ with tab_in:
         except Exception as e:
             st.error(f"No pude leer VFQ: {e}")
 
+    st.markdown("**(Opcional) CSV de calidad (VFQ o QualityScore)**")
+    up_vfq = st.file_uploader("vfq.csv (de tu screener)", type=["csv"])
+
+    quality_df = None
+    if up_vfq is not None:
+        try:
+            qdf = pd.read_csv(up_vfq)
+            if "symbol" in qdf.columns:
+                keep_cols = [c for c in ["symbol","VFQ","QualityScore"] if c in qdf.columns]
+                quality_df = qdf[keep_cols].copy()
+                st.success(f"Cargado VFQ/Quality: {quality_df.shape}")
+            else:
+                st.warning("El CSV no tiene columna 'symbol'.")
+        except Exception as e:
+            st.error(f"No pude leer VFQ: {e}")
+
+    # >>> NUEVO: si NO subiste CSV, intenta FMP <<<
+    if quality_df is None:
+        fmp_key = st.secrets.get("FMP_API_KEY", "")
+        symbols_for_fmp = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
+        if fmp_key and symbols_for_fmp:
+            try:
+                with st.spinner("Descargando fundamentals (FMP) para QualityScore..."):
+                    from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
+                    qdf = compute_quality_from_fmp(symbols_for_fmp, fmp_key)
+                    if not qdf.empty:
+                        quality_df = qdf[["symbol","QualityScore"]].copy()
+                        st.info("QualityScore obtenido automáticamente desde FMP.")
+            except Exception as e:
+                st.warning(f"No pude calcular QualityScore con FMP: {e}")
+
 # ------------------ MACRO ------------------
 # ------------------ MACRO ------------------
 with tab_macro:
