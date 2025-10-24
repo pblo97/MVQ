@@ -114,9 +114,10 @@ def _http_get(url: str, params: dict | None = None, *, timeout: int = TIMEOUT_SE
 # ============================ UTILIDADES VARIAS ============================
 
 EXCHANGES_OK = {
-    "NASDAQ", "Nasdaq", "NasdaqGS", "NasdaqGM",
-    "NYSE", "NYSE ARCA", "NYSE Arca", "NYSE American",
-    "AMEX", "BATS"
+    "NASDAQ","Nasdaq","NasdaqGS","NasdaqGM",
+    "NYSE","NYSE ARCA","NYSE Arca","NYSE American",
+    "AMEX","BATS",
+    "SIX","SIX Swiss","SWX","SIX Swiss Exchange"  # ← añade estas
 }
 
 def _clean_symbol(sym: str) -> str:
