@@ -130,7 +130,7 @@ with tab_in:
                 st.warning("FMP no devolvió datos de calidad para estos símbolos.")
         except Exception as e:
             st.error(f"No pude calcular QualityScore con FMP: {e}")
-
+    st.session_state["quality_df"] = quality_df
 
 # ------------------ MACRO ------------------
 # ------------------ MACRO ------------------
@@ -399,55 +399,101 @@ with tab_exits:
     # Parámetros
     colE1, colE2, colE3 = st.columns(3)
     with colE1:
-        ma_window = st.number_input("MA (días)", 100, 400, 200, 10)
+        ma_window = st.number_input("MA (días)", 100, 400, 200, 10, key="ex_ma")
     with colE2:
-        mom_lookback = st.number_input("Lookback Momentum (días)", 120, 400, 252, 5)
+        mom_lookback = st.number_input("Lookback Momentum (días)", 120, 400, 252, 5, key="ex_mom")
     with colE3:
-        vfq_delta_thr = st.number_input("Umbral ΔVFQ 1Q (degradación)", 0.00, 1.00, 0.10, 0.01, format="%.2f")
+        vfq_delta_thr = st.number_input("Umbral ΔVFQ 1Q (degradación)", 0.00, 1.00, 0.10, 0.01, format="%.2f", key="ex_vfq_thr")
 
-    st.caption("Salida si: rompe MA200 y/o Momentum 12-1 < 0; se refuerza con degradación de calidad (ΔVFQ 1Q < -umbral). Revisión trimestral.")
+    st.caption(
+        "Salida si: rompe MA200 y/o Momentum 12-1 < 0; "
+        "se refuerza con degradación de calidad (ΔVFQ 1Q < -umbral). Revisión trimestral."
+    )
 
-    # Carga opcional de histórico de calidad
+    # 1) Carga opcional de histórico de calidad
     vfq_hist = None
-    up_vfq_hist = st.file_uploader("Histórico de calidad (opcional) — columnas: symbol,date,VFQ", type=["csv"])
+    up_vfq_hist = st.file_uploader(
+        "Histórico de calidad (opcional) — columnas: symbol,date,VFQ",
+        type=["csv"],
+        key="vfq_hist_uploader"
+    )
     if up_vfq_hist is not None:
         try:
             vfq_hist = pd.read_csv(up_vfq_hist)
-            # normalizamos nombres
             vfq_hist.columns = [c.strip() for c in vfq_hist.columns]
+            # normaliza tipos
+            if "date" in vfq_hist.columns:
+                vfq_hist["date"] = pd.to_datetime(vfq_hist["date"])
             st.success(f"Histórico de calidad cargado: {vfq_hist.shape}")
         except Exception as e:
             st.error(f"No pude leer histórico de calidad: {e}")
+            vfq_hist = None
 
+    # 2) Fallback: si NO subiste histórico pero sí hay Quality (FMP) en Entradas,
+    # construimos una "foto actual" para mostrar VFQ y habilitar columna de calidad.
+    if vfq_hist is None and st.session_state.get("quality_df") is not None:
+        qdf_ss = st.session_state["quality_df"]
+        if isinstance(qdf_ss, pd.DataFrame) and not qdf_ss.empty:
+            cols_ok = {"symbol", "QualityScore"}.issubset(set(qdf_ss.columns))
+            if cols_ok:
+                vfq_hist = (
+                    qdf_ss.rename(columns={"QualityScore": "VFQ"})[["symbol", "VFQ"]]
+                          .assign(date=pd.to_datetime(pd.Timestamp.today().date()))
+                )
+                st.info(
+                    "Usando QualityScore de FMP (foto actual) para reforzar reglas de salida. "
+                    "Sube un CSV histórico para evaluar ΔVFQ trimestral real."
+                )
+
+    # 3) Construcción de tabla de salidas
     try:
         panel = load_prices_panel(symbols + [bench], start.isoformat(), end.isoformat(), cache_key="pm_panel")
         bench_px = load_benchmark(bench, start.isoformat(), end.isoformat())
 
-        from qvm_trend.pm.exits import build_exit_table  # usa el parche nuevo
+        from qvm_trend.pm.exits import build_exit_table  # versión parcheada que acepta vfq_hist
 
         table = build_exit_table(
             panel=panel,
             bench_close=None if bench_px is None else bench_px.get("close"),
             ma_window=int(ma_window),
             mom_lookback=int(mom_lookback),
-            review_freq="Q",
-            vfq_hist=vfq_hist,
+            review_freq="Q",              # revisión trimestral
+            vfq_hist=vfq_hist,            # puede venir del CSV o del fallback FMP (foto actual)
             vfq_col="VFQ",
             vfq_delta_thr=float(vfq_delta_thr),
         )
 
-        if table.empty:
+        if table is None or table.empty:
             st.warning("No se pudo generar la tabla de salidas.")
         else:
-            # Filtro por acción
-            act_sel = st.multiselect("Filtrar por acción", options=["EXIT","TRIM","HOLD"], default=["EXIT","TRIM"])
+            # Orden y columnas sugeridas
+            preferred_cols = [
+                "symbol", "price_last", "ma_flag", "mom_flag",
+                "vfq_last", "vfq_prev", "vfq_delta", "quality_flag",
+                "reason", "action", "next_review"
+            ]
+            cols_show = [c for c in preferred_cols if c in table.columns] or table.columns.tolist()
+            table = table[cols_show].copy()
+
+            # Filtros rápidos
+            act_sel = st.multiselect("Filtrar por acción", options=["EXIT", "TRIM", "HOLD"], default=["EXIT", "TRIM"])
             if act_sel:
                 table = table[table["action"].isin(act_sel)]
 
-            # Quita símbolos manualmente si quieres
             sym_del = st.multiselect("Eliminar símbolos de la tabla", options=sorted(table["symbol"].unique().tolist()))
             if sym_del:
                 table = table[~table["symbol"].isin(sym_del)]
+
+            # Formato
+            num_cols = [c for c in ["price_last", "vfq_last", "vfq_prev", "vfq_delta"] if c in table.columns]
+            if num_cols:
+                for c in num_cols:
+                    if c == "vfq_delta":
+                        table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:+.2f}" if pd.notna(x) else "")
+                    elif c == "price_last":
+                        table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:,.2f}" if pd.notna(x) else "")
+                    else:
+                        table[c] = pd.to_numeric(table[c], errors="coerce").map(lambda x: f"{x:.2f}" if pd.notna(x) else "")
 
             st.dataframe(table, use_container_width=True)
 
