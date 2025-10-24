@@ -1,0 +1,61 @@
+# --- Python / Streamlit project .gitignore ---
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs / Editors
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build / Dist
+build/
+dist/
+*.egg-info/
+
+# Test / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/*.yaml
+
+# Data exports / artifacts
+exports/
+*/exports/*
+*.csv
+*.tsv
+*.parquet
+
+# Logs
+logs/
+*.log
+
+# Local configs
+*.env
+.env.*
+.envrc
+
+# Misc
+*.bak
+*.tmp
