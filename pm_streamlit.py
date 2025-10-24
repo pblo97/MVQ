@@ -1,18 +1,57 @@
+import os, sys
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import date
 
-import os, sys
-ROOT = os.path.abspath(os.path.dirname(__file__))  # carpeta donde vive pm_streamlit.py
+# --- RUTA DEL PROYECTO ---
+ROOT = os.path.abspath(os.path.dirname(__file__))          # .../mvq
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-# ==== imports del paquete ====
+# --- Inicialización de paquetes (por si faltan) ---
+for d in ["qvm_trend", "qvm_trend/macro", "qvm_trend/pm"]:
+    p = os.path.join(ROOT, d, "__init__.py")
+    if not os.path.exists(p):
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("# package\n")
+        except Exception:
+            pass
+
+# ==== imports del paquete (con diagnóstico) ====
 from qvm_trend.data_io import load_prices_panel, load_benchmark, DEFAULT_START, DEFAULT_END
-from qvm_trend.pm.orchestrator import build_portfolio
 from qvm_trend.pm.exits import build_exit_table
-from qvm_trend.macro.macro_score import z_to_regime, macro_z_from_series
+
+# Intento robusto de import del macro_score:
+try:
+    from qvm_trend.macro.macro_score import z_to_regime, macro_z_from_series
+except Exception as e:
+    # Muestra el error real (Streamlit suele redacted)
+    st.error(f"Error importando qvm_trend.macro.macro_score: {type(e).__name__}: {e}")
+    # Fallback mínimo para no romper la app mientras depuras:
+    from dataclasses import dataclass
+    @dataclass
+    class _Reg:
+        label: str
+        z: float
+        m_multiplier: float
+        beta_cap: float
+        vol_cap: float
+    def z_to_regime(z: float) -> _Reg:
+        # reglas suaves por z-score
+        if z <= -0.5:  # OFF
+            return _Reg("OFF", z, 0.70, 0.60, 0.03)
+        if z >= 0.5:   # ON
+            return _Reg("ON",  z, 1.25, 1.25, 0.07)
+        return _Reg("NEUTRAL", z, 0.95, 1.00, 0.05)
+    def macro_z_from_series(s: pd.Series) -> float:
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        return float((s - s.mean())/(s.std(ddof=1)+1e-12)).iloc[-1] if len(s) else 0.0
+
+# Importa orchestrator DESPUÉS de tener z_to_regime disponible
+from qvm_trend.pm.orchestrator import build_portfolio
 
 st.set_page_config(page_title="Gestión de Cartera", page_icon="🧭", layout="wide")
 
