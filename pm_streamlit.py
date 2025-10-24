@@ -1,4 +1,5 @@
 # pm_streamlit.py
+# pm_streamlit.py
 import os, io
 import numpy as np
 import pandas as pd
@@ -7,7 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
 
-# === TUS LOADERS / HELPERS ===
+# === Loaders / Helpers tuyos ===
 from qvm_trend.data_io import load_prices_panel, load_benchmark, DEFAULT_START, DEFAULT_END
 from qvm_trend.stats import beta_vs_bench, win_loss_stats  # asumimos existen
 
@@ -22,10 +23,9 @@ st.markdown("""
 
 # ===================== PERSISTENCIA REMOTA (GitHub Gist) =====================
 # Secrets necesarios en Streamlit Cloud (Settings → Secrets):
-# GITHUB_TOKEN = "ghp_..."
-# GIST_ID = "abc123..."         (id del gist)
+# GITHUB_TOKEN  = "ghp_..."
+# GIST_ID       = "abc123..."          (id del gist)
 # GIST_FILENAME = "portfolio_symbols.csv"
-
 from github import Github, InputFileContent
 
 def _gh():
@@ -96,15 +96,26 @@ def _cached_bench(bench, start, end):
     return load_benchmark(bench, start, end)
 
 # ===================== UI PRINCIPAL =====================
-st.title("🧮 Gestión de Cartera (Gist + Análisis)")
+st.title("🧮 Gestión de Cartera (Gist + Kelly robusto)")
 
 with st.sidebar:
     st.markdown("### Parámetros de sizing")
-    method = st.selectbox("Método de pesos", ["Kelly fraccionado", "Equal Weight", "Risk Parity (Inv-Vol)", "Mean–Variance (Σ⁻¹μ, heur.)"])
+    method = st.selectbox(
+        "Método de pesos",
+        ["Kelly fraccionado", "Equal Weight", "Risk Parity (Inv-Vol)", "Mean–Variance (Σ⁻¹μ, heur.)"],
+        index=0
+    )
     base_kelly = st.slider("Fracción Kelly", 0.1, 1.0, 0.5, 0.1)
     vol_cap = st.number_input("Cap por posición (fracción del equity)", 0.01, 0.20, 0.05, 0.01, format="%.2f")
     beta_cap = st.number_input("Cap ∑(β·w) <=", 0.25, 2.0, 1.0, 0.05)
     enforce_sum1 = st.toggle("Forzar ∑w = 1.0 (después de beta cap)", value=True)
+
+    st.markdown("---")
+    st.markdown("### Kelly avanzado")
+    winsor_p = st.slider("Winsor p (cola)", 0.0, 0.10, 0.05, 0.01)
+    t0 = st.slider("Umbral t-stat (prudencia)", 1.0, 4.0, 2.0, 0.1)
+    lam_blend = st.slider("λ (mezcla con μ/σ²)", 0.0, 0.5, 0.2, 0.05)
+    min_months = st.number_input("Mín. meses por activo", 6, 120, 36, 6)
 
     st.markdown("---")
     st.markdown("### Datos")
@@ -126,7 +137,6 @@ with c0:
     )
 
 with c1:
-    # Descargar CSV
     pf = st.session_state["pm_portfolio"]
     st.download_button(
         "⬇️ Descargar cartera (CSV)",
@@ -135,7 +145,6 @@ with c1:
         mime="text/csv",
         use_container_width=True
     )
-    # Subir CSV para actualizar
     up = st.file_uploader("Subir cartera (CSV)", type=["csv"])
     replace = st.toggle("Reemplazar completamente al subir", value=False)
     if up is not None:
@@ -187,28 +196,60 @@ if ok_rm:
 
 st.markdown("---")
 
-# ===================== CÁLCULO DE PESOS + ANÁLISIS =====================
-st.subheader("Cálculo de pesos y análisis")
-run_btn = st.button("🧮 Calcular", type="primary", use_container_width=True)
+# ===================== KELLY ROBUSTO & MÉTRICAS =====================
+def _winsor_series(x: pd.Series, p: float) -> pd.Series:
+    if p <= 0 or x.empty: return x
+    lo, hi = x.quantile(p), x.quantile(1-p)
+    return x.clip(lower=lo, upper=hi)
+
+def _kelly_p_b(p: float, payoff: float) -> float:
+    if payoff is None or payoff <= 0: return 0.0
+    k = p - (1-p)/payoff
+    return float(max(0.0, min(1.0, k)))
+
+def _kelly_merton(mu: float, sigma: float) -> float:
+    if sigma is None or sigma <= 1e-9: return 0.0
+    k = mu / (sigma**2)
+    return float(max(0.0, min(1.0, k)))
 
 def _monthly(series_daily: pd.Series) -> pd.Series:
     series_daily = series_daily.dropna()
     if series_daily.empty: return series_daily
     return series_daily.resample("M").apply(lambda x: (1 + x).prod() - 1).dropna()
 
-def _stats_per_symbol(ser_m: pd.Series, bench_m: pd.Series):
-    p, avg_win, avg_loss = win_loss_stats(ser_m)          # HitRate, AvgWin, AvgLoss
-    mu = ser_m.mean()                                      # media mensual
-    sigma = ser_m.std()                                    # vol mensual
-    sharpe_m = mu / sigma if sigma and sigma > 0 else np.nan
-    b = abs(avg_win / avg_loss) if (avg_loss not in (0, None)) else np.nan
-    kelly = max(0.0, min(1.0, p - (1.0 - p) / b)) if (b and b>0) else 0.0
-    beta = beta_vs_bench(ser_m, bench_m)
-    return dict(HitRate=p, AvgWin=avg_win, AvgLoss=avg_loss, Payoff=(abs(avg_win/avg_loss) if (avg_loss not in (0, None)) else np.nan),
-                Kelly=kelly, Beta=beta, Mu=mu, Sigma=sigma, Sharpe_m=sharpe_m)
+def _stats_per_symbol(ser_m: pd.Series, bench_m: pd.Series,
+                      winsor_p: float, t0: float, min_months: int, lam_blend: float):
+    ser_m = ser_m.dropna()
+    n = len(ser_m)
+    if n < min_months:
+        return dict(valid=False)
+
+    rw = _winsor_series(ser_m, winsor_p)
+    wins = (rw > 0).sum()
+    p_hat = (wins + 0.5) / (n + 1)  # Jeffreys prior
+
+    avg_win = rw[rw > 0].mean() if (rw > 0).any() else np.nan
+    avg_loss = rw[rw < 0].mean() if (rw < 0).any() else np.nan
+    payoff = abs(avg_win / avg_loss) if (avg_loss not in (0, None)) else np.nan
+
+    mu = rw.mean()
+    sigma = rw.std(ddof=1)
+    se = sigma / np.sqrt(n) if sigma and sigma>0 else np.nan
+    t_stat = float(mu / se) if (se and se>0) else 0.0
+
+    beta = beta_vs_bench(rw, bench_m.reindex(rw.index).dropna())
+
+    k1 = _kelly_p_b(p_hat, payoff) if not np.isnan(payoff) else 0.0
+    k2 = _kelly_merton(mu, sigma)
+    u = float(np.clip(t_stat / max(t0, 1e-9), 0.0, 1.0))
+    k_blend = u * ((1 - lam_blend) * k1 + lam_blend * k2)
+
+    return dict(valid=True, HitRate=p_hat, AvgWin=avg_win, AvgLoss=avg_loss,
+                Payoff=payoff, Kelly_raw=k1, Kelly_blend=k_blend,
+                Beta=beta, Mu=mu, Sigma=sigma, Sharpe_m=(mu/sigma if sigma and sigma>0 else np.nan),
+                n_months=n, t_stat=t_stat)
 
 def _risk_parity_weights(sigmas: np.ndarray, cap: float):
-    # w ∝ 1/σ  (sin short), capping por posición
     inv = np.where(sigmas>0, 1.0/np.maximum(sigmas, 1e-8), 0.0)
     if inv.sum() == 0: return np.zeros_like(inv)
     w = inv / inv.sum()
@@ -217,16 +258,12 @@ def _risk_parity_weights(sigmas: np.ndarray, cap: float):
     return w / s if s>0 else w
 
 def _mean_variance_weights(mu: np.ndarray, cov: np.ndarray, cap: float):
-    # Heurístico: w ∝ Σ^{-1} μ , con no-short y cap
     try:
         inv = np.linalg.pinv(cov + 1e-8*np.eye(len(cov)))
         raw = inv @ mu
         raw = np.maximum(raw, 0.0)        # no short
-        if raw.sum() == 0: 
-            w = np.ones_like(raw) / len(raw)
-        else:
-            w = raw / raw.sum()
-        w = np.minimum(w, cap)            # cap por posición
+        w = raw / raw.sum() if raw.sum() > 0 else np.ones_like(raw)/len(raw)
+        w = np.minimum(w, cap)
         s = w.sum()
         return w / s if s>0 else w
     except Exception:
@@ -239,19 +276,21 @@ def _apply_beta_cap(weights: np.ndarray, betas: np.ndarray, beta_cap: float):
         scale = beta_cap / total_beta_w
     return weights * scale
 
+# ===================== CÁLCULO DE PESOS + ANÁLISIS =====================
+st.subheader("Cálculo de pesos y análisis")
+run_btn = st.button("🧮 Calcular", type="primary", use_container_width=True)
+
 if run_btn:
     pf = st.session_state["pm_portfolio"]
     syms = pf["symbol"].tolist() if not pf.empty else []
     if not syms:
         st.warning("Cartera vacía. Agrega símbolos arriba.")
     else:
-        # Fechas extendidas para estadísticas
         extend_days = int(extend_months * 30)
         start_ext = (pd.to_datetime(start) - pd.Timedelta(days=extend_days)).date().isoformat()
         end_iso = end.isoformat()
 
         try:
-            # ↓↓↓ DATOS (cacheados) ↓↓↓
             pnl = _cached_prices(syms + [bench], start_ext, end_iso, cache_key="pm_panel")
             if bench not in pnl:
                 st.error(f"No pude cargar el benchmark '{bench}'.")
@@ -259,7 +298,7 @@ if run_btn:
                 bench_daily = pnl[bench]["close"].pct_change().dropna()
                 bench_m = _monthly(bench_daily)
 
-                # --- Construye tabla de métricas por símbolo ---
+                # --- Métricas por símbolo ---
                 rows, used = [], []
                 sym_series_m = {}
                 for s in syms:
@@ -268,19 +307,21 @@ if run_btn:
                     ser_d = pnl[s]["close"].pct_change().dropna()
                     ser_m = _monthly(ser_d)
                     common = ser_m.index.intersection(bench_m.index)
-                    if len(common) < 6:  # al menos 6 meses para algo de estabilidad
+                    if len(common) < min_months:
                         continue
                     ser_m = ser_m.loc[common]
                     bench_mc = bench_m.loc[common]
 
-                    stt = _stats_per_symbol(ser_m, bench_mc)
+                    stt = _stats_per_symbol(ser_m, bench_mc, winsor_p, t0, min_months, lam_blend)
+                    if not stt.get("valid", False):
+                        continue
                     rows.append(dict(symbol=s, **stt))
                     used.append(s)
                     sym_series_m[s] = ser_m
 
                 dfm = pd.DataFrame(rows)
                 if dfm.empty:
-                    st.warning("No hay datos suficientes (pocos meses o tickers sin serie).")
+                    st.warning("No hay datos suficientes (historial mensual insuficiente).")
                     st.stop()
 
                 # --- Pesos según método ---
@@ -296,22 +337,21 @@ if run_btn:
                     w = _risk_parity_weights(sigmas, caps)
                 elif method == "Mean–Variance (Σ⁻¹μ, heur.)":
                     mu = dfm["Mu"].values
-                    # Cov mensual entre símbolos (alineando índices)
                     mret = pd.DataFrame({s: sym_series_m[s] for s in used}).dropna()
                     cov = np.cov(mret.values.T)
                     w = _mean_variance_weights(mu, cov, caps)
-                else:  # Kelly fraccionado
-                    kelly = dfm["Kelly"].values
-                    w = np.minimum(base_kelly * kelly, caps)
+                else:  # Kelly fraccionado ROBUSTO
+                    kelly_vec = dfm["Kelly_blend"].fillna(0).values
+                    w = np.minimum(base_kelly * kelly_vec, caps)
                     if w.sum() == 0:
                         w = np.ones(n) / n
                     else:
                         w = w / w.sum()
 
-                # --- Aplica cap de beta ---
+                # --- Cap de beta ---
                 w_beta = _apply_beta_cap(w, betas, float(beta_cap))
 
-                # --- (Opcional) Forzar suma 1 luego de beta cap ---
+                # --- Forzar suma 1 (opcional) ---
                 w_final = w_beta.copy()
                 if enforce_sum1 and w_final.sum() > 0:
                     w_final = w_final / w_final.sum()
@@ -319,10 +359,13 @@ if run_btn:
                 dfm["w_prop"] = w
                 dfm["w_final"] = w_final
                 dfm["beta_contrib"] = dfm["Beta"].fillna(1.0) * dfm["w_final"]
+
                 st.subheader("Métricas por símbolo & Pesos")
                 st.dataframe(
-                    dfm[["symbol","HitRate","AvgWin","AvgLoss","Payoff","Kelly","Beta","Mu","Sigma","Sharpe_m","w_final","beta_contrib"]]\
-                       .rename(columns={"Mu":"Mu_m","Sigma":"Sigma_m","Sharpe_m":"Sharpe_m","w_final":"weight","beta_contrib":"beta_w"}),
+                    dfm[["symbol","n_months","HitRate","AvgWin","AvgLoss","Payoff",
+                         "Kelly_raw","Kelly_blend","t_stat","Beta","Mu","Sigma","Sharpe_m",
+                         "w_final","beta_contrib"]]\
+                       .rename(columns={"w_final":"weight","beta_contrib":"beta_w","Mu":"Mu_m","Sigma":"Sigma_m"}),
                     use_container_width=True, hide_index=True
                 )
 
@@ -344,7 +387,7 @@ if run_btn:
 
                 st.info(f"sum(beta_w) = {dfm['beta_contrib'].sum():.3f} (cap={beta_cap})   |   sum(w) = {dfm['w_final'].sum():.3f}")
 
-                # --- Correlación (mensual) ---
+                # --- Correlaciones (mensual) ---
                 st.markdown("### Correlaciones (mensuales)")
                 mret = pd.DataFrame({s: sym_series_m[s] for s in used}).dropna()
                 corr = mret.corr()
@@ -353,9 +396,8 @@ if run_btn:
                 ax.set_title("Matriz de correlaciones mensuales")
                 st.pyplot(fig, use_container_width=True)
 
-                # --- Cartera vs Benchmark (estática con w constantes) ---
+                # --- Cartera vs Benchmark (w constantes) ---
                 st.markdown("### Cartera vs Benchmark (estática con w constantes)")
-                # Serie diaria de portafolio con w_final constantes
                 daily = pd.DataFrame({
                     s: pnl[s]["close"].pct_change() for s in used
                     if s in pnl and "close" in pnl[s].columns
@@ -392,7 +434,7 @@ if run_btn:
                 ax.set_title("Histograma retornos mensuales")
                 st.pyplot(fig, use_container_width=True)
 
-                # --- Descarga pesos (ASCII) ---
+                # --- Descarga pesos (CSV, ASCII) ---
                 out = dfm[["symbol","w_final","beta_contrib"]].rename(
                     columns={"w_final":"weight", "beta_contrib":"beta_w"}
                 )
