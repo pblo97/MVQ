@@ -73,33 +73,96 @@ with tab_macro:
     beta_cap_sug = None
     pos_cap_sug  = None
     overlay_gate_series = None
+    macro_bundle = None
 
     with c1:
         up_macro = st.file_uploader("macro_monitor_bundle.csv", type=["csv"])
         if up_macro is not None:
             try:
                 mb = pd.read_csv(up_macro, index_col=0, parse_dates=True)
+                macro_bundle = mb.sort_index()
+                st.success(f"Bundle macro cargado: {macro_bundle.shape[0]} filas, {macro_bundle.shape[1]} columnas")
 
-                # 1) Intentar usar macro_z del bundle
-                if "macro_z" in mb.columns and pd.notna(mb["macro_z"]).any():
-                    macro_z_val = float(mb["macro_z"].dropna().iloc[-1])
+                # 1) macro_z directo si viene; si no, intenta COMPOSITE_Z / COMPOSITE_PCA usando macro_z_from_series
+                if "macro_z" in macro_bundle.columns and pd.notna(macro_bundle["macro_z"]).any():
+                    macro_z_val = float(macro_bundle["macro_z"].dropna().iloc[-1])
                 else:
-                    # 2) Si no viene, calcúlalo del composite
-                    if "COMPOSITE_Z" in mb.columns and pd.notna(mb["COMPOSITE_Z"]).any():
-                        macro_z_val = float(macro_z_from_series(mb["COMPOSITE_Z"]))
-                    elif "COMPOSITE_PCA" in mb.columns and pd.notna(mb["COMPOSITE_PCA"]).any():
-                        macro_z_val = float(macro_z_from_series(mb["COMPOSITE_PCA"]))
+                    if "COMPOSITE_Z" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_Z"]).any():
+                        macro_z_val = float(macro_z_from_series(macro_bundle["COMPOSITE_Z"]))
+                    elif "COMPOSITE_PCA" in macro_bundle.columns and pd.notna(macro_bundle["COMPOSITE_PCA"]).any():
+                        macro_z_val = float(macro_z_from_series(macro_bundle["COMPOSITE_PCA"]))
                     else:
                         macro_z_val = 0.0  # fallback
 
-                # Sugerencias de caps (si el bundle las trae)
-                if "beta_cap_sug" in mb.columns:
-                    beta_cap_sug = float(mb["beta_cap_sug"].dropna().iloc[-1])
-                if "pos_cap_sug" in mb.columns:
-                    pos_cap_sug  = float(mb["pos_cap_sug"].dropna().iloc[-1])
+                if "beta_cap_sug" in macro_bundle.columns:
+                    beta_cap_sug = float(macro_bundle["beta_cap_sug"].dropna().iloc[-1])
+                if "pos_cap_sug" in macro_bundle.columns:
+                    pos_cap_sug  = float(macro_bundle["pos_cap_sug"].dropna().iloc[-1])
 
-                overlay_gate_series = mb.get("Overlay_Signal")
-                st.success(f"Macro bundle OK (z={macro_z_val:.2f})")
+                overlay_gate_series = macro_bundle.get("Overlay_Signal")
+                st.success(f"Macro listo (z={macro_z_val:.2f})")
+
+                # ==== Visualizaciones interactivas ====
+                st.markdown("### Gráficos del bundle")
+                g1, g2 = st.columns(2)
+                with g1:
+                    cols_plot = [c for c in ["COMPOSITE_Z","COMPOSITE_PCA"] if c in macro_bundle.columns]
+                    if cols_plot:
+                        dfp = macro_bundle[cols_plot].rename_axis("Date").reset_index()
+                        import plotly.express as px
+                        fig = px.line(dfp, x="Date", y=cols_plot, title="Composites macro")
+                        st.plotly_chart(fig, use_container_width=True)
+                with g2:
+                    if "Overlay_Signal" in macro_bundle.columns:
+                        dfov = macro_bundle["Overlay_Signal"].rename_axis("Date").reset_index()
+                        import plotly.express as px
+                        fig = px.step(dfov, x="Date", y="Overlay_Signal", title="Overlay (0/1)", markers=False)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                g3, g4 = st.columns(2)
+                with g3:
+                    # Régimen derivado desde macro_z (o desde composite si no hay)
+                    reg_series = None
+                    try:
+                        mz_series = None
+                        if "macro_z" in macro_bundle.columns:
+                            mz_series = macro_bundle["macro_z"]
+                        elif "COMPOSITE_Z" in macro_bundle.columns:
+                            mz_series = macro_bundle["COMPOSITE_Z"]
+                        if mz_series is not None:
+                            # mapa simple a régimen usando z_to_regime por punto
+                            reg_series = mz_series.dropna().apply(lambda z: z_to_regime(float(z)).label)
+                            dfreg = reg_series.rename("Regime").rename_axis("Date").reset_index()
+                            import plotly.express as px
+                            fig = px.area(dfreg, x="Date", y=dfreg["Regime"].apply(lambda r: 1 if r=="ON" else (0 if r=="OFF" else 0.5)),
+                                          title="Régimen (OFF/NEU/ON)", range_y=[-0.1, 1.1])
+                            fig.update_yaxes(tickvals=[0,0.5,1.0], ticktext=["OFF","NEU","ON"])
+                            st.plotly_chart(fig, use_container_width=True)
+                    except Exception as _:
+                        pass
+                with g4:
+                    # Equity naive vs filtered si están
+                    if {"Excess_Ret","Ret_Filtered"}.issubset(macro_bundle.columns):
+                        df_ret = macro_bundle[["Excess_Ret","Ret_Filtered"]].dropna().copy()
+                        df_ret["EQ_naive"] = (1 + df_ret["Excess_Ret"]).cumprod()
+                        df_ret["EQ_filtered"] = (1 + df_ret["Ret_Filtered"]).cumprod()
+                        import plotly.express as px
+                        fig = px.line(df_ret.rename_axis("Date").reset_index(),
+                                      x="Date", y=["EQ_naive","EQ_filtered"],
+                                      title="Curva de capital: naive vs filtrado")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                # KPIs rápidos si hay retornos
+                if {"Excess_Ret","Ret_Filtered"}.issubset(macro_bundle.columns):
+                    ret = macro_bundle["Excess_Ret"].dropna()
+                    ref = macro_bundle["Ret_Filtered"].dropna()
+                    def _safe_sharpe(x):
+                        x = x.dropna()
+                        return float(x.mean()/x.std()) if x.std() not in (None,0,np.nan) and np.isfinite(x.std()) else np.nan
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("Sharpe naive", f"{_safe_sharpe(ret):.3f}")
+                    k2.metric("Sharpe filtrado", f"{_safe_sharpe(ref):.3f}")
+                    k3.metric("% tiempo ON", f"{100.0*float(macro_bundle.get('Overlay_Signal', pd.Series()).mean()):.1f}%" if "Overlay_Signal" in macro_bundle.columns else "—")
 
             except Exception as e:
                 st.error(f"Error leyendo macro bundle: {e}")
@@ -111,21 +174,20 @@ with tab_macro:
 
     macro_z_eff = macro_z_val if macro_z_val is not None else macro_z_slider
 
-    # Régimen y multiplicadores
+    # Régimen y multiplicadores (desde z_to_regime)
     reg = z_to_regime(float(macro_z_eff))
     k1,k2,k3,k4 = st.columns(4)
     k1.metric("macro_z", f"{reg.z:.2f}")
     k2.metric("Régimen", reg.label)
     k3.metric("M_macro", f"{reg.m_multiplier:.2f}")
-    k4.metric("Sugerencia β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
+    k4.metric("β cap / pos cap", f"{reg.beta_cap:.2f} / {reg.vol_cap:.2f}")
 
     # Guardar en sesión para otras pestañas
     st.session_state["macro_z_eff"] = macro_z_eff
-    st.session_state["beta_cap_sug"] = beta_cap_sug
-    st.session_state["pos_cap_sug"]  = pos_cap_sug
+    # Si bundle trae sugerencias, priorízalas; si no, usa las del régimen base
+    st.session_state["beta_cap_sug"] = beta_cap_sug if beta_cap_sug is not None else reg.beta_cap
+    st.session_state["pos_cap_sug"]  = pos_cap_sug  if pos_cap_sug  is not None else reg.vol_cap
     st.session_state["overlay_gate_series"] = overlay_gate_series
-
-
 # ------------------ CARTERA ------------------
 with tab_port:
     st.subheader("Pesos y métricas (Kelly + Macro + Quality)")
