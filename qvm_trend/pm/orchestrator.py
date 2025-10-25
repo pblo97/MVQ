@@ -191,12 +191,12 @@ def build_portfolio(
     shrink_kappa: int = 20,
     ewm_span: int = 12,
     lambda_corr: float = 0.5,
-    # compat
+    # Mezcla anterior (compat)
     t0: float = 2.0,
     lam_blend: float = 0.2,
     # Macro / quality
     macro_z: float = 0.0,
-    quality_df: pd.DataFrame | None = None,  # ['symbol','QualityScore'] o ['symbol','VFQ']
+    quality_df: pd.DataFrame | None = None,   # ['symbol','QualityScore'] o ['symbol','VFQ']
     alpha_off: float = 0.30,
     alpha_neu: float = 0.10,
     alpha_on: float = 0.00,
@@ -211,7 +211,7 @@ def build_portfolio(
     Devuelve DF ordenado por 'weight' con:
     ['symbol','p','payoff','k_bin','k_cont','k_raw','k_pen','mu','sigma','beta','n','weight','beta_w']
     """
-    # ========= 1) Datos de precios =========
+    # 1) Precios y retornos
     pnl = load_prices_panel(symbols + [bench], start, end, cache_key="pm_panel")
     bench_df = pnl.get(bench)
     if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
@@ -220,17 +220,12 @@ def build_portfolio(
     bench_d = bench_df["close"].pct_change().dropna()
     bench_m = monthly_rets(bench_d)
 
-    ret_m: dict[str, pd.Series] = {}
-    ret_excess: dict[str, pd.Series] = {}
-    rows: list[dict] = []
-    used: list[str] = []
-
+    ret_m, ret_excess, rows, used = {}, {}, [], []
     for s in symbols:
-        dfp = pnl.get(s)
-        if dfp is None or dfp.empty or "close" not in dfp.columns:
+        df = pnl.get(s)
+        if df is None or df.empty or "close" not in df.columns:
             continue
-
-        a_d = dfp["close"].pct_change().dropna()
+        a_d = df["close"].pct_change().dropna()
         a_m = monthly_rets(a_d)
         common = a_m.index.intersection(bench_m.index)
         if len(common) < int(min_months):
@@ -242,7 +237,6 @@ def build_portfolio(
         if ex_m.size < int(min_months):
             continue
 
-        # Guardar series para correlación
         ret_m[s] = a_m
         ret_excess[s] = ex_m
 
@@ -262,57 +256,68 @@ def build_portfolio(
     if df.empty:
         return df
 
-    # ========= 2) Penalización por correlación → k_pen =========
-    ret_excess_df = pd.DataFrame(ret_excess)  # cols=símbolos, idx=mes
+    # 2) Penalización por correlación → k_pen
+    ret_excess_df = pd.DataFrame(ret_excess)  # cols=símbolos
     k_pen = penalize_by_corr(
         df.set_index("symbol")["k_raw"],
         ret_excess_df,
         lambda_corr=lambda_corr
     )
 
-    # Asegura serie alineada
+    # asegurar índice y orden
     df = df.set_index("symbol")
     if not isinstance(k_pen, pd.Series):
         k_pen = pd.Series(k_pen, index=df.index)
     else:
         k_pen = k_pen.reindex(df.index)
 
-    # ---- Limpieza + floor suave (anti-ruido) ----
+    # ---- floor suave + mínimo de activos + mezcla diversificada ----
+    # a) floor suave (anti-ruido)
     k_pen = k_pen.clip(lower=0.0)
-    k_floor = 0.005  # 0.5% Kelly
+    k_floor = 0.001  # 0.1% de Kelly
     k_pen = k_pen.where(k_pen >= k_floor, 0.0)
 
-    # ---- Diversificación mínima (opcional) ----
-    min_active = 4
+    # b) diversificación mínima
+    min_active = 6
     actives = int((k_pen > 0).sum())
     if actives < min_active:
-        # 1) relaja el floor (mantén >0)
+        # relaja floor: cuenta todo >0
         k_pen = k_pen.where(k_pen > 0.0, 0.0)
         actives = int((k_pen > 0).sum())
-
         if actives < min_active:
-            # 2) enciende top por μ de exceso hasta llegar a min_active
+            # enciende por μ de exceso los top faltantes
+            need = min_active - actives
+            already = set(k_pen[k_pen > 0].index)
+            top_mu = df.loc[~df.index.isin(already), "mu"].sort_values(ascending=False)
+            push = top_mu.head(max(need, 0)).index
             eps = 1e-4
-            top_mu_idx = df["mu"].nlargest(min(min_active, len(df))).index
-            k_pen.loc[top_mu_idx] = np.maximum(k_pen.loc[top_mu_idx], eps)
+            k_pen.loc[push] = np.maximum(k_pen.loc[push], eps)
 
     df["k_pen"] = k_pen
 
-    # ========= 3) Peso base por Kelly fraccionado =========
+    # c) normaliza Kelly fraccionado
     k_base = df["k_pen"].fillna(0.0).clip(lower=0.0).values
     if k_base.sum() <= 0:
         w_k = np.ones(len(df)) / len(df)
     else:
         w_k = k_base / k_base.sum()
-    w_k = base_kelly * w_k  # fracción global Kelly
+    w_k = base_kelly * w_k
 
-    # ========= 4) Macro overlay y caps sugeridos =========
+    # d) mezcla diversificada estable sobre top-μ
+    eta = 0.15                   # 15% diversificado
+    N_u = max(min_active, min(8, len(df)))
+    u_idx = df["mu"].sort_values(ascending=False).head(N_u).index
+    u = pd.Series(0.0, index=df.index)
+    u.loc[u_idx] = 1.0 / N_u
+    w_k = (1.0 - eta) * w_k + eta * u.values
+
+    # 3) Overlay macro y caps efectivos
     reg = z_to_regime(float(macro_z))
     M_macro = reg.m_multiplier
     beta_cap_eff = min(float(beta_cap_user), float(reg.beta_cap))
-    pos_cap_eff = min(float(pos_cap), float(reg.vol_cap))
+    pos_cap_eff  = min(float(pos_cap), float(reg.vol_cap))
 
-    # ========= 5) Quality tilt (si llega) =========
+    # 4) Quality tilt
     if quality_df is not None and not quality_df.empty:
         if "QualityScore" in quality_df.columns:
             qmap = dict(zip(quality_df["symbol"].astype(str).str.upper(), quality_df["QualityScore"]))
@@ -322,28 +327,28 @@ def build_portfolio(
             qmap = {}
         q_series = pd.Series(df.index).astype(str).str.upper().map(qmap)
         q_series.index = df.index
-        q_series = q_series.fillna(df.get("mu", 0.0))  # fallback suave
+        q_series = q_series.fillna(df.get("mu", 0.0))
     else:
         q_series = df.get("mu", pd.Series(0.0, index=df.index))
 
     alpha = _pick_alpha(reg.label, alpha_off, alpha_neu, alpha_on)
     q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0).values
 
-    # ========= 6) Gate táctico para NUEVAS entradas =========
+    # 5) Gate táctico (bloqueo de nuevas si macro malo)
     T_gate = np.ones(len(df))
     if current_holdings is not None and float(macro_z) < float(allow_new_when_z_below):
         holdset = {h.upper() for h in current_holdings}
         is_new = ~pd.Series(df.index, index=df.index).astype(str).str.upper().isin(holdset)
         T_gate[is_new.values] = 0.0
 
-    # Combinar: Kelly * Macro * Quality * Gate
+    # 6) Combinar y normalizar
     w_base = w_k * M_macro * q_mult * T_gate
-    if w_base.sum() > 0:
-        w_base = w_base / w_base.sum()
+    if w_base.sum() <= 0:
+        w_base = w_k
     else:
-        w_base = w_k  # fallback
+        w_base = w_base / max(w_base.sum(), 1e-12)
 
-    # ========= 7) Caps finales (β y posición) =========
+    # 7) Caps finales y suma=1
     w_final = _finalize_weights(
         w_base,
         betas=df["beta"].fillna(1.0).values,
@@ -356,7 +361,7 @@ def build_portfolio(
     df["beta_w"] = df["beta"].fillna(1.0) * df["weight"]
     df = df.reset_index()
 
-    # ========= columnas para UI =========
+    # columnas para UI
     cols = ["symbol",
             "p", "payoff", "k_bin", "k_cont", "k_raw", "k_pen",
             "mu", "sigma", "beta", "n",
