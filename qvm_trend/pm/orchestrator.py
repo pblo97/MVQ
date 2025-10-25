@@ -191,7 +191,7 @@ def build_portfolio(
     shrink_kappa: int = 20,
     ewm_span: int = 12,
     lambda_corr: float = 0.5,
-    # Mezcla anterior (compat)
+    # compat
     t0: float = 2.0,
     lam_blend: float = 0.2,
     # Macro / quality
@@ -211,7 +211,7 @@ def build_portfolio(
     Devuelve DF ordenado por 'weight' con:
     ['symbol','p','payoff','k_bin','k_cont','k_raw','k_pen','mu','sigma','beta','n','weight','beta_w']
     """
-    # 1) Datos de precios
+    # ========= 1) Datos de precios =========
     pnl = load_prices_panel(symbols + [bench], start, end, cache_key="pm_panel")
     bench_df = pnl.get(bench)
     if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
@@ -220,15 +220,17 @@ def build_portfolio(
     bench_d = bench_df["close"].pct_change().dropna()
     bench_m = monthly_rets(bench_d)
 
-    ret_m = {}
-    ret_excess = {}
-    rows = []
-    used = []
+    ret_m: dict[str, pd.Series] = {}
+    ret_excess: dict[str, pd.Series] = {}
+    rows: list[dict] = []
+    used: list[str] = []
+
     for s in symbols:
-        df = pnl.get(s)
-        if df is None or df.empty or "close" not in df.columns:
+        dfp = pnl.get(s)
+        if dfp is None or dfp.empty or "close" not in dfp.columns:
             continue
-        a_d = df["close"].pct_change().dropna()
+
+        a_d = dfp["close"].pct_change().dropna()
         a_m = monthly_rets(a_d)
         common = a_m.index.intersection(bench_m.index)
         if len(common) < int(min_months):
@@ -240,6 +242,7 @@ def build_portfolio(
         if ex_m.size < int(min_months):
             continue
 
+        # Guardar series para correlación
         ret_m[s] = a_m
         ret_excess[s] = ex_m
 
@@ -252,7 +255,6 @@ def build_portfolio(
             min_months=min_months,
         )
         beta = _beta_vs_bench(a_m, b_m)
-
         rows.append({"symbol": s, **km, "beta": beta})
         used.append(s)
 
@@ -260,33 +262,57 @@ def build_portfolio(
     if df.empty:
         return df
 
-    # 2) Penalización por correlación → k_pen
-    ret_excess_df = pd.DataFrame(ret_excess)  # cols = símbolos
-    df = df.set_index("symbol")
-    k_pen = penalize_by_corr(df["k_raw"], ret_excess_df, lambda_corr=lambda_corr)
+    # ========= 2) Penalización por correlación → k_pen =========
+    ret_excess_df = pd.DataFrame(ret_excess)  # cols=símbolos, idx=mes
+    k_pen = penalize_by_corr(
+        df.set_index("symbol")["k_raw"],
+        ret_excess_df,
+        lambda_corr=lambda_corr
+    )
 
-    # === PATCH: floor suave tras penalización y antes de normalizar ===
-    # Evita que micro-ruido mantenga candidatos con k muy chica; si < k_floor => 0
-    k_floor = 0.005  # 0.5% Kelly
+    # Asegura serie alineada
+    df = df.set_index("symbol")
+    if not isinstance(k_pen, pd.Series):
+        k_pen = pd.Series(k_pen, index=df.index)
+    else:
+        k_pen = k_pen.reindex(df.index)
+
+    # ---- Limpieza + floor suave (anti-ruido) ----
     k_pen = k_pen.clip(lower=0.0)
+    k_floor = 0.005  # 0.5% Kelly
     k_pen = k_pen.where(k_pen >= k_floor, 0.0)
+
+    # ---- Diversificación mínima (opcional) ----
+    min_active = 4
+    actives = int((k_pen > 0).sum())
+    if actives < min_active:
+        # 1) relaja el floor (mantén >0)
+        k_pen = k_pen.where(k_pen > 0.0, 0.0)
+        actives = int((k_pen > 0).sum())
+
+        if actives < min_active:
+            # 2) enciende top por μ de exceso hasta llegar a min_active
+            eps = 1e-4
+            top_mu_idx = df["mu"].nlargest(min(min_active, len(df))).index
+            k_pen.loc[top_mu_idx] = np.maximum(k_pen.loc[top_mu_idx], eps)
 
     df["k_pen"] = k_pen
 
-    # 3) Peso base por Kelly fraccionado (normalización de k_pen)
-    den = float(k_pen.sum())
-    if den > 0:
-        w_k = base_kelly * (k_pen / den)
+    # ========= 3) Peso base por Kelly fraccionado =========
+    k_base = df["k_pen"].fillna(0.0).clip(lower=0.0).values
+    if k_base.sum() <= 0:
+        w_k = np.ones(len(df)) / len(df)
     else:
-        w_k = pd.Series(0.0, index=k_pen.index)
+        w_k = k_base / k_base.sum()
+    w_k = base_kelly * w_k  # fracción global Kelly
 
-    # 4) Macro overlay: multiplicador y caps efectivos
+    # ========= 4) Macro overlay y caps sugeridos =========
     reg = z_to_regime(float(macro_z))
     M_macro = reg.m_multiplier
     beta_cap_eff = min(float(beta_cap_user), float(reg.beta_cap))
     pos_cap_eff = min(float(pos_cap), float(reg.vol_cap))
 
-    # 5) Quality tilt (usa QualityScore o VFQ si existe)
+    # ========= 5) Quality tilt (si llega) =========
     if quality_df is not None and not quality_df.empty:
         if "QualityScore" in quality_df.columns:
             qmap = dict(zip(quality_df["symbol"].astype(str).str.upper(), quality_df["QualityScore"]))
@@ -296,31 +322,30 @@ def build_portfolio(
             qmap = {}
         q_series = pd.Series(df.index).astype(str).str.upper().map(qmap)
         q_series.index = df.index
-        # fallback: si no hay quality para alguno, usa mu estandarizada suave
-        q_series = q_series.fillna(df.get("mu", 0.0))
+        q_series = q_series.fillna(df.get("mu", 0.0))  # fallback suave
     else:
         q_series = df.get("mu", pd.Series(0.0, index=df.index))
 
     alpha = _pick_alpha(reg.label, alpha_off, alpha_neu, alpha_on)
-    q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0)
+    q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0).values
 
-    # 6) Gate táctico: bloquear NUEVAS si macro < umbral (mantiene holdings)
-    T_gate = pd.Series(1.0, index=df.index)
+    # ========= 6) Gate táctico para NUEVAS entradas =========
+    T_gate = np.ones(len(df))
     if current_holdings is not None and float(macro_z) < float(allow_new_when_z_below):
         holdset = {h.upper() for h in current_holdings}
-        is_new = ~pd.Index(df.index).astype(str).str.upper().isin(holdset)
-        T_gate[is_new] = 0.0
+        is_new = ~pd.Series(df.index, index=df.index).astype(str).str.upper().isin(holdset)
+        T_gate[is_new.values] = 0.0
 
-    # Combinar: Kelly fraccionado * macro * quality * gate
-    w_base = (w_k * M_macro * q_mult * T_gate)
-    if w_base.sum() <= 0:
-        w_base = w_k
+    # Combinar: Kelly * Macro * Quality * Gate
+    w_base = w_k * M_macro * q_mult * T_gate
+    if w_base.sum() > 0:
+        w_base = w_base / w_base.sum()
     else:
-        w_base = w_base / max(w_base.sum(), 1e-12)
+        w_base = w_k  # fallback
 
-    # 7) Caps finales (posición / beta) y normalización
+    # ========= 7) Caps finales (β y posición) =========
     w_final = _finalize_weights(
-        w_base.values,
+        w_base,
         betas=df["beta"].fillna(1.0).values,
         beta_cap=beta_cap_eff,
         pos_cap=pos_cap_eff,
@@ -331,7 +356,7 @@ def build_portfolio(
     df["beta_w"] = df["beta"].fillna(1.0) * df["weight"]
     df = df.reset_index()
 
-    # columnas para UI
+    # ========= columnas para UI =========
     cols = ["symbol",
             "p", "payoff", "k_bin", "k_cont", "k_raw", "k_pen",
             "mu", "sigma", "beta", "n",
