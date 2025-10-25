@@ -194,12 +194,12 @@ def build_portfolio(
     # Mezcla anterior (compat)
     t0: float = 2.0,
     lam_blend: float = 0.2,
-    # Macro / quality
+    # Macro / quality  ⬅️ defaults más agresivos
     macro_z: float = 0.0,
     quality_df: pd.DataFrame | None = None,   # ['symbol','QualityScore'] o ['symbol','VFQ']
-    alpha_off: float = 0.30,
-    alpha_neu: float = 0.10,
-    alpha_on: float = 0.00,
+    alpha_off: float = 0.40,   # antes 0.30
+    alpha_neu: float = 0.25,   # antes 0.10
+    alpha_on:  float = 0.15,   # antes 0.00
     # Caps y gating
     enforce_sum1: bool = True,
     pos_cap: float = 0.05,
@@ -209,6 +209,7 @@ def build_portfolio(
 ) -> pd.DataFrame:
     """Devuelve DF ordenado por 'weight' con:
     ['symbol','p','payoff','k_bin','k_cont','k_raw','k_pen','mu','sigma','beta','n','weight','beta_w']"""
+
     # 1) Precios y retornos
     pnl = load_prices_panel(symbols + [bench], start, end, cache_key="pm_panel")
     bench_df = pnl.get(bench)
@@ -268,12 +269,12 @@ def build_portfolio(
     else:
         k_pen = k_pen.reindex(df.index)
 
-    # ---- floor suave + mínimo de activos ----
+    # ---- floor y mínimo de activos (más concentrado) ----
     k_pen = pd.to_numeric(k_pen, errors="coerce").fillna(0.0).clip(lower=0.0)
-    k_floor = 0.001  # 0.1% Kelly
+    k_floor = 0.003  # ⬆️ 0.3% Kelly (antes 0.1%) — sube contraste
     k_pen = k_pen.where(k_pen >= k_floor, 0.0)
 
-    min_active = 6  # aseguramos al menos 6 nombres vivos
+    min_active = 4  # ⬇️ mínimo de nombres vivos
     actives = int((k_pen > 0).sum())
     if actives < min_active:
         # Relaja floor: vale todo > 0
@@ -291,7 +292,7 @@ def build_portfolio(
 
     df["k_pen"] = k_pen
 
-    # 3) Kelly fraccionado solo por k_pen (sin caer a 1/N salvo todo cero)
+    # 3) Kelly fraccionado solo por k_pen (sin mezcla uniforme)
     k_base = df["k_pen"].values
     sum_k = float(np.nansum(k_base))
     if sum_k <= 0:
@@ -300,16 +301,7 @@ def build_portfolio(
         w_k = (k_base / sum_k).astype(float)
     w_k = base_kelly * w_k
 
-    # 4) Mezcla diversificada SUAVE en top por k_pen (evita 1/N)
-    eta = 0.08  # 8% diversificado
-    N_u = min(max(min_active, 5), len(df))
-    top_by_k = pd.Series(k_base, index=df.index).nlargest(N_u).index
-    u = pd.Series(0.0, index=df.index, dtype=float)
-    u.loc[top_by_k] = 1.0 / N_u
-    # aseguro alineación
-    w_k = ((1.0 - eta) * w_k) + (eta * u.reindex(df.index).values)
-
-    # 5) Quality tilt
+    # 4) Quality tilt (más fuerte)
     if quality_df is not None and not quality_df.empty:
         if "QualityScore" in quality_df.columns:
             qmap = dict(zip(quality_df["symbol"].astype(str).str.upper(), quality_df["QualityScore"]))
@@ -322,11 +314,14 @@ def build_portfolio(
     else:
         q_series = pd.Series(0.0, index=df.index)
 
-    alpha = _pick_alpha(z_to_regime(float(macro_z)).label, alpha_off, alpha_neu, alpha_on)
-    q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0).astype(float).values
-
-    # 6) Macro overlay y gating
     reg = z_to_regime(float(macro_z))
+    alpha = _pick_alpha(reg.label, alpha_off, alpha_neu, alpha_on)
+    q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0).astype(float).values
+    # potencia extra opcional para acentuar tilt
+    tilt_power = 1.25
+    q_mult = np.power(q_mult, tilt_power)
+
+    # 5) Macro overlay y gating
     M_macro = float(reg.m_multiplier)
     beta_cap_eff = min(float(beta_cap_user), float(reg.beta_cap))
     pos_cap_eff  = min(float(pos_cap),       float(reg.vol_cap))
@@ -337,7 +332,7 @@ def build_portfolio(
         is_new = ~pd.Series(df.index, index=df.index).astype(str).str.upper().isin(holdset)
         T_gate[is_new.values] = 0.0
 
-    # 7) Combinar (y romper empates si quedaran casi iguales)
+    # 6) Combinar (con rompe-empates suave)
     w_base = (w_k * q_mult * M_macro * T_gate).astype(float)
     s = float(np.nansum(w_base))
     if s > 0:
@@ -345,12 +340,12 @@ def build_portfolio(
     else:
         w_base = np.ones_like(w_base) / max(len(w_base), 1)
 
-    # anti-empate: pequeño jitter determinístico por ranking de k_pen
+    # anti-empate determinístico por ranking de k_pen
     ranks = pd.Series(k_pen).rank(ascending=False, method="dense").reindex(df.index).fillna(0).values
     w_base = w_base + (ranks * 1e-6)
     w_base = w_base / max(float(np.nansum(w_base)), 1e-12)
 
-    # 8) Caps finales
+    # 7) Caps finales
     w_final = _finalize_weights(
         w_base,
         betas=df["beta"].fillna(1.0).values.astype(float),
