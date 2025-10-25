@@ -328,6 +328,36 @@ with tab_port:
         current_holdings=None  # o lista de tus posiciones ya abiertas
     )
 
+    # === KPIs de diversificación y uso de caps ===
+    weights = pd.to_numeric(dfw["weight"], errors="coerce").fillna(0.0)
+    betas   = pd.to_numeric(dfw["beta"], errors="coerce").fillna(1.0)
+
+    N_eff   = (1.0 / np.square(weights).sum()) if weights.sum() > 0 else 0.0
+    activos = int((weights > 1e-8).sum())
+
+    # Estos dos vienen de la pestaña Macro (ya los calculaste ahí)
+    beta_cap_eff = float(st.session_state.get("beta_cap_sug", beta_cap))
+    pos_cap_eff  = float(st.session_state.get("pos_cap_sug",  pos_cap))
+
+    cap_hits     = int((weights >= (pos_cap_eff - 1e-9)).sum())
+    cap_pct      = cap_hits / max(1, activos)
+
+    beta_total   = float((betas * weights).sum())
+    beta_util    = beta_total / max(beta_cap_eff, 1e-12)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("N efectivos", f"{N_eff:,.2f}", help="1 / Σ w_i²")
+    m2.metric("# activos", f"{activos}")
+    m3.metric("En cap posición", f"{cap_hits} ({cap_pct:.0%})", help="w_i ≥ pos_cap")
+    m4.metric("Uso de β-cap", f"{beta_util:.0%}", help="Σ (β·w) / β_cap")
+
+    # Mini-tabla con flags para ver rápido quién pega caps
+    df_kpis = dfw[["symbol","weight","beta"]].copy()
+    df_kpis["cap_pos"] = df_kpis["weight"] >= (pos_cap_eff - 1e-9)
+    df_kpis["beta_w"]  = df_kpis["beta"].fillna(1.0) * df_kpis["weight"]
+    df_kpis = df_kpis.sort_values("weight", ascending=False).reset_index(drop=True)
+    st.dataframe(df_kpis, use_container_width=True)
+
     if dfw.empty:
         st.warning("No se pudieron calcular pesos (verifica precios/fechas).")
         st.stop()
