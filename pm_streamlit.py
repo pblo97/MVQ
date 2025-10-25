@@ -352,25 +352,74 @@ with tab_port:
     m4.metric("Uso de β-cap", f"{beta_util:.0%}", help="Σ (β·w) / β_cap")
 
     # Mini-tabla con flags para ver rápido quién pega caps
-    df_kpis = dfw[["symbol","weight","beta"]].copy()
-    df_kpis["cap_pos"] = df_kpis["weight"] >= (pos_cap_eff - 1e-9)
-    df_kpis["beta_w"]  = df_kpis["beta"].fillna(1.0) * df_kpis["weight"]
-    df_kpis = df_kpis.sort_values("weight", ascending=False).reset_index(drop=True)
-    st.dataframe(df_kpis, use_container_width=True)
+    # === Resumen de cartera (tabla principal) ===
+    df_summary = dfw[["symbol", "weight", "beta"]].copy()
+    df_summary["beta_w"]  = df_summary["beta"].fillna(1.0) * df_summary["weight"]
+    df_summary["cap_pos"] = df_summary["weight"] >= (pos_cap_eff - 1e-9)
+    df_summary = df_summary.sort_values("weight", ascending=False).reset_index(drop=True)
 
-    if dfw.empty:
-        st.warning("No se pudieron calcular pesos (verifica precios/fechas).")
-        st.stop()
+    st.markdown("### Cartera (resumen)")
+    st.dataframe(
+        df_summary.style.format({
+            "weight": "{:.4f}",
+            "beta":   "{:.4f}",
+            "beta_w": "{:.4f}",
+        }),
+        use_container_width=True
+    )
 
-    st.dataframe(dfw, use_container_width=True)
+    # Descarga del resumen
+    c_dl1, c_dl2 = st.columns(2)
+    with c_dl1:
+        st.download_button(
+            "Descargar resumen (CSV)",
+            df_summary.to_csv(index=False).encode(),
+            file_name="portfolio_summary.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
-    c1,c2 = st.columns(2)
+    # === Detalle (opcional) en expander ===
+    with st.expander("Métricas detalladas (Kelly)"):
+        cols_det = ["symbol","p","payoff","k_bin","k_cont","k_raw","k_pen","mu","sigma","beta","n","weight","beta_w"]
+        cols_det = [c for c in cols_det if c in dfw.columns]
+        df_det = dfw[cols_det].sort_values("weight", ascending=False).reset_index(drop=True)
+
+        st.dataframe(
+            df_det.style.format({
+                "p":       "{:.3f}",
+                "payoff":  "{:.4f}",
+                "k_bin":   "{:.4f}",
+                "k_cont":  "{:.6f}",
+                "k_raw":   "{:.4f}",
+                "k_pen":   "{:.4f}",
+                "mu":      "{:,.0f}",
+                "sigma":   "{:,.0f}",
+                "beta":    "{:.4f}",
+                "weight":  "{:.4f}",
+                "beta_w":  "{:.4f}",
+                "n":       "{:.0f}",
+            }),
+            use_container_width=True
+        )
+
+        st.download_button(
+            "Descargar métricas (CSV)",
+            df_det.to_csv(index=False).encode(),
+            file_name="portfolio_kelly_metrics.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    # === Gráficos (desde el resumen) ===
+    c1, c2 = st.columns(2)
     with c1:
-        st.bar_chart(dfw.set_index("symbol")["weight"])
+        st.bar_chart(df_summary.set_index("symbol")["weight"])
         st.caption("Pesos finales (w)")
     with c2:
-        st.bar_chart(dfw.set_index("symbol")["beta_w"])
+        st.bar_chart(df_summary.set_index("symbol")["beta_w"])
         st.caption("Contribución β·w")
+
 
     st.markdown("---")
     st.subheader("Sizing con capital ficticio")
