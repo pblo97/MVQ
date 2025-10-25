@@ -75,37 +75,43 @@ tab_in, tab_macro, tab_port, tab_exits, tab_diag = st.tabs(
 with tab_in:
     c1, c2, c3 = st.columns([2,1,1])
     with c1:
-        symbols_txt = st.text_area("Símbolos (coma-separados)", "CHDN,CNR,GOOGL,MMM,PYPL,PZZA,UBER", height=80)
+        symbols_txt = st.text_area(
+            "Símbolos (coma-separados)",
+            "CHDN,CNR,GOOGL,MMM,PYPL,PZZA,UBER",
+            height=80
+        )
     with c2:
         bench = st.text_input("Benchmark", value="SPY").strip().upper()
         start = st.date_input("Inicio", value=pd.to_datetime(DEFAULT_START).date())
         end   = st.date_input("Fin", value=pd.to_datetime(DEFAULT_END).date())
     with c3:
         base_kelly = st.slider("Fracción Kelly base", 0.05, 0.50, 0.25, 0.01)
-        pos_cap    = st.number_input("Cap por posición", 0.01, 0.10, 0.05, 0.01, format="%.2f")
-        beta_cap   = st.number_input("Cap ∑(β·w)", 0.25, 2.00, 1.00, 0.05)
+        # presets más suaves
+        pos_cap    = st.number_input("Cap por posición", 0.01, 0.50, 0.30, 0.01, format="%.2f")  # ← antes 0.05
+        beta_cap   = st.number_input("Cap ∑(β·w)", 0.25, 2.00, 1.20, 0.05)                       # ← antes 1.00
 
     st.markdown("### Ajustes Kelly avanzados")
     ck1, ck2, ck3 = st.columns(3)
     with ck1:
-        winsor_p = st.slider("Winsor p (%)", 0.0, 5.0, 2.0, 0.25) / 100.0
+        winsor_p = st.slider("Winsor p (%)", 0.0, 5.0, 1.0, 0.25) / 100.0   # ← antes 2.0%
     with ck2:
-        costs_per_period = st.number_input("Costos mensuales (bps)", 0, 100, 10, 1) / 10_000.0
+        costs_per_period = st.number_input("Costos mensuales (bps)", 0, 100, 5, 1) / 10_000.0  # ← antes 10
     with ck3:
-        lambda_corr = st.slider("Penalización correlación λ", 0.0, 1.0, 0.50, 0.05)
+        lambda_corr = st.slider("Penalización correlación λ", 0.0, 1.0, 0.25, 0.05)            # ← antes 0.50
 
     ck4, ck5 = st.columns(2)
     with ck4:
-        ewm_span = st.slider("EWMA span (meses)", 6, 24, 12, 1)
+        ewm_span = st.slider("EWMA span (meses)", 6, 24, 14, 1)                                # ← antes 12
     with ck5:
-        shrink_kappa = st.slider("Shrink κ (p/payoff)", 0, 50, 20, 1)
+        shrink_kappa = st.slider("Shrink κ (p/payoff)", 0, 50, 12, 1)                           # ← antes 20
 
     # === QualityScore SIEMPRE desde FMP ===
     from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
 
-    @st.cache_data(show_spinner=False, ttl=60*60)
+    @st.cache_data(show_spinner=False, ttl=60*60)  # cache 1 hora
     def _fetch_quality_from_fmp(symbols_list: list[str], fmp_key: str) -> pd.DataFrame:
-        return compute_quality_from_fmp(symbols_list, fmp_key)  # devuelve symbol, QualityScore, features
+        # Devuelve ['symbol','QualityScore', ...features]
+        return compute_quality_from_fmp(symbols_list, fmp_key)
 
     symbols_for_fmp = [s.strip().upper() for s in symbols_txt.split(",") if s.strip()]
     fmp_key = st.secrets.get("FMP_API_KEY", "")
@@ -120,6 +126,7 @@ with tab_in:
             if qdf is not None and not qdf.empty:
                 quality_df = qdf[["symbol", "QualityScore"]].copy()
                 st.success("QualityScore obtenido automáticamente desde FMP.")
+                # Vista rápida ordenada (opcional)
                 st.dataframe(
                     qdf.sort_values("QualityScore", ascending=False),
                     use_container_width=True
@@ -129,8 +136,9 @@ with tab_in:
         except Exception as e:
             st.error(f"No pude calcular QualityScore con FMP: {e}")
 
-    # deja la calidad disponible para Cartera / Salidas
+    # Deja la calidad disponible para Cartera / Salidas
     st.session_state["quality_df"] = quality_df
+
 
 # ------------------ MACRO ------------------
 # ------------------ MACRO ------------------
@@ -289,12 +297,13 @@ with tab_port:
         pos_cap_eff = min(pos_cap_eff, float(st.session_state["pos_cap_sug"]))
 
     # Gate táctico con overlay (si el último valor es 0 → bloquear nuevas)
-    allow_new_when_z_below = -0.5
+    allow_new_when_z_below = -1.0  # más permisivo por defecto
     ov = st.session_state.get("overlay_gate_series")
     if ov is not None:
         try:
+            # Si overlay==0, solo pide un z muy malo para bloquear (prácticamente no bloquea)
             if int(pd.Series(ov).astype(int).iloc[-1]) == 0:
-                allow_new_when_z_below = 10.0  # bloquea nuevas totalmente
+                allow_new_when_z_below = 1.0
         except Exception:
             pass
 

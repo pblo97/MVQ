@@ -184,17 +184,17 @@ def build_portfolio(
     end: str,
     *,
     # Kelly pro
-    base_kelly: float = 0.20,          # fracción Kelly global (0.10–0.30 típico)
+    base_kelly: float = 0.20,
     winsor_p: float = 0.02,
     min_months: int = 36,
-    costs_per_period: float = 0.001,   # 0.1% mensual
+    costs_per_period: float = 0.001,
     shrink_kappa: int = 20,
     ewm_span: int = 12,
     lambda_corr: float = 0.5,
-    # Mezcla anterior (mantener compatibilidad si la usas en otro lado)
+    # Mezcla anterior (compat)
     t0: float = 2.0,
     lam_blend: float = 0.2,
-    # Macro/quality
+    # Macro / quality
     macro_z: float = 0.0,
     quality_df: pd.DataFrame | None = None,  # ['symbol','QualityScore'] o ['symbol','VFQ']
     alpha_off: float = 0.30,
@@ -208,16 +208,8 @@ def build_portfolio(
     current_holdings: List[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Devuelve DataFrame ordenado por 'weight' con:
+    Devuelve DF ordenado por 'weight' con:
     ['symbol','p','payoff','k_bin','k_cont','k_raw','k_pen','mu','sigma','beta','n','weight','beta_w']
-    Lógica:
-      1) Precios → retornos mensuales → EXCESO vs benchmark → Kelly pro por símbolo.
-      2) Penalización por correlación → k_pen.
-      3) Peso base = normalización de k_pen * base_kelly.
-      4) Macro overlay: z_to_regime → multiplicador M_macro y caps efectivos.
-      5) Quality tilt (alpha por régimen).
-      6) Gate táctico: si macro_z < umbral, NUEVAS entradas = 0 (mantiene holdings).
-      7) Caps (posición/beta) y normalización final.
     """
     # 1) Datos de precios
     pnl = load_prices_panel(symbols + [bench], start, end, cache_key="pm_panel")
@@ -228,7 +220,6 @@ def build_portfolio(
     bench_d = bench_df["close"].pct_change().dropna()
     bench_m = monthly_rets(bench_d)
 
-    # Retornos mensuales por símbolo y EXCESO vs bench
     ret_m = {}
     ret_excess = {}
     rows = []
@@ -249,7 +240,6 @@ def build_portfolio(
         if ex_m.size < int(min_months):
             continue
 
-        # Guardar series para penalización de correlación después
         ret_m[s] = a_m
         ret_excess[s] = ex_m
 
@@ -261,7 +251,6 @@ def build_portfolio(
             ewm_span=ewm_span,
             min_months=min_months,
         )
-
         beta = _beta_vs_bench(a_m, b_m)
 
         rows.append({"symbol": s, **km, "beta": beta})
@@ -271,19 +260,25 @@ def build_portfolio(
     if df.empty:
         return df
 
-    # 2) Penalización por correlación
-    ret_excess_df = pd.DataFrame(ret_excess)  # cols = símbolos, idx = meses
-    k_pen = penalize_by_corr(df.set_index("symbol")["k_raw"], ret_excess_df, lambda_corr=lambda_corr)
+    # 2) Penalización por correlación → k_pen
+    ret_excess_df = pd.DataFrame(ret_excess)  # cols = símbolos
     df = df.set_index("symbol")
+    k_pen = penalize_by_corr(df["k_raw"], ret_excess_df, lambda_corr=lambda_corr)
+
+    # === PATCH: floor suave tras penalización y antes de normalizar ===
+    # Evita que micro-ruido mantenga candidatos con k muy chica; si < k_floor => 0
+    k_floor = 0.005  # 0.5% Kelly
+    k_pen = k_pen.clip(lower=0.0)
+    k_pen = k_pen.where(k_pen >= k_floor, 0.0)
+
     df["k_pen"] = k_pen
 
-    # 3) Peso base por Kelly fraccionado
-    k_base = df["k_pen"].fillna(0.0).clip(lower=0.0).values
-    if k_base.sum() <= 0:
-        w_k = np.ones(len(df)) / len(df)
+    # 3) Peso base por Kelly fraccionado (normalización de k_pen)
+    den = float(k_pen.sum())
+    if den > 0:
+        w_k = base_kelly * (k_pen / den)
     else:
-        w_k = k_base / k_base.sum()
-    w_k = base_kelly * w_k  # fracción global de Kelly (el resto puede ser cash)
+        w_k = pd.Series(0.0, index=k_pen.index)
 
     # 4) Macro overlay: multiplicador y caps efectivos
     reg = z_to_regime(float(macro_z))
@@ -291,7 +286,7 @@ def build_portfolio(
     beta_cap_eff = min(float(beta_cap_user), float(reg.beta_cap))
     pos_cap_eff = min(float(pos_cap), float(reg.vol_cap))
 
-    # 5) Quality tilt
+    # 5) Quality tilt (usa QualityScore o VFQ si existe)
     if quality_df is not None and not quality_df.empty:
         if "QualityScore" in quality_df.columns:
             qmap = dict(zip(quality_df["symbol"].astype(str).str.upper(), quality_df["QualityScore"]))
@@ -301,31 +296,31 @@ def build_portfolio(
             qmap = {}
         q_series = pd.Series(df.index).astype(str).str.upper().map(qmap)
         q_series.index = df.index
-        q_series = q_series.fillna(df.get("mu", 0.0))  # fallback
+        # fallback: si no hay quality para alguno, usa mu estandarizada suave
+        q_series = q_series.fillna(df.get("mu", 0.0))
     else:
         q_series = df.get("mu", pd.Series(0.0, index=df.index))
 
     alpha = _pick_alpha(reg.label, alpha_off, alpha_neu, alpha_on)
-    q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0).values
+    q_mult = _quality_tilt(q_series, alpha).reindex(df.index).fillna(1.0)
 
-    # 6) Gate táctico: bloquear NUEVAS si macro < umbral (mantener holdings)
-    T_gate = np.ones(len(df))
+    # 6) Gate táctico: bloquear NUEVAS si macro < umbral (mantiene holdings)
+    T_gate = pd.Series(1.0, index=df.index)
     if current_holdings is not None and float(macro_z) < float(allow_new_when_z_below):
         holdset = {h.upper() for h in current_holdings}
-        is_new = ~pd.Series(df.index, index=df.index).astype(str).str.upper().isin(holdset)
-        T_gate[is_new.values] = 0.0
+        is_new = ~pd.Index(df.index).astype(str).str.upper().isin(holdset)
+        T_gate[is_new] = 0.0
 
     # Combinar: Kelly fraccionado * macro * quality * gate
-    w_base = w_k * M_macro * q_mult * T_gate
-    # Si todo quedó 0 (bloqueo macro total), cae a w_k
+    w_base = (w_k * M_macro * q_mult * T_gate)
     if w_base.sum() <= 0:
         w_base = w_k
     else:
         w_base = w_base / max(w_base.sum(), 1e-12)
 
-    # 7) Caps finales
+    # 7) Caps finales (posición / beta) y normalización
     w_final = _finalize_weights(
-        w_base,
+        w_base.values,
         betas=df["beta"].fillna(1.0).values,
         beta_cap=beta_cap_eff,
         pos_cap=pos_cap_eff,
@@ -336,12 +331,12 @@ def build_portfolio(
     df["beta_w"] = df["beta"].fillna(1.0) * df["weight"]
     df = df.reset_index()
 
-    # Columnas ordenadas (manteniendo compatibilidad con tu UI)
+    # columnas para UI
     cols = ["symbol",
             "p", "payoff", "k_bin", "k_cont", "k_raw", "k_pen",
             "mu", "sigma", "beta", "n",
             "weight", "beta_w"]
     for c in cols:
         if c not in df.columns:
-            df[c] = np.nan if c not in ("symbol",) else df.get(c, "")
+            df[c] = np.nan if c != "symbol" else df.get(c, "")
     return df[cols].sort_values("weight", ascending=False).reset_index(drop=True)
