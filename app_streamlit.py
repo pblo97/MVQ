@@ -28,8 +28,9 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 
 # ============== IMPORTS DE TU PIPELINE ==============
 
-from qvm_trend.scoring import blend_breakout_qvm, build_momentum_proxy
-
+from qvm_trend.scoring import (
+    blend_breakout_qvm, build_momentum_proxy
+)
 from qvm_trend.data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
     DEFAULT_START, DEFAULT_END
