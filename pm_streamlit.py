@@ -106,7 +106,7 @@ with tab_in:
         shrink_kappa = st.slider("Shrink κ (p/payoff)", 0, 50, 12, 1)                           # ← antes 20
 
     # === QualityScore SIEMPRE desde FMP ===
-    from qvm_trend.fundamentals.fmp_quality import compute_quality_from_fmp
+    from qvm_trend.fundamentals_.fmp_quality import compute_quality_from_fmp
 
     @st.cache_data(show_spinner=False, ttl=60*60)  # cache 1 hora
     def _fetch_quality_from_fmp(symbols_list: list[str], fmp_key: str) -> pd.DataFrame:
@@ -515,7 +515,7 @@ with tab_exits:
         st.stop()
 
     try:
-        from qvm_trend.fundamentals.fmp_quality import quality_history_from_fmp
+        from qvm_trend.fundamentals_.fmp_quality import quality_history_from_fmp
     except Exception as e:
         st.error(f"No pude importar quality_history_from_fmp: {e}")
         st.stop()
