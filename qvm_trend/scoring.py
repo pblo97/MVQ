@@ -1,5 +1,9 @@
 from typing import Dict, Tuple
 from .factors import BreakoutFeatures
+from __future__ import annotations
+import pandas as pd
+import numpy as np
+from .factors_growth_aware import compute_qvm_scores, apply_megacap_rules
 
 DEFAULT_TH = {
     "rvol_min": 1.5,
@@ -64,4 +68,48 @@ def entry_signal(score: float, tests: Dict[str, bool], min_score=0.6) -> bool:
     return (score >= min_score) and core_ok
 
 
+def _z(x: pd.Series) -> pd.Series:
+    x = x.astype(float)
+    return (x - x.mean()) / (x.std(ddof=0) + 1e-12)
 
+def blend_breakout_qvm(df_base: pd.DataFrame,
+                       breakout_col: str = "BreakoutScore",
+                       momentum_col: str = "momentum_score",
+                       sector_col: str = "sector",
+                       mcap_col: str = "market_cap",
+                       w_quality: float = 0.40,
+                       w_value: float = 0.25,
+                       w_momentum: float = 0.35,
+                       w_breakout: float = 0.30) -> pd.DataFrame:
+    """
+    Mezcla QVM (growth-aware) con tu BreakoutScore.
+    Devuelve df con:
+      value_adj, quality_adj, *_neut, qvm_score,
+      mega_exception_ok, quality_too_low,
+      final_alpha = (1 - w_breakout)*z(qvm_score) + w_breakout*z(BreakoutScore)
+    """
+    req_cols = {sector_col, mcap_col, momentum_col, breakout_col}
+    missing = [c for c in req_cols if c not in df_base.columns]
+    if missing:
+        raise KeyError(f"Faltan columnas requeridas para QVM/blend: {missing}")
+
+    qvm = compute_qvm_scores(
+        df_base,
+        w_quality=w_quality, w_value=w_value, w_momentum=w_momentum,
+        momentum_col=momentum_col, sector_col=sector_col, mcap_col=mcap_col
+    )
+    qvm = apply_megacap_rules(qvm, momentum_col=momentum_col)
+    qvm["final_alpha"] = (1 - w_breakout) * _z(qvm["qvm_score"]) + w_breakout * _z(qvm[breakout_col])
+    return qvm
+
+def build_momentum_proxy(df_sig: pd.DataFrame) -> pd.Series:
+    """
+    Proxy simple de momentum si no traes 12-1:
+     40% ClosePos + 40% P52 + 20% slope RS (si existe)
+    """
+    def _get(c): return pd.to_numeric(df_sig.get(c), errors="coerce")
+    closepos = _get("ClosePos")
+    p52 = _get("P52")
+    rs_slope = _get("rs_ma20_slope") if "rs_ma20_slope" in df_sig.columns else pd.Series(index=df_sig.index, data=np.nan)
+    comp = 0.40*closepos.fillna(closepos.median()) + 0.40*p52.fillna(p52.median()) + 0.20*rs_slope.fillna(0.0)
+    return (comp - comp.mean()) / (comp.std(ddof=0) + 1e-12)

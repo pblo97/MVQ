@@ -27,6 +27,9 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 """, unsafe_allow_html=True)
 
 # ============== IMPORTS DE TU PIPELINE ==============
+
+from qvm_trend.scoring import blend_breakout_qvm, build_momentum_proxy
+
 from qvm_trend.data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
     DEFAULT_START, DEFAULT_END
@@ -135,7 +138,7 @@ if "pipeline_ready" not in st.session_state:
 
 # ==================== TABS ====================
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Universo", "Guardrails", "VFQ", "Señales", "Export", "Backtesting"]
+    ["Universo", "Guardrails", "VFQ", "Señales", "QVM (growth-aware)", "Export", "Backtesting"]
 )
 
 # ==================== VFQ sidebar extra ====================
@@ -385,8 +388,68 @@ with tab4:
     except Exception as e:
         st.error(f"Error en señales: {e}")
 
-# ====== Paso 5: EXPORT ======
 with tab5:
+    st.subheader("QVM (growth-aware)")
+    try:
+        sig_df = st.session_state.get("signals", pd.DataFrame())
+        vfq_df = st.session_state.get("vfq", pd.DataFrame())
+        uni_df = st.session_state.get("uni", pd.DataFrame())
+        kept_df = st.session_state.get("kept", pd.DataFrame())
+
+        if sig_df.empty:
+            st.info("Primero corre **Señales**.")
+            st.stop()
+
+        base_cols = []
+        for c in ["symbol", "sector", "marketCap", "marketCap_unified", "BreakoutScore", "ClosePos", "P52", "rs_ma20_slope"]:
+            if c in sig_df.columns:
+                base_cols.append(c)
+        base = sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]].drop_duplicates("symbol")
+
+        if isinstance(vfq_df, pd.DataFrame) and not vfq_df.empty:
+            base = base.merge(vfq_df, on="symbol", how="left", suffixes=("", "_vfq"))
+        if isinstance(uni_df, pd.DataFrame) and {"symbol", "sector", "marketCap"}.issubset(uni_df.columns):
+            base = base.merge(uni_df[["symbol", "sector", "marketCap"]], on="symbol", how="left", suffixes=("", "_uni"))
+        if isinstance(kept_df, pd.DataFrame) and "symbol" in kept_df.columns:
+            base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
+
+        if "market_cap" not in base.columns:
+            if "marketCap_unified" in base.columns:
+                base["market_cap"] = pd.to_numeric(base["marketCap_unified"], errors="coerce")
+            else:
+                base["market_cap"] = pd.to_numeric(base.get("marketCap"), errors="coerce")
+        if "sector" not in base.columns and "sector_vfq" in base.columns:
+            base["sector"] = base["sector_vfq"]
+
+        if "momentum_score" not in base.columns:
+            base["momentum_score"] = build_momentum_proxy(sig_df).reindex(base.index).values
+
+        qvm = blend_breakout_qvm(
+            base.rename(columns={"marketCap": "market_cap"}),
+            breakout_col="BreakoutScore",
+            momentum_col="momentum_score",
+            sector_col="sector",
+            mcap_col="market_cap",
+            w_quality=0.40, w_value=0.25, w_momentum=0.35, w_breakout=0.30
+        )
+
+        st.metric("Con QVM calculado", f"{len(qvm):,}")
+        show_cols = [c for c in [
+            "symbol", "sector", "market_cap", "qvm_score", "final_alpha",
+            "value_adj_neut", "quality_adj_neut", "mega_exception_ok",
+            "quality_too_low", "BreakoutScore", "momentum_score"
+        ] if c in qvm.columns]
+        st.dataframe(
+            qvm[show_cols].sort_values(["final_alpha", "qvm_score", "BreakoutScore"], ascending=False).head(300),
+            use_container_width=True, hide_index=True
+        )
+
+        st.session_state["qvm"] = qvm
+    except Exception as e:
+        st.error(f"Error en QVM growth-aware: {e}")
+
+# ====== Paso 5: EXPORT ======
+with tab6:
     st.subheader("Exportar / Guardar ")
     uni_s  = st.session_state.get("uni")
     gdiag  = st.session_state.get("guard_diag")
@@ -408,7 +471,7 @@ with tab5:
         _dl_btn(sig_s, "Descargar señales (CSV)", "senales.csv")
 
 # ====== Pestaña 6: BACKTESTING ======
-with tab6:
+with tab7:
     st.subheader("🔎 Backtesting (por activo)")
     st.markdown(
         "Regla evaluada: **MA200 OR Momentum 12–1 > 0** (o **AND** si marcas el check). "
