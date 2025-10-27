@@ -31,7 +31,7 @@ from qvm_trend.data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
     DEFAULT_START, DEFAULT_END
 )
-from qvm_trend.fundamentals_ import (
+from qvm_trend.fundamentals import (
     download_fundamentals,  build_vfq_scores_dynamic,
     download_guardrails_batch, apply_quality_guardrails
 )
