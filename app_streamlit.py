@@ -6,7 +6,6 @@ from datetime import datetime, date
 
 # ==== QVM / VFQ ====
 
-
 # ==================== CONFIG BÁSICO ====================
 st.set_page_config(
     page_title="Sistema QVM",
@@ -27,7 +26,6 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 """, unsafe_allow_html=True)
 
 # ============== IMPORTS DE TU PIPELINE ==============
-
 from qvm_trend.scoring import (
     blend_breakout_qvm, build_momentum_proxy
 )
@@ -44,6 +42,9 @@ from qvm_trend.pipeline import (
     market_regime_on
 )
 from qvm_trend.backtests import backtest_many
+
+# NUEVOS IMPORTS (growth-aware)
+from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules
 
 # ------------------ CACHÉ DE I/O ------------------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -97,7 +98,7 @@ with st.sidebar:
         ipo_days = st.slider("Antigüedad IPO (días)", 90, 1500, 365, 30)
 
     with st.expander("Fundamentales & Guardrails", expanded=False):
-        min_cov = st.slider("Cobertura VFQ mínima (# métricas)", 1, 4, 2)
+        min_cov_guard = st.slider("Cobertura VFQ mínima (# métricas)", 1, 4, 2)
         profit_hits = st.slider("Pisos de rentabilidad (hits EBIT/CFO/FCF)", 0, 3, 2)
         max_issuance = st.slider("Net issuance máx.", 0.00, 0.10, 0.03, 0.01)
         max_assets = st.slider("Asset growth |y/y| máx.", 0.00, 0.50, 0.20, 0.01)
@@ -138,7 +139,7 @@ if "pipeline_ready" not in st.session_state:
     st.session_state["pipeline_ready"] = False
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Universo", "Guardrails", "VFQ", "Señales", "QVM (growth-aware)", "Export", "Backtesting"]
 )
 
@@ -313,6 +314,9 @@ with tab4:
         panel = _cached_load_prices_panel(syms_vfq, start.isoformat(), end.isoformat(), cache_key=cache_tag)
         bench_px = _cached_load_benchmark(bench, start.isoformat(), end.isoformat())
 
+        # Guarda panel para pestañas posteriores (p.ej. QVM)
+        st.session_state["panel_prices"] = panel
+
         trend = apply_trend_filter(panel, use_and_condition=use_and)
         brk = enrich_with_breakout(
             panel,
@@ -389,6 +393,7 @@ with tab4:
     except Exception as e:
         st.error(f"Error en señales: {e}")
 
+# ====== Paso 5: QVM (growth-aware) ======
 with tab5:
     st.subheader("QVM (growth-aware)")
     try:
@@ -396,11 +401,13 @@ with tab5:
         vfq_df = st.session_state.get("vfq", pd.DataFrame())
         uni_df = st.session_state.get("uni", pd.DataFrame())
         kept_df = st.session_state.get("kept", pd.DataFrame())
+        panel_prices = st.session_state.get("panel_prices")  # guardado en tab4
 
         if sig_df.empty:
             st.info("Primero corre **Señales**.")
             st.stop()
 
+        # --- Base: columnas clave por symbol ---
         base_cols = []
         for c in ["symbol", "sector", "marketCap", "marketCap_unified", "BreakoutScore", "ClosePos", "P52", "rs_ma20_slope"]:
             if c in sig_df.columns:
@@ -414,6 +421,7 @@ with tab5:
         if isinstance(kept_df, pd.DataFrame) and "symbol" in kept_df.columns:
             base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
 
+        # Normaliza market cap / sector
         if "market_cap" not in base.columns:
             if "marketCap_unified" in base.columns:
                 base["market_cap"] = pd.to_numeric(base["marketCap_unified"], errors="coerce")
@@ -422,34 +430,89 @@ with tab5:
         if "sector" not in base.columns and "sector_vfq" in base.columns:
             base["sector"] = base["sector_vfq"]
 
-        if "momentum_score" not in base.columns:
-            base["momentum_score"] = build_momentum_proxy(sig_df).reindex(base.index).values
+        # --- Momentum: calcúlalo desde PRECIOS (panel) ---
+        momentum = None
+        try:
+            if isinstance(panel_prices, pd.DataFrame):
+                # ya está largo
+                df_long = panel_prices.rename(columns={"ticker": "symbol"} if "ticker" in panel_prices.columns else {})
+                momentum = build_momentum_proxy(df_long, price_col="close", id_col="symbol", date_col="date")
+            elif isinstance(panel_prices, dict):
+                # dict {symbol: df_prices}; conviértelo a largo
+                frames = []
+                for sym, dfp in panel_prices.items():
+                    if isinstance(dfp, pd.DataFrame) and {"close"}.issubset(dfp.columns):
+                        tmp = dfp.reset_index().rename(columns={"index": "date"} if "date" not in dfp.columns else {})
+                        tmp["symbol"] = sym
+                        frames.append(tmp[["symbol", "date", "close"]])
+                if frames:
+                    long_df = pd.concat(frames, ignore_index=True)
+                    momentum = build_momentum_proxy(long_df, price_col="close", id_col="symbol", date_col="date")
+        except Exception:
+            momentum = None
 
-        qvm = blend_breakout_qvm(
+        if momentum is not None and isinstance(momentum, pd.Series):
+            base = base.merge(momentum.rename("momentum_score"), left_on="symbol", right_index=True, how="left")
+
+        # Fallback si no hay momentum
+        if "momentum_score" not in base.columns or base["momentum_score"].isna().all():
+            if "ClosePos" in base.columns:
+                s = pd.to_numeric(base["ClosePos"], errors="coerce")
+                base["momentum_score"] = (s - s.mean()) / (s.std(ddof=0) + 1e-12)
+            else:
+                base["momentum_score"] = 0.0  # neutro
+
+        # --- QVM growth-aware (value/quality con neutralización y momentum) ---
+        qvm_df = compute_qvm_scores(
             base.rename(columns={"marketCap": "market_cap"}),
-            breakout_col="BreakoutScore",
+            w_quality=0.40, w_value=0.25, w_momentum=0.35,
             momentum_col="momentum_score",
             sector_col="sector",
-            mcap_col="market_cap",
-            w_quality=0.40, w_value=0.25, w_momentum=0.35, w_breakout=0.30
+            mcap_col="market_cap"
         )
 
-        st.metric("Con QVM calculado", f"{len(qvm):,}")
+        # Megacaps rules/flags (opcionales)
+        qvm_df = apply_megacap_rules(
+            qvm_df,
+            momentum_col="momentum_score",
+            quality_col="quality_adj_neut",
+            value_col="value_adj_neut"
+        )
+
+        # Blend con breakout (si está disponible). Usamos percentil del blend para "final_alpha".
+        if "BreakoutScore" in base.columns:
+            blend = blend_breakout_qvm(
+                pd.DataFrame({
+                    "qvm_score": qvm_df["qvm_score"],
+                    "breakout_score": pd.to_numeric(base["BreakoutScore"], errors="coerce")
+                }),
+                col_qvm="qvm_score",
+                col_breakout="breakout_score",
+                w_qvm=0.70,
+                w_breakout=0.30,
+                to_percentile=True
+            )
+            qvm_df["final_alpha"] = blend
+        else:
+            s = qvm_df["qvm_score"]
+            qvm_df["final_alpha"] = s.rank(pct=True, method="average")
+
+        st.metric("Con QVM calculado", f"{len(qvm_df):,}")
         show_cols = [c for c in [
             "symbol", "sector", "market_cap", "qvm_score", "final_alpha",
             "value_adj_neut", "quality_adj_neut", "mega_exception_ok",
             "quality_too_low", "BreakoutScore", "momentum_score"
-        ] if c in qvm.columns]
+        ] if c in qvm_df.columns]
         st.dataframe(
-            qvm[show_cols].sort_values(["final_alpha", "qvm_score", "BreakoutScore"], ascending=False).head(300),
+            qvm_df[show_cols].sort_values(["final_alpha", "qvm_score"], ascending=False).head(300),
             use_container_width=True, hide_index=True
         )
 
-        st.session_state["qvm"] = qvm
+        st.session_state["qvm"] = qvm_df
     except Exception as e:
         st.error(f"Error en QVM growth-aware: {e}")
 
-# ====== Paso 5: EXPORT ======
+# ====== Paso 6: EXPORT ======
 with tab6:
     st.subheader("Exportar / Guardar ")
     uni_s  = st.session_state.get("uni")
@@ -471,7 +534,7 @@ with tab6:
         _dl_btn(gdiag, "Descargar guardrails diag (CSV)", "guardrails_diag.csv")
         _dl_btn(sig_s, "Descargar señales (CSV)", "senales.csv")
 
-# ====== Pestaña 6: BACKTESTING ======
+# ====== Pestaña 7: BACKTESTING ======
 with tab7:
     st.subheader("🔎 Backtesting (por activo)")
     st.markdown(
