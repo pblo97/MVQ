@@ -1,6 +1,7 @@
+from __future__ import annotations
 from typing import Dict, Tuple
 from .factors import BreakoutFeatures
-from __future__ import annotations
+
 import pandas as pd
 import numpy as np
 from .factors_growth_aware import compute_qvm_scores, apply_megacap_rules
@@ -72,108 +73,177 @@ def _z(x: pd.Series) -> pd.Series:
     x = x.astype(float)
     return (x - x.mean()) / (x.std(ddof=0) + 1e-12)
 
-__all__ = [
-    "build_momentum_proxy",
-    "blend_breakout_qvm",
-]
+try:
+    from .factors_growth_aware import (
+        compute_qvm_scores,
+        apply_megacap_rules,
+    )
+    _HAS_GA = True
+except Exception:
+    _HAS_GA = False
 
-EPS = 1e-12
-
+# ----------------------------- Utils ----------------------------- #
 def _zscore(s: pd.Series) -> pd.Series:
     s = pd.to_numeric(s, errors="coerce")
-    return (s - s.mean()) / (s.std(ddof=0) + EPS)
+    return (s - s.mean()) / (s.std(ddof=0) + 1e-12)
 
-def _rank01(s: pd.Series) -> pd.Series:
-    return s.rank(pct=True, method="average")
+def _rank_pct(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").rank(pct=True)
 
-def _safe_div(a, b):
-    a = pd.to_numeric(a, errors="coerce")
-    b = pd.to_numeric(b, errors="coerce")
-    return np.divide(a, b, out=np.zeros_like(pd.Series(a, copy=False), dtype=float),
-                     where=np.isfinite(b) & (b != 0))
+def _neutralize_by_sector_cap(df: pd.DataFrame, score_col: str,
+                              sector_col: str = "sector",
+                              mcap_col: str = "market_cap",
+                              buckets=(("Mega", 150e9, np.inf),
+                                       ("Large", 10e9, 150e9),
+                                       ("Mid", 2e9, 10e9),
+                                       ("Small", 0, 2e9))) -> pd.Series:
+    out = df.copy()
+    out[mcap_col] = pd.to_numeric(out.get(mcap_col), errors="coerce")
+    # buckets
+    edges = [b[1] for b in buckets] + [buckets[-1][2]]
+    labels = [b[0] for b in buckets]
+    out["_cap_bucket"] = pd.cut(out[mcap_col].astype(float), bins=edges, labels=labels, include_lowest=True, right=False)
+    # z por grupo
+    z_sector = out.groupby(sector_col, group_keys=False)[score_col].apply(_zscore)
+    z_cap    = out.groupby("_cap_bucket", group_keys=False)[score_col].apply(_zscore)
+    return 0.5*z_sector + 0.5*z_cap
 
-def build_momentum_proxy(
-    prices: pd.DataFrame,
-    *,
-    price_col: str = "close",
-    id_col: str = "ticker",
-    date_col: str = "date",
-    w_short: float = 0.20,
-    w_med: float = 0.30,
-    w_long: float = 0.50,
-    short_win: int = 63,
-    med_win: int = 126,
-    long_win: int = 252,
-    vol_win: int = 63,
-) -> pd.Series:
+# ----------------------- Momentum proxy -------------------------- #
+def build_momentum_proxy(df_sig: pd.DataFrame) -> pd.Series:
     """
-    Calcula un score de momentum por activo (multi-horizonte con penalización por volatilidad).
-    Devuelve una Series indexada por <id_col> llamada 'momentum_score' (z-score).
-    Acepta:
-      - DF "largo": columnas [id_col, date_col, price_col]
-      - DF indexado MultiIndex [id_col, date_col] + una columna de precios
+    Proxy de momentum (0..~) usando señales técnicas si no traes serie propia.
+    Usa columnas si existen: ClosePos (↑), P52 (↑), rs_ma20_slope (↑), hits (↑)
+    Devuelve una Serie indexada por *symbol*.
     """
-    df = prices.copy()
+    if df_sig is None or not isinstance(df_sig, pd.DataFrame) or df_sig.empty:
+        return pd.Series(dtype=float)
 
-    # Normaliza a formato largo si viene como MultiIndex
-    if id_col not in df.columns and isinstance(df.index, pd.MultiIndex):
-        df = df.reset_index().rename(columns={df.columns[0]: id_col, df.columns[1]: date_col})
-        if price_col not in df.columns:
-            value_cols = [c for c in df.columns if c not in (id_col, date_col)]
-            if len(value_cols) != 1:
-                raise ValueError("No se puede inferir price_col; especifícalo.")
-            price_col = value_cols[0]
+    x = df_sig.copy()
+    if "symbol" not in x.columns:
+        # Sin símbolo, devolvemos z de ClosePos global como fallback
+        cols = [c for c in ["ClosePos", "P52", "rs_ma20_slope", "hits"] if c in x.columns]
+        s = sum(_zscore(x[c]) for c in cols) / max(1, len(cols))
+        return pd.Series(s, index=x.index, dtype=float)
 
-    if date_col in df.columns:
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.sort_values([id_col, date_col])
+    parts = []
+    if "ClosePos" in x.columns:       parts.append(_zscore(x["ClosePos"]))
+    if "P52" in x.columns:            parts.append(_zscore(x["P52"]))
+    if "rs_ma20_slope" in x.columns:  parts.append(_zscore(x["rs_ma20_slope"]))
+    if "hits" in x.columns:           parts.append(_zscore(x["hits"]))
+    if not parts:
+        mom = pd.Series(0.0, index=x.index)
+    else:
+        mom = sum(parts) / len(parts)
 
-    def per_id(g: pd.DataFrame) -> float:
-        px = pd.to_numeric(g[price_col], errors="coerce").astype(float)
-        if px.isna().all() or len(px) < min(short_win, med_win, long_win) + 1:
-            return np.nan
-        rets = np.log(px).diff()
+    # promedio por símbolo (por si hay duplicados)
+    mom_sym = pd.DataFrame({"symbol": x["symbol"], "mom": mom}).groupby("symbol", as_index=True)["mom"].mean()
+    return mom_sym
 
-        def cumret(n):
-            r = rets.rolling(n).sum().iloc[-1]
-            return float(r) if np.isfinite(r) else np.nan
-
-        r_short = cumret(short_win)
-        r_med   = cumret(med_win)
-        r_long  = cumret(long_win)
-
-        vol = float(rets.rolling(vol_win).std(ddof=0).iloc[-1]) if len(rets) >= vol_win else np.nan
-
-        raw = (w_short * r_short) + (w_med * r_med) + (w_long * r_long)
-        if np.isfinite(vol) and vol > 0:
-            raw = raw / (vol + EPS)  # tipo Sharpe
-        return raw
-
-    scores = df.groupby(id_col, sort=False, group_keys=False).apply(per_id).astype(float)
-    scores.name = "momentum_score"
-    # Entrega z-score para facilitar el blend posterior
-    return _zscore(scores)
-
-def blend_breakout_qvm(
-    df: pd.DataFrame,
-    *,
-    col_qvm: str = "qvm_score",
-    col_breakout: str = "breakout_score",
-    w_qvm: float = 0.60,
-    w_breakout: float = 0.40,
-    to_percentile: bool = True,
-) -> pd.Series:
+# -------------------- QVM + Breakout blender -------------------- #
+def blend_breakout_qvm(base: pd.DataFrame,
+                       breakout_col: str = "BreakoutScore",
+                       momentum_col: str = "momentum_score",
+                       sector_col: str = "sector",
+                       mcap_col: str = "market_cap",
+                       w_quality: float = 0.40,
+                       w_value: float = 0.25,
+                       w_momentum: float = 0.35,
+                       w_breakout: float = 0.30) -> pd.DataFrame:
     """
-    Mezcla un score QVM con un score de breakout.
-    Estandariza ambos a z-score y hace un blend ponderado.
-    Retorna percentil [0,1] si to_percentile=True (útil para ranking global).
+    Crea un score QVM (growth-aware si hay datos) y lo mezcla con Breakout.
+    - Si existen columnas 'value_adj_neut' y 'quality_adj_neut', las usa.
+    - Si no, intenta usar 'ValueScore' y 'QualityScore' (neutralizando por sector+cap).
+    - Si hay fundamentales suficientes y factors_growth_aware disponible, calcula value/quality growth-aware.
+    Devuelve copia de base con columnas:
+      ['value_adj_neut','quality_adj_neut','qvm_score','final_alpha',
+       'mega_exception_ok','quality_too_low'] si aplica.
     """
-    if col_qvm not in df.columns or col_breakout not in df.columns:
-        raise KeyError(f"Faltan columnas '{col_qvm}' y/o '{col_breakout}' en df.")
+    if base is None or not isinstance(base, pd.DataFrame) or base.empty:
+        return pd.DataFrame()
 
-    z_qvm = _zscore(df[col_qvm])
-    z_bo  = _zscore(df[col_breakout])
+    df = base.copy()
 
-    blended = (w_qvm * z_qvm) + (w_breakout * z_bo)
-    blended.name = "blended_qvm_breakout"
-    return _rank01(blended) if to_percentile else blended
+    # Asegurar columnas clave
+    if sector_col not in df.columns and "sector_vfq" in df.columns:
+        df[sector_col] = df["sector_vfq"]
+    if mcap_col not in df.columns:
+        for alt in ("marketCap_unified", "marketCap"):
+            if alt in df.columns:
+                df[mcap_col] = pd.to_numeric(df[alt], errors="coerce")
+                break
+
+    # Momentum z
+    if momentum_col not in df.columns:
+        # intentar construir desde señales si trajeron columnas conocidas
+        mom_proxy = build_momentum_proxy(df if "symbol" in df.columns else pd.DataFrame())
+        if "symbol" in df.columns and not mom_proxy.empty:
+            df = df.merge(mom_proxy.rename("momentum_score"), left_on="symbol", right_index=True, how="left")
+        else:
+            df[momentum_col] = 0.0
+    m_z = _zscore(pd.to_numeric(df[momentum_col], errors="coerce").fillna(0.0))
+
+    # Value/Quality growth-aware si es posible
+    have_adj = {"value_adj_neut","quality_adj_neut"}.issubset(df.columns)
+    if not have_adj and _HAS_GA:
+        try:
+            # compute_qvm_scores calcula value/quality adj + neut (no usa breakout)
+            tmp = compute_qvm_scores(
+                df.rename(columns={mcap_col: "market_cap", sector_col: "sector"}),
+                w_quality=0.40, w_value=0.25, w_momentum=0.35,
+                momentum_col=momentum_col, sector_col="sector", mcap_col="market_cap"
+            )
+            for c in ("value_adj_neut","quality_adj_neut","value_adj","quality_adj","qvm_score"):
+                if c in tmp.columns:
+                    df[c] = tmp[c]
+            have_adj = {"value_adj_neut","quality_adj_neut"}.issubset(df.columns)
+        except Exception:
+            have_adj = False
+
+    # Fallback a VFQ si sigue faltando
+    if not have_adj:
+        if "ValueScore" in df.columns:
+            df["value_adj_neut"] = _neutralize_by_sector_cap(
+                df.rename(columns={sector_col: "sector", mcap_col: "market_cap"}),
+                score_col="ValueScore", sector_col="sector", mcap_col="market_cap"
+            )
+        else:
+            df["value_adj_neut"] = 0.0
+
+        if "QualityScore" in df.columns:
+            df["quality_adj_neut"] = _neutralize_by_sector_cap(
+                df.rename(columns={sector_col: "sector", mcap_col: "market_cap"}),
+                score_col="QualityScore", sector_col="sector", mcap_col="market_cap"
+            )
+        else:
+            df["quality_adj_neut"] = 0.0
+
+    # QVM score
+    qvm_score = (
+        w_quality  * _zscore(df["quality_adj_neut"]) +
+        w_value    * _zscore(df["value_adj_neut"]) +
+        w_momentum * m_z
+    )
+    df["qvm_score"] = qvm_score
+
+    # Breakout z y mezcla final
+    b_z = _zscore(pd.to_numeric(df.get(breakout_col, 0.0), errors="coerce").fillna(0.0))
+    df["final_alpha"] = (1 - w_breakout) * qvm_score + w_breakout * b_z
+
+    # Guardrails mega-cap si están disponibles
+    if _HAS_GA:
+        try:
+            flags = apply_megacap_rules(
+                df.rename(columns={sector_col: "sector", mcap_col: "market_cap"}),
+                momentum_col=momentum_col,
+                quality_col="quality_adj_neut",
+                value_col="value_adj_neut",
+            )[["mega_exception_ok","quality_too_low","q_pct_sector","v_pct_sector","m_pct_global"]]
+            df = df.merge(flags, left_index=True, right_index=True, how="left")
+        except Exception:
+            df["mega_exception_ok"] = False
+            df["quality_too_low"] = False
+    else:
+        df["mega_exception_ok"] = False
+        df["quality_too_low"] = False
+
+    return df
