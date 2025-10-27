@@ -72,44 +72,108 @@ def _z(x: pd.Series) -> pd.Series:
     x = x.astype(float)
     return (x - x.mean()) / (x.std(ddof=0) + 1e-12)
 
-def blend_breakout_qvm(df_base: pd.DataFrame,
-                       breakout_col: str = "BreakoutScore",
-                       momentum_col: str = "momentum_score",
-                       sector_col: str = "sector",
-                       mcap_col: str = "market_cap",
-                       w_quality: float = 0.40,
-                       w_value: float = 0.25,
-                       w_momentum: float = 0.35,
-                       w_breakout: float = 0.30) -> pd.DataFrame:
-    """
-    Mezcla QVM (growth-aware) con tu BreakoutScore.
-    Devuelve df con:
-      value_adj, quality_adj, *_neut, qvm_score,
-      mega_exception_ok, quality_too_low,
-      final_alpha = (1 - w_breakout)*z(qvm_score) + w_breakout*z(BreakoutScore)
-    """
-    req_cols = {sector_col, mcap_col, momentum_col, breakout_col}
-    missing = [c for c in req_cols if c not in df_base.columns]
-    if missing:
-        raise KeyError(f"Faltan columnas requeridas para QVM/blend: {missing}")
+__all__ = [
+    "build_momentum_proxy",
+    "blend_breakout_qvm",
+]
 
-    qvm = compute_qvm_scores(
-        df_base,
-        w_quality=w_quality, w_value=w_value, w_momentum=w_momentum,
-        momentum_col=momentum_col, sector_col=sector_col, mcap_col=mcap_col
-    )
-    qvm = apply_megacap_rules(qvm, momentum_col=momentum_col)
-    qvm["final_alpha"] = (1 - w_breakout) * _z(qvm["qvm_score"]) + w_breakout * _z(qvm[breakout_col])
-    return qvm
+EPS = 1e-12
 
-def build_momentum_proxy(df_sig: pd.DataFrame) -> pd.Series:
+def _zscore(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    return (s - s.mean()) / (s.std(ddof=0) + EPS)
+
+def _rank01(s: pd.Series) -> pd.Series:
+    return s.rank(pct=True, method="average")
+
+def _safe_div(a, b):
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    return np.divide(a, b, out=np.zeros_like(pd.Series(a, copy=False), dtype=float),
+                     where=np.isfinite(b) & (b != 0))
+
+def build_momentum_proxy(
+    prices: pd.DataFrame,
+    *,
+    price_col: str = "close",
+    id_col: str = "ticker",
+    date_col: str = "date",
+    w_short: float = 0.20,
+    w_med: float = 0.30,
+    w_long: float = 0.50,
+    short_win: int = 63,
+    med_win: int = 126,
+    long_win: int = 252,
+    vol_win: int = 63,
+) -> pd.Series:
     """
-    Proxy simple de momentum si no traes 12-1:
-     40% ClosePos + 40% P52 + 20% slope RS (si existe)
+    Calcula un score de momentum por activo (multi-horizonte con penalización por volatilidad).
+    Devuelve una Series indexada por <id_col> llamada 'momentum_score' (z-score).
+    Acepta:
+      - DF "largo": columnas [id_col, date_col, price_col]
+      - DF indexado MultiIndex [id_col, date_col] + una columna de precios
     """
-    def _get(c): return pd.to_numeric(df_sig.get(c), errors="coerce")
-    closepos = _get("ClosePos")
-    p52 = _get("P52")
-    rs_slope = _get("rs_ma20_slope") if "rs_ma20_slope" in df_sig.columns else pd.Series(index=df_sig.index, data=np.nan)
-    comp = 0.40*closepos.fillna(closepos.median()) + 0.40*p52.fillna(p52.median()) + 0.20*rs_slope.fillna(0.0)
-    return (comp - comp.mean()) / (comp.std(ddof=0) + 1e-12)
+    df = prices.copy()
+
+    # Normaliza a formato largo si viene como MultiIndex
+    if id_col not in df.columns and isinstance(df.index, pd.MultiIndex):
+        df = df.reset_index().rename(columns={df.columns[0]: id_col, df.columns[1]: date_col})
+        if price_col not in df.columns:
+            value_cols = [c for c in df.columns if c not in (id_col, date_col)]
+            if len(value_cols) != 1:
+                raise ValueError("No se puede inferir price_col; especifícalo.")
+            price_col = value_cols[0]
+
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.sort_values([id_col, date_col])
+
+    def per_id(g: pd.DataFrame) -> float:
+        px = pd.to_numeric(g[price_col], errors="coerce").astype(float)
+        if px.isna().all() or len(px) < min(short_win, med_win, long_win) + 1:
+            return np.nan
+        rets = np.log(px).diff()
+
+        def cumret(n):
+            r = rets.rolling(n).sum().iloc[-1]
+            return float(r) if np.isfinite(r) else np.nan
+
+        r_short = cumret(short_win)
+        r_med   = cumret(med_win)
+        r_long  = cumret(long_win)
+
+        vol = float(rets.rolling(vol_win).std(ddof=0).iloc[-1]) if len(rets) >= vol_win else np.nan
+
+        raw = (w_short * r_short) + (w_med * r_med) + (w_long * r_long)
+        if np.isfinite(vol) and vol > 0:
+            raw = raw / (vol + EPS)  # tipo Sharpe
+        return raw
+
+    scores = df.groupby(id_col, sort=False, group_keys=False).apply(per_id).astype(float)
+    scores.name = "momentum_score"
+    # Entrega z-score para facilitar el blend posterior
+    return _zscore(scores)
+
+def blend_breakout_qvm(
+    df: pd.DataFrame,
+    *,
+    col_qvm: str = "qvm_score",
+    col_breakout: str = "breakout_score",
+    w_qvm: float = 0.60,
+    w_breakout: float = 0.40,
+    to_percentile: bool = True,
+) -> pd.Series:
+    """
+    Mezcla un score QVM con un score de breakout.
+    Estandariza ambos a z-score y hace un blend ponderado.
+    Retorna percentil [0,1] si to_percentile=True (útil para ranking global).
+    """
+    if col_qvm not in df.columns or col_breakout not in df.columns:
+        raise KeyError(f"Faltan columnas '{col_qvm}' y/o '{col_breakout}' en df.")
+
+    z_qvm = _zscore(df[col_qvm])
+    z_bo  = _zscore(df[col_breakout])
+
+    blended = (w_qvm * z_qvm) + (w_breakout * z_bo)
+    blended.name = "blended_qvm_breakout"
+    return _rank01(blended) if to_percentile else blended
