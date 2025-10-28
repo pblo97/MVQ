@@ -606,4 +606,246 @@ with tab6:
 # ====== Paso 7: BACKTESTING (placeholder) ======
 with tab7:
     st.subheader("Backtesting")
-    st.caption("Integra aquí tu lógica de backtests usando `backtest_many` si corresponde.")
+
+    # ---------- Helpers locales (solo para esta pestaña) ----------
+    def _to_panel_dict(panel_prices):
+        """Acepta dict {sym: df} o DF largo y retorna dict {sym: df con index datetime y col 'close'}."""
+        if isinstance(panel_prices, dict):
+            out = {}
+            for s, df in panel_prices.items():
+                if not isinstance(df, pd.DataFrame) or df.empty or "close" not in df.columns:
+                    continue
+                dfi = df.copy()
+                # asegura índice datetime
+                if not isinstance(dfi.index, pd.DatetimeIndex):
+                    if "date" in dfi.columns:
+                        dfi = dfi.set_index(pd.to_datetime(dfi["date"])).drop(columns=[c for c in ["date"] if c in dfi.columns])
+                    else:
+                        dfi.index = pd.to_datetime(dfi.index)
+                dfi = dfi.sort_index()
+                out[s] = dfi[["close"]].dropna()
+            return out
+        elif isinstance(panel_prices, pd.DataFrame) and not panel_prices.empty:
+            df = panel_prices.copy()
+            if "symbol" not in df.columns and "ticker" in df.columns:
+                df = df.rename(columns={"ticker": "symbol"})
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values(["symbol", "date"])
+            out = {}
+            for s, grp in df.groupby("symbol"):
+                gg = grp.copy()
+                if "date" in gg.columns:
+                    gg = gg.set_index(gg["date"])
+                out[s] = gg[["close"]].dropna()
+            return out
+        return {}
+
+    def _month_ends_index(df: pd.DataFrame) -> pd.DatetimeIndex:
+        return df.resample("M").last().index
+
+    def _daily_returns_from_prices(df: pd.DataFrame) -> pd.Series:
+        # espera index datetime y columna 'close'
+        px = df["close"].astype(float)
+        rets = px.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        return rets
+
+    def _portfolio_backtest(panel_dict: dict,
+                            rank_df: pd.DataFrame,
+                            rank_col: str = "final_alpha",
+                            top_n: int = 10,
+                            cost_bps: int = 10,
+                            lag_days: int = 0,
+                            target_vol: float | None = None,
+                            lev_cap: float = 2.0) -> tuple[pd.Series, pd.DataFrame]:
+        """
+        Backtest simple de portafolio:
+        - Cada fin de mes selecciona Top-N por 'rank_col'
+        - Equal weight
+        - Aplica lag_days a la ejecución
+        - Aplica costos por cambio de pesos (bps)
+        - (Opcional) Target de volatilidad diario sobre la serie de portafolio (20d rolling), con tope de leverage
+        Devuelve: equity (Serie) y tabla de rebalances (DataFrame con pesos en cada mes).
+        """
+        # Asegura que rank_df tiene symbol y la columna de ranking
+        if "symbol" not in rank_df.columns or rank_col not in rank_df.columns:
+            return pd.Series(dtype=float), pd.DataFrame()
+
+        # Construimos calendario de rebalanceo a partir de la intersección de meses disponibles
+        # Usamos el universo de símbolos con historial
+        if not panel_dict:
+            return pd.Series(dtype=float), pd.DataFrame()
+
+        # Calendario mensual común (intersección soft)
+        any_sym = next(iter(panel_dict))
+        cal = _month_ends_index(panel_dict[any_sym])
+        # preferimos el calendario del benchmark si lo tienes; aquí usamos el primero
+
+        lag = pd.Timedelta(days=int(lag_days)) if lag_days else pd.Timedelta(0)
+
+        # Serie de retorno diario por símbolo
+        daily_map = {s: _daily_returns_from_prices(df) for s, df in panel_dict.items()}
+
+        # Construir DataFrame de retornos diario alineado
+        all_rets = pd.DataFrame({s: sr for s, sr in daily_map.items()}).sort_index().fillna(0.0)
+        if all_rets.empty:
+            return pd.Series(dtype=float), pd.DataFrame()
+
+        # Rebalances mensuales
+        month_ends = all_rets.resample("M").last().index
+        weights_hist = []
+        port_rets = []
+
+        prev_weights = pd.Series(0.0, index=all_rets.columns)
+
+        for i in range(1, len(month_ends)):
+            t0, t1 = month_ends[i-1], month_ends[i]
+
+            # Selección Top-N por ranking (estático por ahora; si tu ranking es dinámico, adaptar a fecha)
+            top = (rank_df[["symbol", rank_col]]
+                   .dropna()
+                   .sort_values(rank_col, ascending=False)
+                   .head(int(top_n))["symbol"]
+                   .tolist())
+
+            # Pesos equal-weight en seleccionados
+            current_weights = pd.Series(0.0, index=all_rets.columns, dtype=float)
+            if len(top) > 0:
+                w = 1.0 / len(top)
+                current_weights.loc[[s for s in top if s in current_weights.index]] = w
+
+            # Turnover y costos (costo proporcional al cambio de peso)
+            tw = (current_weights - prev_weights).abs().sum() * 0.5  # convención: media del cambio
+            cost_rate = (cost_bps / 1e4) * tw
+
+            # Ventana diaria de [t0+lag, t1+lag]
+            sl = all_rets.loc[(all_rets.index > t0 + lag) & (all_rets.index <= t1 + lag)]
+            if sl.empty:
+                continue
+
+            # Retorno diario de portafolio (pesos estáticos dentro del mes)
+            pr = (sl * current_weights).sum(axis=1)
+
+            # Aplica costo SOLO el primer día del bloque
+            if len(pr) > 0:
+                pr.iloc[0] = pr.iloc[0] - cost_rate
+
+            port_rets.append(pr)
+            weights_hist.append(current_weights.rename(t1))
+            prev_weights = current_weights
+
+        if not port_rets:
+            return pd.Series(dtype=float), pd.DataFrame()
+
+        port_rets = pd.concat(port_rets).sort_index()
+        equity = (1.0 + port_rets).cumprod()
+
+        # Volatility targeting (opcional) — 20 días rolling
+        if target_vol is not None and target_vol > 0:
+            roll = port_rets.rolling(20).std().replace(0.0, np.nan)
+            ann_vol = roll * np.sqrt(252)
+            lev = (target_vol / ann_vol).clip(lower=0.0, upper=float(lev_cap)).fillna(0.0)
+            adj_rets = port_rets * lev
+            equity = (1.0 + adj_rets).cumprod()
+
+        weights_table = pd.DataFrame(weights_hist) if weights_hist else pd.DataFrame()
+        return equity.rename("Portfolio"), weights_table
+
+    try:
+        panel_prices = st.session_state.get("panel_prices")
+        qvm_df = st.session_state.get("qvm")
+        if panel_prices is None or qvm_df is None or qvm_df.empty:
+            st.info("Corre **Señales** y **QVM** antes de backtestear.")
+            st.stop()
+
+        # ---------- Controles ----------
+        left, right = st.columns([0.55, 0.45])
+        with left:
+            rank_by = st.selectbox("Criterio de ranking para Top-N", ["final_alpha", "prob_up", "qvm_score"], index=0)
+            top_n = st.slider("Top-N (portafolio)", 5, 50, 15, 5)
+            use_and_bt = st.toggle("Señal MA200 AND Mom 12-1 (para métricas por símbolo)", value=False)
+            rebalance_freq = st.selectbox("Frecuencia rebalance (por símbolo)", ["M", "W"], index=0,
+                                          help="Solo para backtest por símbolo (función backtest_many). El portafolio usa mensual fijo en este bloque.")
+        with right:
+            cost_bps = st.slider("Costos (bps por cambio de peso)", 0, 50, 10, 1)
+            lag_days = st.slider("Lag de ejecución (días)", 0, 5, 1, 1)
+            enable_target_vol = st.toggle("Target de volatilidad (portafolio)", value=False)
+            target_vol = st.number_input("Volatilidad anual objetivo (p.ej. 0.15)", value=0.15, step=0.01, format="%.2f") if enable_target_vol else None
+            lev_cap = st.number_input("Límite de apalancamiento", value=2.0, step=0.1, format="%.1f") if enable_target_vol else 2.0
+
+        # ---------- Panel en dict ----------
+        panel_dict = _to_panel_dict(panel_prices)
+        if not panel_dict:
+            st.warning("No hay datos de precios adecuados para backtesting.")
+            st.stop()
+
+        # ---------- Backtest por símbolo (usa tu backtests.py) ----------
+        try:
+            # Selección: los símbolos disponibles intersectados con panel
+            avail_syms = [s for s in qvm_df["symbol"].dropna().astype(str).unique().tolist() if s in panel_dict]
+            metrics_df, curves = backtest_many(
+                panel=panel_dict,
+                symbols=avail_syms,
+                cost_bps=int(cost_bps),
+                lag_days=int(lag_days),
+                use_and_condition=bool(use_and_bt),
+                rebalance_freq=str(rebalance_freq)
+            )
+
+            st.markdown("**Métricas por símbolo (backtest_many)**")
+            st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+        except Exception as e:
+            st.error(f"Error en backtest por símbolo: {e}")
+            metrics_df, curves = pd.DataFrame(), {}
+
+        st.markdown("---")
+
+        # ---------- Backtest de Portafolio Top-N ----------
+        try:
+            # rank_df: usa el último QVM disponible (columns: symbol, final_alpha, prob_up, qvm_score ...)
+            rank_cols_needed = {"symbol", rank_by}
+            if not rank_cols_needed.issubset(qvm_df.columns):
+                st.warning(f"No encuentro columnas {rank_cols_needed} en QVM.")
+                st.stop()
+
+            # filtra a símbolos con precios
+            rank_df = qvm_df.loc[qvm_df["symbol"].isin(panel_dict.keys()), ["symbol", rank_by]].dropna()
+            equity, wtable = _portfolio_backtest(
+                panel_dict=panel_dict,
+                rank_df=rank_df,
+                rank_col=rank_by,
+                top_n=int(top_n),
+                cost_bps=int(cost_bps),
+                lag_days=int(lag_days),
+                target_vol=(float(target_vol) if enable_target_vol else None),
+                lev_cap=float(lev_cap)
+            )
+
+            if equity.empty:
+                st.warning("No se pudo construir la curva del portafolio (revisa datos).")
+            else:
+                st.markdown("**Portafolio Top-N (equal-weight)**")
+                st.line_chart(equity, use_container_width=True)
+                # Resumen rápido
+                pr = equity.pct_change().dropna()
+                cagr = ((equity.iloc[-1] / equity.iloc[0]) ** (252/len(pr))) - 1 if len(pr) > 0 else 0.0
+                vol  = pr.std() * np.sqrt(252) if len(pr) > 0 else 0.0
+                shar = (pr.mean()/pr.std()) * np.sqrt(252) if pr.std() > 0 else 0.0
+                dd   = (equity / equity.cummax() - 1).min()
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("CAGR", f"{cagr:.2%}")
+                c2.metric("Vol",  f"{vol:.2%}")
+                c3.metric("Sharpe", f"{shar:.2f}")
+                c4.metric("MaxDD", f"{dd:.2%}")
+
+                with st.expander("Pesos en cada rebalance (Top-N)", expanded=False):
+                    st.dataframe(wtable.fillna(0.0), use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Error en backtest de portafolio: {e}")
+
+        st.caption("Tip: el backtest por símbolo usa tu `backtest_many`. El del portafolio aplica Top-N por ranking QVM con equal-weight, costos, lag y target de volatilidad opcional.")
+
+    except Exception as e:
+        st.error(f"Error en Backtesting: {e}")
