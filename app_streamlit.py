@@ -351,24 +351,50 @@ with tab4:
     st.subheader("Señales (Técnico)")
     try:
         if run_btn and "vfq_sel" in st.session_state:
-            # Carga precios + señales usando tus helpers reales
             syms = st.session_state["vfq_sel"]["symbol"].dropna().astype(str).unique().tolist()
+
             with st.status("Cargando precios y calculando señales…", expanded=False) as status:
+                # 1) precios como panel {symbol: df}
                 panel = _cached_load_prices_panel(syms, start=str(start), end=str(end), cache_key=cache_tag)
-                # Aplica filtros/indicadores según tus funciones
-                sig_df = apply_trend_filter(panel, use_and=use_and)
-                sig_df = enrich_with_breakout(sig_df,
-                                              rvol_th=rvol_th,
-                                              closepos_th=closepos_th,
-                                              p52_th=p52_th,
-                                              updown_vol_th=updown_vol_th,
-                                              min_hits=min_hits,
-                                              atr_pct_min=atr_pct_min,
-                                              use_rs_slope=use_rs_slope,
-                                              require_breakout=require_breakout)
-                if risk_on:
-                    bench_df = _cached_load_benchmark(bench, start=str(start), end=str(end))
-                    sig_df = market_regime_on(sig_df, bench_df)
+
+                # 2) tendencia (AND/OR correcto)
+                trend_df = apply_trend_filter(panel, use_and_condition=use_and)
+
+                # 3) breakout (usa panel; NO admite atr_pct_min ni require_breakout)
+                bo_df = enrich_with_breakout(
+                    panel,
+                    rvol_lookback=20,                 # por si quieres exponerlo luego
+                    rvol_th=float(rvol_th),
+                    closepos_th=float(closepos_th),
+                    p52_th=float(p52_th),
+                    updown_vol_th=float(updown_vol_th),
+                    bench_series=None,               # opcional: serie de benchmark normalizada
+                    min_hits=int(min_hits),
+                    use_rs_slope=bool(use_rs_slope),
+                    rs_min_slope=0.0
+                )
+
+                # 4) mezcla: una fila por símbolo
+                sig_df = (
+                    trend_df.merge(bo_df, on="symbol", how="outer")
+                            .sort_values("symbol")
+                            .reset_index(drop=True)
+                )
+
+                # 5) régimen de mercado (bool). Si risk_on=True en UI, aplicamos el freno.
+                bench_df = _cached_load_benchmark(bench, start=str(start), end=str(end))
+                ok_market = market_regime_on(bench_df, panel)
+
+                if risk_on and not ok_market:
+                    # No filtramos filas; apagamos las banderas de entrada
+                    if "signal_trend" in sig_df.columns:
+                        sig_df["signal_trend"] = False
+                    if "signal_breakout" in sig_df.columns:
+                        sig_df["signal_breakout"] = False
+                    sig_df["risk_on"] = False
+                else:
+                    sig_df["risk_on"] = True
+
                 status.update(label="Señales listas", state="complete")
 
             st.session_state["signals"] = sig_df
@@ -383,7 +409,6 @@ with tab4:
         st.dataframe(sig_df.head(300), use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error calculando señales: {e}")
-
 # ====== Paso 5: QVM (growth-aware) ======
 with tab5:
     st.subheader("QVM (growth-aware)")
