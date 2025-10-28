@@ -490,6 +490,20 @@ with tab5:
         if "sector" not in base.columns and "sector_vfq" in base.columns:
             base["sector"] = base["sector_vfq"]
 
+        if hasattr(base, "columns"):
+            base = base.loc[:, ~base.columns.duplicated(keep="last")]
+
+        # 2) Asegura que 'momentum_score' sea Serie 1D numérica
+        if "momentum_score" in base.columns:
+            # Si por cualquier motivo pandas devuelve un DataFrame (n,2), toma la 1ª col
+            if isinstance(base["momentum_score"], pd.DataFrame):
+                base["momentum_score"] = pd.to_numeric(base["momentum_score"].iloc[:, 0], errors="coerce")
+            else:
+                base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce")
+        else:
+            base["momentum_score"] = 0.0  # fallback seguro
+
+
         # ------------------- QVM growth-aware -------------------
         qvm_df = compute_qvm_scores(
             base.rename(columns={"marketCap": "market_cap"}),
