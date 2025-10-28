@@ -1,4 +1,8 @@
+# --- poner esto ARRIBA DE TODO ---
 import os
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "poll"  # o "none" si prefieres desactivar
+# ---------------------------------
+
 import numpy as np
 import pandas as pd
 import streamlit as st
