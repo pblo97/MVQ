@@ -95,6 +95,26 @@ def perf_summary_from_returns(rets: pd.Series, periods_per_year: int) -> dict:
         "Periodos": int(len(r))
     }
 
+def _enrich_sector_industry(uni_df: pd.DataFrame, src_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rellena/inyecta sector e industry en uni_df usando cualquier df que tenga esas columnas (p.ej. df_fund).
+    Prioriza columnas no vacías y deja 'Unknown' si no hay data.
+    """
+    out = uni_df.copy()
+    need_sector = ("sector" not in out.columns) or (out["sector"].isna().mean() > 0.8 if "sector" in out.columns else True)
+    have_cols = [c for c in ["sector", "industry"] if c in src_df.columns]
+    if need_sector and have_cols:
+        map_df = (
+            src_df[["symbol"] + have_cols]
+            .dropna(subset=["symbol"])
+            .drop_duplicates("symbol", keep="last")
+        )
+        out = out.drop(columns=have_cols, errors="ignore").merge(map_df, on="symbol", how="left")
+    out["sector"] = out.get("sector", "Unknown").fillna("Unknown").replace("", "Unknown")
+    if "industry" in out.columns:
+        out["industry"] = out["industry"].fillna("")
+    return out
+
 # ==================== HEADER ====================
 l, r = st.columns([0.85, 0.15])
 with l:
@@ -297,8 +317,12 @@ with tab3:
 
             with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
                 df_fund = _cached_download_fundamentals(tuple(sorted(kept_syms)), cache_key=cache_tag)
-                base_for_vfq = uni.merge(df_fund, on="symbol", how="right")
 
+# A. usar la info de fundamentals para enriquecer el universo con sector/industry
+                uni_enriched = _enrich_sector_industry(uni, df_fund)
+
+                # trabajar siempre con el universo enriquecido
+                base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
                 # ===== Cálculo VFQ (tu función) =====
                 df_vfq = build_vfq_scores_dynamic(
                     base_for_vfq,
