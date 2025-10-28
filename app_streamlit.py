@@ -281,8 +281,10 @@ with tab3:
             kept = st.session_state["kept"]
             kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
             with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
-                df_fund = _cached_download_fundamentals(tuple(sorted(kept_syms)), cache_tag)
+                df_fund = _cached_download_fundamentals(tuple(sorted(kept_syms)), cache_key=cache_tag)
                 base_for_vfq = uni.merge(df_fund, on="symbol", how="right")
+
+                # Calcula VFQ usando tu función dinámica
                 df_vfq = build_vfq_scores_dynamic(
                     base_for_vfq,
                     value_metrics=vfq_cfg["value_metrics"],
@@ -296,13 +298,26 @@ with tab3:
                 )
                 status.update(label="VFQ calculado", state="complete")
 
-            # filtros finales
-            mask_cov = pd.to_numeric(df_vfq.get("coverage_count", 0), errors="coerce").fillna(0) >= int(min_cov)
-            mask_pct = pd.to_numeric(df_vfq.get("VFQ_pct_sector", 1.0), errors="coerce").fillna(1.0) >= float(min_pct)
+            # -------- FIX 1: filtro de cobertura tolerante --------
+            if "coverage_count" in df_vfq.columns:
+                mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
+            else:
+                # Si no hay coverage_count, no bloquees por cobertura
+                mask_cov = pd.Series(True, index=df_vfq.index)
+
+            # -------- FIX 2: filtro por percentil dentro de sector --------
+            # build_vfq_scores_dynamic produce 'VFQ' y 'VFQ_pct_sector'
+            vfq_pct_col = "VFQ_pct_sector" if "VFQ_pct_sector" in df_vfq.columns else None
+            if vfq_pct_col:
+                mask_pct = pd.to_numeric(df_vfq[vfq_pct_col], errors="coerce").fillna(1.0) >= float(min_pct)
+            else:
+                mask_pct = pd.Series(True, index=df_vfq.index)
+
             df_vfq_sel = df_vfq.loc[mask_cov & mask_pct].copy()
 
             st.session_state["vfq"] = df_vfq
             st.session_state["vfq_sel"] = df_vfq_sel
+
         elif "vfq" in st.session_state and "vfq_sel" in st.session_state:
             df_vfq = st.session_state["vfq"]
             df_vfq_sel = st.session_state["vfq_sel"]
@@ -310,17 +325,24 @@ with tab3:
             st.info("Primero corre **Guardrails** (botón Ejecutar).")
             st.stop()
 
+        # -------- FIX 3: ordenar por la columna correcta --------
+        sort_col = "VFQ" if "VFQ" in df_vfq_sel.columns else (
+            "VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None
+        )
+        view_df = (
+            df_vfq_sel.sort_values(sort_col, ascending=False).head(300)
+            if sort_col else df_vfq_sel.head(300)
+        )
+
         c1, c2 = st.columns([0.6, 0.4])
         with c1:
             st.metric("Con VFQ calculado", f"{len(df_vfq):,}")
-            st.dataframe(
-                df_vfq_sel.sort_values("VFQ_score", ascending=False).head(300),
-                use_container_width=True, hide_index=True
-            )
+            st.dataframe(view_df, use_container_width=True, hide_index=True)
         with c2:
             st.caption("Distribución por sector (seleccionados)")
-            if "sector" in df_vfq_sel.columns:
+            if "sector" in df_vfq_sel.columns and not df_vfq_sel.empty:
                 st.bar_chart(df_vfq_sel["sector"].value_counts().head(15), use_container_width=True)
+
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
 
