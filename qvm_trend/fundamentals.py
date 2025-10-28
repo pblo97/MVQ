@@ -25,6 +25,8 @@ except Exception:
 # Helpers genéricos / numéricos robustos
 # ======================================================================
 
+CAP_Z = 3.0  # límite de seguridad para z-scores
+
 def _first_obj(x):
     """Devuelve el primer objeto si es lista; si es dict lo devuelve; si no, {}."""
     if isinstance(x, list):
@@ -154,22 +156,40 @@ def value_growth_aware(df: pd.DataFrame) -> pd.Series:
     fcf_ttm = out.get("fcf_ttm", pd.Series(index=out.index, data=np.nan))
     fcf_5y_median = out.get("fcf_5y_median", fcf_ttm)
 
+    # Flags de calidad mínima (evita disparos por divisiones con ~0)
+    pre_rev   = (pd.to_numeric(sales_ntm, errors="coerce") <= 0) | (pd.to_numeric(gp, errors="coerce") <= 0)
+    bad_ebitda= (pd.to_numeric(ebitda_ntm, errors="coerce") <= 0)
+
     ev_over_ebitda = _safe_div(ev, ebitda_ntm)
-    ev_over_gp = _safe_div(ev, gp)
-    ev_over_sales = _safe_div(ev, sales_ntm)
-    capex_sales = _safe_div(capex, sales_ntm).fillna(0.0)
+    ev_over_gp     = _safe_div(ev, gp)
+    ev_over_sales  = _safe_div(ev, sales_ntm)
+
+    capex_sales = _safe_div(capex, sales_ntm).fillna(0.0).clip(lower=0.0, upper=1.0)  # tope razonable
     ev_over_sales_pen = ev_over_sales * (1 + capex_sales)
 
-    v1 = _winsorize(1 / ev_over_ebitda.replace(0, np.nan)).fillna(0)
-    v2 = _winsorize(1 / ev_over_gp.replace(0, np.nan)).fillna(0)
-    v3 = _winsorize(1 / ev_over_sales_pen.replace(0, np.nan)).fillna(0)
+    # Invertidos + winsor + CAP de z (evita outliers absurdos)
+    def _inv_w(s):
+        inv = 1.0 / s.replace(0, np.nan)
+        return _winsorize(inv, 0.01).fillna(0.0)
+
+    v1 = _inv_w(ev_over_ebitda)
+    v2 = _inv_w(ev_over_gp)
+    v3 = _inv_w(ev_over_sales_pen)
 
     raw = 0.40 * _zscore(v1) + 0.30 * _zscore(v2) + 0.30 * _zscore(v3)
+    raw = raw.clip(-CAP_Z, CAP_Z)
 
+    # Penalizaciones explícitas
+    penalty = pd.Series(0.0, index=raw.index)
+    penalty = penalty.mask(pre_rev,   -1.5)  # sin ventas o sin GP ⇒ fuerte castigo
+    penalty = penalty.mask(bad_ebitda, -0.8) # EBITDA ≤ 0 ⇒ castigo moderado
+
+    # Boost por FCF 5y ajustado por SBC (cap suave)
     fcf_yield5 = _safe_div((fcf_5y_median - sbc), ev)
-    out["_fcf_yield5_pct"] = _rank_pct(fcf_yield5)
-    boost = (out["_fcf_yield5_pct"] >= 0.80).astype(float) * 0.25
-    return raw + boost
+    f5_pct = _rank_pct(fcf_yield5)
+    boost = (f5_pct >= 0.80).astype(float) * 0.25
+
+    return (raw + penalty + boost).fillna(-1.0)
 
 def quality_intangible_aware(df: pd.DataFrame) -> pd.Series:
     """
@@ -222,13 +242,15 @@ def quality_intangible_aware(df: pd.DataFrame) -> pd.Series:
 
     netcash_ebitda = _winsorize(-_safe_div(net_debt.fillna(0), _to_float(ebitda).abs() + 1e-9), 0.01)
 
-    return (
+    score = (
         0.35 * _zscore(gp_assets) +
         0.35 * _zscore(roic_xrd) +
         0.10 * stab +
         0.10 * _zscore(netcash_ebitda) +
         0.10 * accruals_score
-    )
+    ).clip(-CAP_Z, CAP_Z).fillna(-1.0)
+
+    return score
 
 # ======================================================================
 # Neutralización por sector/capitalización y QVM
@@ -243,18 +265,38 @@ def neutralize_by_sector_cap(df: pd.DataFrame, score_col: str, sector_col: str =
     """
     Devuelve score neutralizado por sector y bucket de market cap:
       final = 0.5*z_sector + 0.5*z_capbucket
+    - Se ordenan los buckets por su borde inferior para garantizar bins crecientes.
     """
     out = df.copy()
     out[mcap_col] = pd.to_numeric(out.get(mcap_col, np.nan), errors="coerce")
-    edges = [b[1] for b in buckets] + [buckets[-1][2]]
-    labels = [b[0] for b in buckets]
-    out["_cap_bucket"] = pd.cut(out[mcap_col], bins=edges, labels=labels, include_lowest=True, right=False)
+
+    # Ordenar buckets por límite inferior y construir bins crecientes
+    b_sorted = sorted(list(buckets), key=lambda b: float(b[1]))
+    # edges: [low0, low1, low2, ..., high_last]
+    edges = [b_sorted[0][1]] + [b[1] for b in b_sorted[1:]] + [b_sorted[-1][2]]
+    # Asegurar estrictamente creciente
+    edges = [float(x) for x in edges]
+    for i in range(1, len(edges)):
+        if edges[i] <= edges[i-1]:
+            edges[i] = np.nextafter(edges[i-1], np.inf)
+
+    labels = [b[0] for b in b_sorted]
+    try:
+        out["_cap_bucket"] = pd.cut(out[mcap_col], bins=edges, labels=labels, include_lowest=True, right=False)
+    except Exception:
+        out["_cap_bucket"] = pd.Series(np.nan, index=out.index, dtype="object")
 
     def z_by(group):
         return _zscore(group[score_col])
-    z_sector = out.groupby(sector_col, group_keys=False).apply(z_by).rename("z_sector")
-    z_cap = out.groupby("_cap_bucket", group_keys=False).apply(z_by).rename("z_cap")
-    return 0.5 * z_sector + 0.5 * z_cap
+
+    # z por sector
+    z_sector = out.groupby(sector_col, group_keys=False, dropna=False).apply(z_by).rename("z_sector")
+
+    # z por bucket (si todo NaN, devuelve NaN y el promedio final lo trata)
+    z_cap = out.groupby("_cap_bucket", group_keys=False, dropna=False).apply(z_by).rename("z_cap")
+
+    final = 0.5 * z_sector + 0.5 * z_cap
+    return final
 
 def compute_qvm_scores(df: pd.DataFrame,
                        w_quality: float = 0.40,
@@ -678,15 +720,6 @@ def download_guardrails_batch(
       - concurrencia limitada por chunk,
       - reintentos con backoff por símbolo,
       - caché opcional vía load_df/save_df.
-
-    Params tunables:
-      chunk_size: cuántos símbolos por batch (150 suele ir bien para FMP/Tiingo).
-      max_workers: hilos por batch (8-12 razonable; bájalo si el proveedor es estricto).
-      pause_between_chunks: pausa (s) entre batches.
-      retries: reintentos por símbolo (2-3 OK).
-
-    Retorna:
-      DataFrame con una fila por símbolo (deduplicado), puede incluir columna '__err_guard' si algún símbolo falló.
     """
     key = f"guard_{cache_key}" if cache_key else None
     if key and not force:
@@ -836,7 +869,7 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     val_cols = [c for c in ["fcf_yield","inv_ev_ebitda"] if c in df.columns]
     q_cols   = [c for c in ["gross_profitability","roic","roa","netMargin"] if c in df.columns]
 
-    # winsor suave (usar _winsorize)
+    # winsor suave
     for c in val_cols + q_cols:
         df[c] = _winsorize(df[c], 0.01)
 
@@ -864,7 +897,7 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
         df["VFQ_pct_sector"] = df.groupby(sec)["VFQ"].rank(pct=True)
     except Exception:
         df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
-    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].fillna(1.0)
+    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].clip(0.0, 1.0).fillna(1.0)
 
     return df
 
@@ -1016,6 +1049,6 @@ def build_vfq_scores_dynamic(
         df["VFQ_pct_sector"] = df.groupby("sector")["VFQ"].rank(pct=True)
     except Exception:
         df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
-    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].fillna(1.0)
+    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].clip(0.0, 1.0).fillna(1.0)
 
     return df

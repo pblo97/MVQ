@@ -53,15 +53,26 @@ from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rul
 # ------------------ CACHÉ DE I/O ------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_run_fmp_screener(limit: int) -> pd.DataFrame:
-    return run_fmp_screener(limit=limit)
+    # fetch_profiles=True baja sector/industry del perfil en la misma pasada
+    return run_fmp_screener(limit=limit, fetch_profiles=True)
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_download_guardrails(symbols: Tuple[str, ...], cache_key: str) -> pd.DataFrame:
     return download_guardrails_batch(list(symbols), cache_key=cache_key, force=False)
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_download_fundamentals(symbols: Tuple[str, ...], cache_key: str) -> pd.DataFrame:
-    return download_fundamentals(list(symbols), cache_key=cache_key, force=False)
+def _cached_download_fundamentals(
+    symbols: Tuple[str, ...],
+    cache_key: str,
+    mc_pairs: Tuple[Tuple[str, float], ...] | None = None,
+) -> pd.DataFrame:
+    mc_map = dict(mc_pairs or ())
+    return download_fundamentals(
+        list(symbols),
+        market_caps=mc_map,          # <-- hint
+        cache_key=cache_key,
+        force=False
+    )
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_load_prices_panel(symbols, start, end, cache_key=""):
@@ -194,11 +205,12 @@ with st.sidebar:
     st.markdown("⚙️ Fundamentos (VFQ)")
 
     # Ajusta estas opciones a las columnas reales que produce tu DF de fundamentales
-    value_metrics_opts = ["ev_ebitda", "fcf_yield", "pe_ttm", "pb"]
-    quality_metrics_opts = ["roic", "roa", "gross_margin", "oper_margin"]
+    # Nombres que sí existen/deriva build_vfq_scores_dynamic
+    value_metrics_opts   = ["inv_ev_ebitda", "fcf_yield"]
+    quality_metrics_opts = ["gross_profitability", "roic", "roa", "netMargin"]
 
-    sel_value = st.multiselect("Métricas Value", options=value_metrics_opts, default=["ev_ebitda", "fcf_yield"])
-    sel_quality = st.multiselect("Métricas Quality", options=quality_metrics_opts, default=["roic", "gross_margin"])
+    sel_value = st.multiselect("Métricas Value", options=value_metrics_opts, default=["inv_ev_ebitda", "fcf_yield"])
+    sel_quality = st.multiselect("Métricas Quality", options=quality_metrics_opts, default=["gross_profitability", "roic"])
 
     c1, c2 = st.columns(2)
     with c1: w_value = st.slider("Peso Value", 0.0, 1.0, 0.5, 0.05)
@@ -315,85 +327,57 @@ with tab3:
             kept = st.session_state["kept"]
             kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
 
-            with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
-                df_fund = _cached_download_fundamentals(tuple(sorted(kept_syms)), cache_key=cache_tag)
+# Hint de market cap desde el universo (si no está, cae a NaN sin romper)
+            mc_pairs = tuple(
+        # Hint de market cap desde el universo
+mc_pairs = tuple(
+    (str(r.symbol), float(r.marketCap))
+    for _, r in uni.loc[uni["symbol"].isin(kept_syms), ["symbol","marketCap"]]
+                     .dropna(subset=["symbol"]).iterrows()
+)
 
-                # >>> Enriquecer universo con sector/industry desde fundamentals
-                uni_enriched = _enrich_sector_industry(uni, df_fund)
+with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
+    df_fund = _cached_download_fundamentals(
+        tuple(sorted(kept_syms)), cache_key=cache_tag, mc_pairs=mc_pairs
+    )
 
-                # Trabajar siempre con universo enriquecido
-                base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
+    # >>> Enriquecer universo con sector/industry desde fundamentals
+    uni_enriched = _enrich_sector_industry(uni, df_fund)
 
-                # ===== Cálculo VFQ (tu función) =====
-                df_vfq = build_vfq_scores_dynamic(
-                    base_for_vfq,
-                    value_metrics=vfq_cfg["value_metrics"],
-                    quality_metrics=vfq_cfg["quality_metrics"],
-                    w_value=vfq_cfg["w_value"],
-                    w_quality=vfq_cfg["w_quality"],
-                    method_intra=vfq_cfg["method_intra"],
-                    winsor_p=vfq_cfg["winsor_p"],
-                    size_buckets=vfq_cfg["size_buckets"],
-                    group_mode=vfq_cfg["group_mode"],
-                )
-                status.update(label="VFQ calculado", state="complete")
+    # Trabajar siempre con universo enriquecido
+    base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
 
-                # Asegura que df_vfq conserve sector/industry desde el universo enriquecido
-                keep_cols = ["symbol", "sector"]
-                if "industry" in uni_enriched.columns:
-                    keep_cols.append("industry")
-                df_vfq = (
-                    df_vfq.drop(columns=["sector","industry"], errors="ignore")
-                          .merge(uni_enriched[keep_cols].drop_duplicates("symbol"),
-                                 on="symbol", how="left")
-                )
-                df_vfq["sector"] = df_vfq["sector"].fillna("Unknown").replace("", "Unknown")
+    # ===== Cálculo VFQ =====
+    df_vfq = build_vfq_scores_dynamic(
+        base_for_vfq,
+        value_metrics=vfq_cfg["value_metrics"],
+        quality_metrics=vfq_cfg["quality_metrics"],
+        w_value=vfq_cfg["w_value"],
+        w_quality=vfq_cfg["w_quality"],
+        method_intra=vfq_cfg["method_intra"],
+        winsor_p=vfq_cfg["winsor_p"],
+        size_buckets=vfq_cfg["size_buckets"],
+        group_mode=vfq_cfg["group_mode"],
+    )
+    status.update(label="VFQ calculado", state="complete")
 
-            # ===== Percentil intra-sector (0..1) =====
-            score_col = "VFQ" if "VFQ" in df_vfq.columns else ("VFQ_score" if "VFQ_score" in df_vfq.columns else None)
-            if score_col is not None:
-                df_vfq["VFQ_pct_sector"] = (
-                    df_vfq.groupby(df_vfq["sector"])[score_col]
-                          .rank(pct=True, method="average")
-                          .astype(float)
-                          .clip(0.0, 1.0)
-                )
-            else:
-                df_vfq["VFQ_pct_sector"] = 1.0
+    # Conservar sector/industry
+    keep_cols = ["symbol", "sector"]
+    if "industry" in uni_enriched.columns:
+        keep_cols.append("industry")
+    df_vfq = (
+        df_vfq.drop(columns=["sector","industry"], errors="ignore")
+              .merge(uni_enriched[keep_cols].drop_duplicates("symbol"),
+                     on="symbol", how="left")
+    )
+    df_vfq["sector"] = df_vfq["sector"].fillna("Unknown").replace("", "Unknown")
 
-            # ===== (Opcional) filtro sanitario =====
-            strict_filters = True
-            if strict_filters:
-                rev = pd.to_numeric(df_vfq.get("revenue_ttm"), errors="coerce")
-                gp  = pd.to_numeric(df_vfq.get("gross_profit_ttm"), errors="coerce")
-                yoy = pd.to_numeric(df_vfq.get("revenue_yoy"), errors="coerce")
-                mask_rev_ok = (rev > 0) | (gp > 0)
-                mask_yoy_ok = (yoy.isna()) | (yoy > -0.05)
-                mask_sane   = mask_rev_ok & mask_yoy_ok
-            else:
-                mask_sane = pd.Series(True, index=df_vfq.index)
-
-            # ===== Filtros cobertura/percentil =====
-            if "coverage_count" in df_vfq.columns:
-                mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
-            else:
-                mask_cov = pd.Series(True, index=df_vfq.index)
-            mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= float(min_pct)
-
-            df_vfq_sel = df_vfq.loc[mask_cov & mask_pct & mask_sane].copy()
-            st.session_state["vfq"]     = df_vfq
-            st.session_state["vfq_sel"] = df_vfq_sel
-
-        elif "vfq" in st.session_state and "vfq_sel" in st.session_state:
-            df_vfq     = st.session_state["vfq"]
-            df_vfq_sel = st.session_state["vfq_sel"]
-        else:
-            st.info("Primero corre **Guardrails** (botón Ejecutar).")
-            st.stop()
 
         # ===== Orden por score =====
         sort_col = "VFQ" if "VFQ" in df_vfq_sel.columns else ("VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None)
         view_df = df_vfq_sel.sort_values(sort_col, ascending=False) if sort_col else df_vfq_sel.copy()
+
+        
 
         # ===== KPIs y gráfico por sector =====
         left, right = st.columns([0.25, 0.75])
