@@ -424,13 +424,13 @@ with tab5:
             st.info("Primero corre **Señales**.")
             st.stop()
 
-        # --- Base: columnas clave por symbol ---
-        base_cols = []
-        for c in ["symbol","sector","marketCap","marketCap_unified","BreakoutScore","ClosePos","P52","rs_ma20_slope"]:
-            if c in sig_df.columns:
-                base_cols.append(c)
-
-        base = sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]].drop_duplicates("symbol")
+        # --- Base desde señales ---
+        base_cols = [c for c in ["symbol","sector","marketCap","marketCap_unified",
+                                 "BreakoutScore","ClosePos","P52","rs_ma20_slope"]
+                     if c in sig_df.columns]
+        base = (sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]]
+                .drop_duplicates("symbol")
+                .copy())
 
         # Añade VFQ/UNI si existen
         if isinstance(vfq_df, pd.DataFrame) and not vfq_df.empty:
@@ -440,47 +440,61 @@ with tab5:
         if isinstance(kept_df, pd.DataFrame) and "symbol" in kept_df.columns:
             base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
 
-        # ------------------- MOMENTUM: SIEMPRE 1D -------------------
-        # 1) Momentum derivado de señales
-        mom_sig = build_momentum_proxy(sig_df)  # Series indexada por symbol
+        # ------------------- MOMENTUM 1D -------------------
+        # 1) Momentum derivado de señales (Series index=symbol)
+        mom_sig = build_momentum_proxy(sig_df)
         if isinstance(mom_sig, pd.Series) and not mom_sig.empty:
             base = base.merge(mom_sig.to_frame("mom_sig"), left_on="symbol", right_index=True, how="left")
 
-        # 2) Momentum desde precios (si está el panel)
+        # 2) Momentum desde precios (Series index=symbol)
         mom_px = None
         try:
             if isinstance(panel_prices, pd.DataFrame):
-                df_long = panel_prices.rename(columns={"ticker": "symbol"} if "ticker" in panel_prices.columns else {})
-                mom_px = build_momentum_proxy(df_long, )
+                # panel largo con columnas (symbol, date, close) o (ticker, date, close)
+                df_long = panel_prices.copy()
+                if "symbol" not in df_long.columns and "ticker" in df_long.columns:
+                    df_long = df_long.rename(columns={"ticker": "symbol"})
+                # build_momentum_proxy espera (id_col, date_col, price_col) si no deduce
+                mom_px = build_momentum_proxy(df_long, price_col="close", id_col="symbol", date_col="date")
             elif isinstance(panel_prices, dict):
+                # dict {sym: df_prices}; conviértelo a largo
                 frames = []
                 for sym, dfp in panel_prices.items():
-                    if isinstance(dfp, pd.DataFrame) and {"close"}.issubset(dfp.columns):
+                    if isinstance(dfp, pd.DataFrame) and "close" in dfp.columns:
                         tmp = dfp.reset_index().rename(columns={"index": "date"} if "date" not in dfp.columns else {})
                         tmp["symbol"] = sym
                         frames.append(tmp[["symbol","date","close"]])
                 if frames:
                     df_long = pd.concat(frames, ignore_index=True)
-                    # reutilizamos el mismo proxy para mantener consistencia
-                    mom_px = build_momentum_proxy(sig_df)  # si prefieres, cambia a tu métrica de precio
+                    mom_px = build_momentum_proxy(df_long, price_col="close", id_col="symbol", date_col="date")
         except Exception:
             mom_px = None
 
         if isinstance(mom_px, pd.Series) and not mom_px.empty:
             base = base.merge(mom_px.to_frame("mom_px"), left_on="symbol", right_index=True, how="left")
 
-        # 3) COALESCE: colapsar a una sola columna 'momentum_score' (1D)
+        # 3) COALESCE a una sola 'momentum_score' (1D)
         cand_moms = [c for c in ["momentum_score","mom_sig","mom_px","momentum_score_prices"] if c in base.columns]
         if cand_moms:
-            base["momentum_score"] = base[cand_moms].astype(float).mean(axis=1, skipna=True)
-            # quita columnas temporales para evitar duplicaciones/2D
+            base["momentum_score"] = base[cand_moms].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
             for c in ["mom_sig","mom_px","momentum_score_prices"]:
                 if c in base.columns:
-                    del base[c]
+                    base.drop(columns=[c], inplace=True)
+
+        # ------------------- NORMALIZACIONES -------------------
+        # Quita nombres de columnas duplicados (causa típica del error 2D)
+        if hasattr(base, "columns"):
+            base = base.loc[:, ~base.columns.duplicated(keep="last")]
+
+        # Asegura que 'momentum_score' sea Serie numérica 1D
+        if "momentum_score" in base.columns:
+            if isinstance(base["momentum_score"], pd.DataFrame):
+                base["momentum_score"] = pd.to_numeric(base["momentum_score"].iloc[:, 0], errors="coerce")
+            else:
+                base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce")
         else:
             base["momentum_score"] = 0.0
 
-        # ------------------- NORMALIZAR CAMPOS BÁSICOS -------------------
         # Market cap y sector
         if "market_cap" not in base.columns:
             if "marketCap_unified" in base.columns:
@@ -489,20 +503,6 @@ with tab5:
                 base["market_cap"] = pd.to_numeric(base.get("marketCap"), errors="coerce")
         if "sector" not in base.columns and "sector_vfq" in base.columns:
             base["sector"] = base["sector_vfq"]
-
-        if hasattr(base, "columns"):
-            base = base.loc[:, ~base.columns.duplicated(keep="last")]
-
-        # 2) Asegura que 'momentum_score' sea Serie 1D numérica
-        if "momentum_score" in base.columns:
-            # Si por cualquier motivo pandas devuelve un DataFrame (n,2), toma la 1ª col
-            if isinstance(base["momentum_score"], pd.DataFrame):
-                base["momentum_score"] = pd.to_numeric(base["momentum_score"].iloc[:, 0], errors="coerce")
-            else:
-                base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce")
-        else:
-            base["momentum_score"] = 0.0  # fallback seguro
-
 
         # ------------------- QVM growth-aware -------------------
         qvm_df = compute_qvm_scores(
@@ -521,8 +521,7 @@ with tab5:
             value_col="value_adj_neut"
         )
 
-        # ------------------- BLEND con Breakout (robusto) -------------------
-        # Z-score seguro sin depender de helpers privados
+        # ------------------- BLEND con Breakout -------------------
         def _z(s):
             s = pd.to_numeric(s, errors="coerce")
             mu = s.mean(skipna=True)
