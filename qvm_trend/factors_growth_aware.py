@@ -3,13 +3,36 @@ import numpy as np
 import pandas as pd
 
 # ----------------------------- Utils -----------------------------
-def _to_float(s: pd.Series | np.ndarray | None) -> pd.Series:
+def _to_float(s: pd.Series | pd.DataFrame | np.ndarray | None) -> pd.Series:
+    """
+    Fuerza a Serie 1D numérica, coalesciendo entradas 2D si llegan:
+    - DataFrame con >1 columna: promedio por fila (skipna)
+    - ndarray 2D: toma la 1ª columna
+    """
     if s is None:
         return pd.Series(dtype=float)
+
+    # DataFrame (posibles duplicados de nombre → 2D)
+    if isinstance(s, pd.DataFrame):
+        if s.shape[1] == 1:
+            s = s.iloc[:, 0]
+        else:
+            # Coalesce: promedio fila a fila
+            s = s.apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
+
+    # ndarray
+    if isinstance(s, np.ndarray):
+        if s.ndim > 1:
+            s = s[:, 0]
+        s = pd.Series(s)
+
+    # Cualquier otra cosa → Serie
     if not isinstance(s, pd.Series):
         s = pd.Series(s)
+
     s = pd.to_numeric(s, errors="coerce")
     return s.astype(float)
+
 
 def _winsorize(s: pd.Series, p: float = 0.01) -> pd.Series:
     s = _to_float(s)
@@ -19,15 +42,13 @@ def _winsorize(s: pd.Series, p: float = 0.01) -> pd.Series:
     return s.clip(lo, hi)
 
 def _zscore(s: pd.Series) -> pd.Series:
-    s = _to_float(s)
+    s = _to_float(s)  # ahora tolera 2D
     mu = s.mean()
     sd = s.std(ddof=0)
     if not np.isfinite(sd) or sd == 0:
         sd = 1.0
     out = (s - mu) / sd
-    # limpia no numéricos residuales
     return out.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
 def _safe_div(a, b) -> pd.Series:
     a = _to_float(a)
     b = _to_float(b)
@@ -211,7 +232,7 @@ def neutralize_by_sector_cap(df: pd.DataFrame, score_col: str, sector_col: str =
     return (0.5 * out["_z_sector"] + 0.5 * out["_z_cap"]).fillna(0.0)
 
 # ----------------------------- QVM -------------------------------
-def compute_qvm_scores(df: pd.DataFrame,
+def compute_qvm_scores(df: pd.DataFrame, 
                        w_quality: float = 0.40,
                        w_value: float = 0.25,
                        w_momentum: float = 0.35,
@@ -219,13 +240,20 @@ def compute_qvm_scores(df: pd.DataFrame,
                        sector_col: str = "sector",
                        mcap_col: str = "market_cap") -> pd.DataFrame:
     df = df.copy()
-    df["value_adj"]  = value_growth_aware(df)
+
+    # 🔧 evita que df["momentum_score"] devuelva un DataFrame por duplicados
+    if hasattr(df, "columns"):
+        df = df.loc[:, ~df.columns.duplicated(keep="last")]
+
+    df["value_adj"]   = value_growth_aware(df)
     df["quality_adj"] = quality_intangible_aware(df)
     df["value_adj_neut"]   = neutralize_by_sector_cap(df, "value_adj",  sector_col, mcap_col)
     df["quality_adj_neut"] = neutralize_by_sector_cap(df, "quality_adj", sector_col, mcap_col)
 
     if momentum_col not in df.columns:
         df[momentum_col] = 0.0
+
+    # ✅ ahora _to_float colapsa 2D de forma segura
     m = _zscore(_to_float(df[momentum_col]))
 
     df["qvm_score"] = (
