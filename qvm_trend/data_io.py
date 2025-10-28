@@ -6,7 +6,7 @@ import time
 import math
 import json
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterable
 
 import pandas as pd
 import numpy as np
@@ -117,7 +117,7 @@ EXCHANGES_OK = {
     "NASDAQ","Nasdaq","NasdaqGS","NasdaqGM",
     "NYSE","NYSE ARCA","NYSE Arca","NYSE American",
     "AMEX","BATS",
-    "SIX","SIX Swiss","SWX","SIX Swiss Exchange"  # ← añade estas
+    "SIX","SIX Swiss","SWX","SIX Swiss Exchange"
 }
 
 def _clean_symbol(sym: str) -> str:
@@ -128,6 +128,59 @@ def _to_num(s, default=np.nan):
         return pd.to_numeric(s, errors="coerce")
     except Exception:
         return default
+
+def _chunks(lst: List[str], n: int) -> Iterable[List[str]]:
+    """Particiona una lista en bloques de tamaño n."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def _merge_sector_industry(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fusiona sector/industry desde 'right' → 'left' sin pisar valores buenos en 'left'.
+    Rellena 'Unknown' y cuida NaNs/strings vacíos.
+    """
+    out = left.copy()
+    if right is None or right.empty or "symbol" not in right.columns:
+        # Asegura columnas y sanitiza
+        if "sector" not in out.columns:
+            out["sector"] = ""
+        if "industry" not in out.columns:
+            out["industry"] = ""
+        out["sector"] = out["sector"].fillna("").replace("", "Unknown")
+        out["industry"] = out["industry"].fillna("")
+        return out
+
+    cols = [c for c in ["sector", "industry"] if c in right.columns]
+    if not cols:
+        if "sector" not in out.columns:
+            out["sector"] = "Unknown"
+        else:
+            out["sector"] = out["sector"].fillna("").replace("", "Unknown")
+        if "industry" not in out.columns:
+            out["industry"] = ""
+        else:
+            out["industry"] = out["industry"].fillna("")
+        return out
+
+    r = (
+        right[["symbol"] + cols]
+        .dropna(subset=["symbol"])
+        .drop_duplicates("symbol", keep="last")
+    )
+    out = out.merge(r, on="symbol", how="left", suffixes=("", "_src"))
+
+    for c in cols:
+        base = out.get(c, "")
+        src  = out.get(f"{c}_src", "")
+        base = base.astype(str).fillna("")
+        src  = src.astype(str).fillna("")
+        out[c] = np.where(base.str.len() > 0, base, src)
+        out.drop(columns=[f"{c}_src"], inplace=True, errors="ignore")
+
+    out["sector"] = out.get("sector", "").fillna("").replace("", "Unknown")
+    if "industry" in out.columns:
+        out["industry"] = out["industry"].fillna("")
+    return out
 
 # ============================ SCREENER (UNIVERSO) ============================
 
@@ -142,7 +195,7 @@ def run_fmp_screener(limit: int = 300,
                      force: bool = False) -> pd.DataFrame:
     """
     Descarga universo base desde /stock-screener de FMP y (opcionalmente) enriquece con /profile/{sym}.
-    Los kwargs cache_key/force están por compatibilidad con la app (no se usan aquí).
+    Si los perfiles fallan o llegan vacíos, hace fallback a fundamentals para sector/industry.
     """
     url = "https://financialmodelingprep.com/api/v3/stock-screener"
     params = {
@@ -159,18 +212,17 @@ def run_fmp_screener(limit: int = 300,
 
     df["symbol"] = df["symbol"].astype(str).apply(_clean_symbol)
 
-    if fetch_profiles:
-        symbols = df["symbol"].dropna().unique().tolist()
-        profiles = []
-        batch = 40
-        pause = 1.0
-        for i in range(0, len(symbols), batch):
-            blk = symbols[i:i+batch]
-            for sym in blk:
-                try:
-                    prof = _http_get(f"https://financialmodelingprep.com/api/v3/profile/{sym}")
-                    if isinstance(prof, list) and prof:
-                        p0 = prof[0]
+    # ---------- Perfiles (sector/industry) ----------
+    prof_ok = False
+    if fetch_profiles and not df.empty:
+        try:
+            symbols = df["symbol"].dropna().unique().tolist()
+            profiles = []
+            for blk in _chunks(symbols, 40):
+                for sym in blk:
+                    try:
+                        prof = _http_get(f"https://financialmodelingprep.com/api/v3/profile/{sym}")
+                        p0 = prof[0] if isinstance(prof, list) and prof else (prof if isinstance(prof, dict) else {})
                         profiles.append({
                             "symbol": sym,
                             "sector": p0.get("sector"),
@@ -187,14 +239,17 @@ def run_fmp_screener(limit: int = 300,
                             "country": p0.get("country"),
                             "ipoDate": p0.get("ipoDate"),
                         })
-                except Exception:
-                    profiles.append({"symbol": sym})
-            time.sleep(pause)
+                    except Exception:
+                        profiles.append({"symbol": sym})
+                time.sleep(1.0)  # respiro gentil
+            dfp = pd.DataFrame(profiles)
+            if not dfp.empty:
+                df = df.merge(dfp, on="symbol", how="left")
+                prof_ok = True
+        except Exception:
+            prof_ok = False
 
-        dfp = pd.DataFrame(profiles)
-        if not dfp.empty:
-            df = df.merge(dfp, on="symbol", how="left")
-
+    # numéricos y sanitizado básico
     for col in ["marketCap", "marketCap_profile", "price", "price_profile", "beta", "beta_profile"]:
         if col not in df.columns:
             df[col] = np.nan
@@ -209,11 +264,33 @@ def run_fmp_screener(limit: int = 300,
             df[c] = ""
         df[c] = df[c].fillna("").astype(str)
 
+    # ---------- Fallback: si perfiles fallan o quedaron vacíos, intenta fundamentals ----------
+    needs_fallback = (df["sector"].eq("").mean() > 0.8)  # >80% vacío
+    if needs_fallback:
+        try:
+            from .fundamentals import download_fundamentals  # import local para evitar ciclos
+            syms = df["symbol"].dropna().astype(str).unique().tolist()
+            fund = download_fundamentals(syms, cache_key="screener_fallback", force=False)
+            if isinstance(fund, pd.DataFrame) and not fund.empty:
+                df = _merge_sector_industry(df, fund)
+        except Exception:
+            # si falla, deja Unknown y sigue
+            df["sector"] = df.get("sector", "").fillna("").replace("", "Unknown")
+            if "industry" in df.columns:
+                df["industry"] = df["industry"].fillna("")
+    else:
+        # si sí llegaron perfiles, sanitiza igual
+        df["sector"] = df.get("sector", "").fillna("").replace("", "Unknown")
+        if "industry" in df.columns:
+            df["industry"] = df["industry"].fillna("")
+
+    # Asegura flags booleanos
     for c in ["isEtf", "isFund", "isAdr"]:
         if c not in df.columns:
             df[c] = False
         df[c] = df[c].fillna(False).astype(bool)
 
+    # IPO a datetime si viene (de perfiles o screener)
     if "ipoDate" not in df.columns:
         df["ipoDate"] = pd.NaT
     else:
@@ -423,7 +500,7 @@ def load_price_panel(symbols: List[str],
             continue
     return panel
 
-# reemplaza tu load_benchmark por este:
+# ============================== BENCHMARK ===============================
 
 _BENCH_ALIAS = {
     "SP500": "^GSPC",
@@ -453,6 +530,7 @@ def load_benchmark(symbol: str,
     df = df.sort_index()
     return df
 
+# =============================== PROBE =================================
 
 def fmp_probe(symbol: str = "AAPL") -> dict:
     """
