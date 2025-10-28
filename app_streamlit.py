@@ -273,6 +273,19 @@ with tab2:
         st.error(f"Error en guardrails: {e}")
 
 # ====== Paso 3: VFQ ======
+# ====== Paso 3: VFQ (PARCHE COMPLETO + UI BONITA) ======
+import altair as alt
+
+def _fmt_mcap(x):
+    try:
+        x = float(x)
+        if x >= 1e12:  return f"${x/1e12:.2f}T"
+        if x >= 1e9:   return f"${x/1e9:.2f}B"
+        if x >= 1e6:   return f"${x/1e6:.2f}M"
+        return f"${x:,.0f}"
+    except Exception:
+        return ""
+
 with tab3:
     st.subheader("VFQ")
     try:
@@ -280,7 +293,9 @@ with tab3:
             uni = st.session_state["uni"]
             kept = st.session_state["kept"]
             kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+
             with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
+                # ↓ usa el caché
                 df_fund = _cached_download_fundamentals(tuple(sorted(kept_syms)), cache_key=cache_tag)
                 base_for_vfq = uni.merge(df_fund, on="symbol", how="right")
 
@@ -298,15 +313,14 @@ with tab3:
                 )
                 status.update(label="VFQ calculado", state="complete")
 
-            # -------- FIX 1: filtro de cobertura tolerante --------
+            # -------- Filtros robustos --------
+            # Cobertura
             if "coverage_count" in df_vfq.columns:
                 mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= int(min_cov)
             else:
-                # Si no hay coverage_count, no bloquees por cobertura
                 mask_cov = pd.Series(True, index=df_vfq.index)
 
-            # -------- FIX 2: filtro por percentil dentro de sector --------
-            # build_vfq_scores_dynamic produce 'VFQ' y 'VFQ_pct_sector'
+            # Percentil intra-sector
             vfq_pct_col = "VFQ_pct_sector" if "VFQ_pct_sector" in df_vfq.columns else None
             if vfq_pct_col:
                 mask_pct = pd.to_numeric(df_vfq[vfq_pct_col], errors="coerce").fillna(1.0) >= float(min_pct)
@@ -325,26 +339,156 @@ with tab3:
             st.info("Primero corre **Guardrails** (botón Ejecutar).")
             st.stop()
 
-        # -------- FIX 3: ordenar por la columna correcta --------
-        sort_col = "VFQ" if "VFQ" in df_vfq_sel.columns else (
-            "VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None
-        )
-        view_df = (
-            df_vfq_sel.sort_values(sort_col, ascending=False).head(300)
-            if sort_col else df_vfq_sel.head(300)
+        # -------- Orden por score correcto --------
+        sort_col = "VFQ" if "VFQ" in df_vfq_sel.columns else ("VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None)
+        view_df = df_vfq_sel.sort_values(sort_col, ascending=False) if sort_col else df_vfq_sel.copy()
+
+        # ================= UI BONITA =================
+        # KPIs + Chart por sector
+        left, right = st.columns([0.25, 0.75])
+        with left:
+            st.markdown("### VFQ")
+            st.metric("Con VFQ calculado", f"{len(df_vfq):,}")
+            st.metric("Seleccionados (filtros)", f"{len(df_vfq_sel):,}")
+        with right:
+            sec = df_vfq_sel.copy()
+            if "sector" not in sec.columns:
+                sec["sector"] = "Unknown"
+            sec["sector"] = sec["sector"].fillna("Unknown").replace("", "Unknown")
+            sector_counts = (
+                sec.groupby("sector", dropna=False)
+                   .size()
+                   .reset_index(name="count")
+                   .sort_values("count", ascending=False)
+                   .head(20)
+            )
+            chart = (
+                alt.Chart(sector_counts)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title="Cantidad"),
+                    y=alt.Y("sector:N", sort="-x", title=None),
+                    tooltip=["sector","count"]
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        st.markdown("---")
+
+        # Búsqueda + orden
+        f1, f2, f3 = st.columns([0.36, 0.36, 0.28])
+        with f1:
+            search = st.text_input("🔎 Buscar (symbol/sector/industry)", "")
+        with f2:
+            order_opts = [c for c in ["VFQ","VFQ_pct_sector","final_alpha","prob_up","qvm_score",
+                                      "BreakoutScore","momentum_score","marketCap_unified","marketCap","price"]
+                          if c in df_vfq_sel.columns]
+            sort_by = st.selectbox("Ordenar por", order_opts, index=0 if order_opts else 0)
+        with f3:
+            ascending = st.toggle("Ascendente", value=False)
+
+        view = view_df.copy()
+
+        # Filtro búsqueda
+        if search.strip():
+            s = search.strip().lower()
+            hay = []
+            for col in ["symbol","sector","industry"]:
+                if col in view.columns:
+                    hay.append(view[col].astype(str).str.lower().str.contains(s, na=False))
+            if hay:
+                mask = hay[0]
+                for m in hay[1:]:
+                    mask = mask | m
+                view = view[mask]
+
+        # Formato columnas
+        if "marketCap_unified" in view.columns:
+            view["market_cap"] = view["marketCap_unified"].apply(_fmt_mcap)
+        elif "marketCap" in view.columns:
+            view["market_cap"] = view["marketCap"].apply(_fmt_mcap)
+
+        if "VFQ_pct_sector" in view.columns:
+            view["VFQ_pct_sector(%)"] = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce")*100
+
+        for col in ["VFQ","value_adj_neut","quality_adj_neut","BreakoutScore","momentum_score","beta","price"]:
+            if col in view.columns:
+                view[col] = pd.to_numeric(view[col], errors="coerce").round(3)
+
+        # Selección y orden de columnas “lindas”
+        pretty_cols = []
+        for c in ["symbol","sector","industry","market_cap","price","beta",
+                  "VFQ","VFQ_pct_sector(%)","value_adj_neut","quality_adj_neut",
+                  "BreakoutScore","momentum_score"]:
+            if c in view.columns:
+                pretty_cols.append(c)
+        if not pretty_cols:  # fallback
+            pretty_cols = view.columns.tolist()
+
+        # Orden
+        if sort_by in view.columns:
+            view = view.sort_values(sort_by, ascending=ascending, na_position="last")
+
+        # Config de columnas
+        cfg = {}
+        if "market_cap" in pretty_cols:
+            cfg["market_cap"] = st.column_config.TextColumn("Market Cap", help="Unificado/estimado")
+        if "price" in pretty_cols:
+            cfg["price"] = st.column_config.NumberColumn("Price", format="%.2f")
+        if "beta" in pretty_cols:
+            cfg["beta"] = st.column_config.NumberColumn("Beta", format="%.3f")
+        if "VFQ" in pretty_cols:
+            cfg["VFQ"] = st.column_config.NumberColumn("VFQ", help="Score agregado", format="%.3f")
+        if "VFQ_pct_sector(%)" in pretty_cols:
+            cfg["VFQ_pct_sector(%)"] = st.column_config.ProgressColumn(
+                "VFQ pct (sector)", help="Percentil intra-sector (0–100%)",
+                min_value=0, max_value=100
+            )
+        if "value_adj_neut" in pretty_cols:
+            cfg["value_adj_neut"] = st.column_config.NumberColumn("Value (neut.)", format="%.3f")
+        if "quality_adj_neut" in pretty_cols:
+            cfg["quality_adj_neut"] = st.column_config.NumberColumn("Quality (neut.)", format="%.3f")
+        if "BreakoutScore" in pretty_cols:
+            cfg["BreakoutScore"] = st.column_config.NumberColumn("Breakout", format="%.3f")
+        if "momentum_score" in pretty_cols:
+            cfg["momentum_score"] = st.column_config.NumberColumn("Momentum", format="%.3f")
+
+        # Tabla
+        st.dataframe(
+            view[pretty_cols].reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+            column_config=cfg
         )
 
-        c1, c2 = st.columns([0.6, 0.4])
+        # Descargas
+        c1, c2, c3 = st.columns(3)
         with c1:
-            st.metric("Con VFQ calculado", f"{len(df_vfq):,}")
-            st.dataframe(view_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Seleccionados (CSV)",
+                view[pretty_cols].to_csv(index=False).encode(),
+                "vfq_seleccionados.csv",
+                use_container_width=True
+            )
         with c2:
-            st.caption("Distribución por sector (seleccionados)")
-            if "sector" in df_vfq_sel.columns and not df_vfq_sel.empty:
-                st.bar_chart(df_vfq_sel["sector"].value_counts().head(15), use_container_width=True)
+            st.download_button(
+                "⬇️ VFQ completo (CSV)",
+                df_vfq.to_csv(index=False).encode(),
+                "vfq_completo.csv",
+                use_container_width=True
+            )
+        with c3:
+            st.download_button(
+                "⬇️ Universo crudo (CSV)",
+                st.session_state.get("uni", pd.DataFrame()).to_csv(index=False).encode(),
+                "universo.csv",
+                use_container_width=True
+            )
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
 
 # ====== Paso 4: SEÑALES (placeholder si tu lógica está en otro módulo) ======
 with tab4:
