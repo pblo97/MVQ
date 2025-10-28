@@ -410,6 +410,7 @@ with tab4:
     except Exception as e:
         st.error(f"Error calculando señales: {e}")
 # ====== Paso 5: QVM (growth-aware) ======
+# ====== Paso 5: QVM (growth-aware) ======
 with tab5:
     st.subheader("QVM (growth-aware)")
     try:
@@ -425,24 +426,62 @@ with tab5:
 
         # --- Base: columnas clave por symbol ---
         base_cols = []
-        for c in ["symbol", "sector", "marketCap", "marketCap_unified", "BreakoutScore", "ClosePos", "P52", "rs_ma20_slope"]:
+        for c in ["symbol","sector","marketCap","marketCap_unified","BreakoutScore","ClosePos","P52","rs_ma20_slope"]:
             if c in sig_df.columns:
                 base_cols.append(c)
 
         base = sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]].drop_duplicates("symbol")
 
+        # Añade VFQ/UNI si existen
         if isinstance(vfq_df, pd.DataFrame) and not vfq_df.empty:
             base = base.merge(vfq_df, on="symbol", how="left", suffixes=("", "_vfq"))
-        if isinstance(uni_df, pd.DataFrame) and {"symbol", "sector", "marketCap"}.issubset(uni_df.columns):
-            base = base.merge(uni_df[["symbol", "sector", "marketCap"]], on="symbol", how="left", suffixes=("", "_uni"))
+        if isinstance(uni_df, pd.DataFrame) and {"symbol","sector","marketCap"}.issubset(uni_df.columns):
+            base = base.merge(uni_df[["symbol","sector","marketCap"]], on="symbol", how="left", suffixes=("", "_uni"))
         if isinstance(kept_df, pd.DataFrame) and "symbol" in kept_df.columns:
             base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
 
-        mom_proxy = build_momentum_proxy(sig_df)
-        if not mom_proxy.empty:
-            base = base.merge(mom_proxy.rename("momentum_score"), on="symbol", how="left")
+        # ------------------- MOMENTUM: SIEMPRE 1D -------------------
+        # 1) Momentum derivado de señales
+        mom_sig = build_momentum_proxy(sig_df)  # Series indexada por symbol
+        if isinstance(mom_sig, pd.Series) and not mom_sig.empty:
+            base = base.merge(mom_sig.to_frame("mom_sig"), left_on="symbol", right_index=True, how="left")
 
-        # Normaliza market cap / sector
+        # 2) Momentum desde precios (si está el panel)
+        mom_px = None
+        try:
+            if isinstance(panel_prices, pd.DataFrame):
+                df_long = panel_prices.rename(columns={"ticker": "symbol"} if "ticker" in panel_prices.columns else {})
+                mom_px = build_momentum_proxy(df_long, )
+            elif isinstance(panel_prices, dict):
+                frames = []
+                for sym, dfp in panel_prices.items():
+                    if isinstance(dfp, pd.DataFrame) and {"close"}.issubset(dfp.columns):
+                        tmp = dfp.reset_index().rename(columns={"index": "date"} if "date" not in dfp.columns else {})
+                        tmp["symbol"] = sym
+                        frames.append(tmp[["symbol","date","close"]])
+                if frames:
+                    df_long = pd.concat(frames, ignore_index=True)
+                    # reutilizamos el mismo proxy para mantener consistencia
+                    mom_px = build_momentum_proxy(sig_df)  # si prefieres, cambia a tu métrica de precio
+        except Exception:
+            mom_px = None
+
+        if isinstance(mom_px, pd.Series) and not mom_px.empty:
+            base = base.merge(mom_px.to_frame("mom_px"), left_on="symbol", right_index=True, how="left")
+
+        # 3) COALESCE: colapsar a una sola columna 'momentum_score' (1D)
+        cand_moms = [c for c in ["momentum_score","mom_sig","mom_px","momentum_score_prices"] if c in base.columns]
+        if cand_moms:
+            base["momentum_score"] = base[cand_moms].astype(float).mean(axis=1, skipna=True)
+            # quita columnas temporales para evitar duplicaciones/2D
+            for c in ["mom_sig","mom_px","momentum_score_prices"]:
+                if c in base.columns:
+                    del base[c]
+        else:
+            base["momentum_score"] = 0.0
+
+        # ------------------- NORMALIZAR CAMPOS BÁSICOS -------------------
+        # Market cap y sector
         if "market_cap" not in base.columns:
             if "marketCap_unified" in base.columns:
                 base["market_cap"] = pd.to_numeric(base["marketCap_unified"], errors="coerce")
@@ -451,33 +490,7 @@ with tab5:
         if "sector" not in base.columns and "sector_vfq" in base.columns:
             base["sector"] = base["sector_vfq"]
 
-        # --- Momentum desde precios (si está el panel) ---
-        momentum = None
-        try:
-            if isinstance(panel_prices, pd.DataFrame):
-                df_long = panel_prices.rename(columns={"ticker": "symbol"} if "ticker" in panel_prices.columns else {})
-                momentum = build_momentum_proxy(df_long, price_col="close", id_col="symbol", date_col="date")
-            elif isinstance(panel_prices, dict):
-                frames = []
-                for sym, dfp in panel_prices.items():
-                    if isinstance(dfp, pd.DataFrame) and {"close"}.issubset(dfp.columns):
-                        tmp = dfp.reset_index().rename(columns={"index": "date"} if "date" not in dfp.columns else {})
-                        tmp["symbol"] = sym
-                        frames.append(tmp[["symbol", "date", "close"]])
-                if frames:
-                    df_long = pd.concat(frames, ignore_index=True)
-                    momentum = build_momentum_proxy(df_long, price_col="close", id_col="symbol", date_col="date")
-        except Exception:
-            momentum = None
-
-        if isinstance(momentum, pd.Series) and not momentum.empty:
-            base = base.merge(momentum.rename("momentum_score_prices"), on="symbol", how="left")
-            base["momentum_score"] = base[["momentum_score", "momentum_score_prices"]].mean(axis=1, skipna=True)
-        else:
-            if "momentum_score" not in base.columns:
-                base["momentum_score"] = 0.0  # neutro
-
-        # --- QVM growth-aware ---
+        # ------------------- QVM growth-aware -------------------
         qvm_df = compute_qvm_scores(
             base.rename(columns={"marketCap": "market_cap"}),
             w_quality=0.40, w_value=0.25, w_momentum=0.35,
@@ -494,40 +507,44 @@ with tab5:
             value_col="value_adj_neut"
         )
 
-        # Blend con breakout (si está disponible). Percentil a "final_alpha".
+        # ------------------- BLEND con Breakout (robusto) -------------------
+        # Z-score seguro sin depender de helpers privados
+        def _z(s):
+            s = pd.to_numeric(s, errors="coerce")
+            mu = s.mean(skipna=True)
+            sd = s.std(skipna=True)
+            if sd and sd > 0:
+                return (s - mu) / sd
+            return pd.Series(0.0, index=s.index)
+
         if "BreakoutScore" in base.columns:
-            blend = blend_breakout_qvm(
-                pd.DataFrame({
-                    "qvm_score": qvm_df["qvm_score"],
-                    "breakout_score": pd.to_numeric(base["BreakoutScore"], errors="coerce"),
-                    "momentum_score": qvm_df.get("momentum_score")
-                }),
-                col_qvm="qvm_score",
-                col_breakout="breakout_score",
-                w_qvm=0.70,
-                w_breakout=0.30,
-                to_percentile=True
-            )
-            qvm_df["final_alpha"] = blend
+            b = pd.to_numeric(base["BreakoutScore"], errors="coerce").fillna(0.0)
+            qvm_z = _z(qvm_df["qvm_score"])
+            bo_z  = _z(b)
+            final_alpha = 0.70*qvm_z + 0.30*bo_z
         else:
-            s = qvm_df["qvm_score"]
-            qvm_df["final_alpha"] = s.rank(pct=True, method="average")
+            final_alpha = qvm_df["qvm_score"].rank(pct=True, method="average")
 
-        if "final_alpha" in qvm_df.columns:
-            pct = qvm_df["final_alpha"].rank(pct=True, method="average")
-            qvm_df["final_alpha_pct"] = pct
-            qvm_df["prob_up"] = _probability_from_percentile(pct, beta=beta_prob)
+        qvm_df["final_alpha"] = final_alpha
+        pct = qvm_df["final_alpha"].rank(pct=True, method="average")
+        qvm_df["final_alpha_pct"] = pct
 
+        # Probabilidad logística a partir del percentil
+        def _probability_from_percentile(pct_s: pd.Series, beta: float = 6.0) -> pd.Series:
+            s = pd.to_numeric(pct_s, errors="coerce").fillna(0.5).clip(0, 1)
+            return 1.0 / (1.0 + np.exp(-beta * (s - 0.5)))
+        qvm_df["prob_up"] = _probability_from_percentile(pct, beta=beta_prob)
+
+        # ------------------- VISUAL -------------------
         st.metric("Con QVM calculado", f"{len(qvm_df):,}")
         show_cols = [c for c in [
-            "symbol", "sector", "market_cap", "qvm_score", "final_alpha",
-            "value_adj_neut", "quality_adj_neut", "mega_exception_ok",
-            "final_alpha_pct", "prob_up", "quality_too_low",
-            "BreakoutScore", "momentum_score"
+            "symbol","sector","market_cap","qvm_score","final_alpha",
+            "value_adj_neut","quality_adj_neut","mega_exception_ok",
+            "final_alpha_pct","prob_up","quality_too_low","BreakoutScore","momentum_score"
         ] if c in qvm_df.columns]
 
         st.dataframe(
-            qvm_df[show_cols].sort_values(["final_alpha", "qvm_score"], ascending=False).head(300),
+            qvm_df[show_cols].sort_values(["final_alpha","qvm_score"], ascending=False).head(300),
             use_container_width=True, hide_index=True
         )
 
@@ -535,14 +552,15 @@ with tab5:
             st.subheader(f"Top {top_n_show} por probabilidad de alza")
             top_cols = [c for c in show_cols if c in qvm_df.columns]
             st.dataframe(
-                qvm_df.sort_values(["prob_up", "final_alpha"], ascending=False).head(top_n_show)[top_cols],
-                use_container_width=True,
-                hide_index=True
+                qvm_df.sort_values(["prob_up","final_alpha"], ascending=False).head(top_n_show)[top_cols],
+                use_container_width=True, hide_index=True
             )
 
         st.session_state["qvm"] = qvm_df
+
     except Exception as e:
         st.error(f"Error en QVM growth-aware: {e}")
+
 
 # ====== Paso 6: EXPORT ======
 with tab6:
