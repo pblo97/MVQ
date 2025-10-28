@@ -200,37 +200,95 @@ def quality_intangible_aware(df: pd.DataFrame) -> pd.Series:
     ).fillna(0.0)
 
 # ------------------- Sector & Cap Neutralization -----------------
-def neutralize_by_sector_cap(df: pd.DataFrame, score_col: str, sector_col: str = "sector",
+def neutralize_by_sector_cap(df: pd.DataFrame, 
+                             score_col: str, 
+                             sector_col: str = "sector",
                              mcap_col: str = "market_cap",
                              buckets=(("Mega", 150e9, np.inf),
-                                        ("Large", 10e9, 150e9),
-                                        ("Mid",   2e9, 10e9),
-                                        ("Small", 0,   2e9))) -> pd.Series:
+                                      ("Large", 10e9, 150e9),
+                                      ("Mid",   2e9, 10e9),
+                                      ("Small", 0,   2e9))) -> pd.Series:
     out = df.copy()
 
-    # sector/cap fallbacks
+    # Fallbacks básicos
     if sector_col not in out.columns:
         out[sector_col] = "Unknown"
     if mcap_col not in out.columns:
         out[mcap_col] = np.nan
 
     out[mcap_col] = _to_float(out[mcap_col])
-    # Construimos cortes robustos
-    edges = [b[1] for b in buckets] + [buckets[-1][2]]
-    labels = [b[0] for b in buckets]
-    out["_cap_bucket"] = pd.cut(out[mcap_col], bins=edges, labels=labels, include_lowest=True, right=False)
 
+    # --- 1) Armar bins válidos (crecientes) a partir de 'buckets' ---
+    #     Ordenamos por límite inferior y reconstruimos "bins" + "labels"
+    try:
+        # Ordena por low ascendente
+        b_sorted = sorted(list(buckets), key=lambda t: float(t[1]))
+        lows  = [float(b[1]) for b in b_sorted]
+        highs = [float(b[2]) for b in b_sorted]
+        labels = [str(b[0]) for b in b_sorted]
+
+        # Verificación de consistencia (cada low < high)
+        for lo, hi in zip(lows, highs):
+            if not (lo < hi):
+                raise ValueError("Cada bucket debe cumplir low < high")
+
+        # Construye bins crecientes: [low0, low1, ..., lowN, highN]
+        # (asumimos rangos contiguos y sin solapamiento en la definición)
+        bins = lows + [highs[-1]]
+
+        # Asegura estrictamente crecientes + únicos
+        bins = np.array(bins, dtype=float)
+        if not np.all(np.diff(bins) > 0):
+            # Si viene algo mal (duplicados/desc), reordena y unifica
+            uniq = np.unique(bins)
+            if len(uniq) < 2:
+                raise ValueError("No hay cortes suficientes para binning")
+            bins = uniq
+
+        # Ajuste de etiquetas al número de intervalos
+        if len(labels) != (len(bins) - 1):
+            # Recalcula labels simple (Small < Mid < Large < Mega)
+            labels = [f"Cap_{i+1}" for i in range(len(bins) - 1)]
+
+        # --- 2) Cortes por market cap ---
+        out["_cap_bucket"] = pd.cut(out[mcap_col], bins=bins, labels=labels, include_lowest=True, right=False)
+
+        # Si todos quedaron NaN (p.ej. datos muy raros), fuerza un solo bucket
+        if out["_cap_bucket"].notna().sum() == 0:
+            out["_cap_bucket"] = "Cap_All"
+
+    except Exception:
+        # Fallback robusto: cuantiles (hasta 4), evitando bins no únicos
+        q = _to_float(out[mcap_col])
+        if q.notna().nunique() < 2:
+            out["_cap_bucket"] = "Cap_All"
+        else:
+            try:
+                # cuantiles 0-25-50-75-100
+                out["_cap_bucket"] = pd.qcut(q, q=4, duplicates="drop")
+            except Exception:
+                out["_cap_bucket"] = "Cap_All"
+
+    # --- 3) Estandarización por sector y por cap bucket ---
     def z_by(group):
         s = group[score_col]
         return _zscore(s)
 
+    # Z por sector
     z_sector = out.groupby(sector_col, group_keys=False).apply(z_by).rename("z_sector")
-    z_cap    = out.groupby("_cap_bucket", group_keys=False).apply(z_by).rename("z_cap")
+
+    # Z por cap bucket (si solo hay una categoría, el z-score saldrá todo 0)
+    z_cap = out.groupby("_cap_bucket", group_keys=False).apply(z_by).rename("z_cap")
 
     out["_z_sector"] = z_sector
     out["_z_cap"] = z_cap
-    return (0.5 * out["_z_sector"] + 0.5 * out["_z_cap"]).fillna(0.0)
 
+    # Si por cualquier razón z_cap es todo NaN, usa solo z_sector
+    if _to_float(out["_z_cap"]).notna().sum() == 0:
+        return out["_z_sector"].fillna(0.0)
+
+    # Blend 50/50
+    return (0.5 * out["_z_sector"] + 0.5 * out["_z_cap"]).fillna(0.0)
 # ----------------------------- QVM -------------------------------
 def compute_qvm_scores(df: pd.DataFrame, 
                        w_quality: float = 0.40,
