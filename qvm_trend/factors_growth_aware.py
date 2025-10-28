@@ -203,9 +203,9 @@ def quality_intangible_aware(df: pd.DataFrame) -> pd.Series:
 def neutralize_by_sector_cap(df: pd.DataFrame, score_col: str, sector_col: str = "sector",
                              mcap_col: str = "market_cap",
                              buckets=(("Mega", 150e9, np.inf),
-                                      ("Large", 10e9, 150e9),
-                                      ("Mid",   2e9, 10e9),
-                                      ("Small", 0,   2e9))) -> pd.Series:
+                                        ("Large", 10e9, 150e9),
+                                        ("Mid",   2e9, 10e9),
+                                        ("Small", 0,   2e9))) -> pd.Series:
     out = df.copy()
 
     # sector/cap fallbacks
