@@ -426,6 +426,24 @@ def _fetch_min_battle_fmp(symbol: str, market_cap_hint: float | None = None) -> 
     out["__src_roa"]  = "ttm" if roa_t is not None else None
     out["__src_nmar"] = "ttm" if nmar_t is not None else None
 
+    # --- COMPANY PROFILE (sector, industry, price, beta, marketCap) ---
+    try:
+        prof = _http_get(f"https://financialmodelingprep.com/api/v3/profile/{s}")
+        p0 = _first_obj(prof)
+    except Exception:
+        p0 = {}
+
+    # sector/industry para enriquecer VFQ y neutralización
+    out["sector"]   = p0.get("sector") or out.get("sector") or "Unknown"
+    out["industry"] = p0.get("industry") or out.get("industry")
+
+    # datos útiles para la vista
+    if out.get("marketCap") is None:
+        out["marketCap"] = _num(p0.get("mktCap"))
+    out["price"] = _num(p0.get("price"))
+    out["beta"]  = _num(p0.get("beta"))
+
+
     # Fallback annual si falta algo crítico
     need_annual = any(
         x is None for x in [out["evToEbitda"], out["grossProfitTTM"], out["totalAssetsTTM"],

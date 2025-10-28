@@ -322,57 +322,36 @@ def _fmt_mcap(x):
 with tab3:
     st.subheader("VFQ")
     try:
-        # --------- precondiciones ----------
-        if not (run_btn and "kept" in st.session_state):
-            st.info("Presiona **Run** y asegúrate de tener símbolos seleccionados en 'kept'.")
-        else:
-            uni: pd.DataFrame = st.session_state.get("uni", pd.DataFrame())
-            kept: pd.DataFrame = st.session_state["kept"]
-            kept_syms = (
-                kept.get("symbol", pd.Series(dtype=str))
-                    .dropna()
-                    .astype(str)
-                    .unique()
-                    .tolist()
+        if run_btn and "kept" in st.session_state:
+            uni  = st.session_state["uni"]
+            kept = st.session_state["kept"]
+            kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+
+            # --- HINT de market cap desde el universo ---
+            mc_hint_df = (
+                uni.loc[uni["symbol"].isin(kept_syms), ["symbol","marketCap"]]
+                   .dropna(subset=["symbol"])
             )
-            if not kept_syms:
-                st.warning("No hay símbolos en 'kept'.")
-                st.stop()
+            mc_hint_df["symbol"] = mc_hint_df["symbol"].astype(str)
+            mc_hint_df["marketCap"] = pd.to_numeric(mc_hint_df["marketCap"], errors="coerce")
+            mc_pairs = tuple(
+                (row.symbol, float(row.marketCap))
+                for _, row in mc_hint_df.dropna(subset=["marketCap"]).iterrows()
+            )
 
-            # ---------- mc_pairs (hint de market cap) ----------
-            def _build_mc_pairs(df_base: pd.DataFrame, syms: list[str]) -> tuple:
-                if df_base is None or df_base.empty:
-                    return tuple()
-                cols = [c for c in ["symbol", "marketCap_unified", "marketCap"] if c in df_base.columns]
-                if not cols or "symbol" not in cols:
-                    return tuple()
-                df_sub = df_base.loc[df_base["symbol"].astype(str).isin(syms), cols].copy()
-                # unifica marketcap
-                if "marketCap_unified" in df_sub.columns:
-                    mcap = pd.to_numeric(df_sub["marketCap_unified"], errors="coerce")
-                else:
-                    mcap = pd.to_numeric(df_sub["marketCap"], errors="coerce")
-                symbols = df_sub["symbol"].astype(str)
-                pairs = [(s, float(m)) for s, m in zip(symbols, mcap) if pd.notna(m)]
-                return tuple(pairs)
-
-            mc_pairs = _build_mc_pairs(uni, kept_syms)
-
-            # ---------- descarga fundamentals ----------
             with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
+                # ✅ ÚNICA llamada, pasando mc_pairs
                 df_fund = _cached_download_fundamentals(
                     tuple(sorted(kept_syms)),
                     cache_key=cache_tag,
                     mc_pairs=mc_pairs
                 )
 
-                # enriquecer universo con sector/industry desde fundamentals
+                # Enriquecer universo con sector/industry desde fundamentals
                 uni_enriched = _enrich_sector_industry(uni, df_fund)
 
-                # base para VFQ
                 base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
 
-                # ========== cálculo VFQ (dinámico) ==========
                 df_vfq = build_vfq_scores_dynamic(
                     base_for_vfq,
                     value_metrics=vfq_cfg["value_metrics"],
@@ -384,21 +363,18 @@ with tab3:
                     size_buckets=vfq_cfg["size_buckets"],
                     group_mode=vfq_cfg["group_mode"],
                 )
-                status.update(label="VFQ calculado ✅", state="complete")
+                status.update(label="VFQ calculado", state="complete")
 
-            # conservar sector/industry originales si existen
-            keep_cols = ["symbol"]
-            if "sector" in uni_enriched.columns:
-                keep_cols.append("sector")
-            if "industry" in uni_enriched.columns:
-                keep_cols.append("industry")
-
-            df_vfq = (
-                df_vfq.drop(columns=["sector", "industry"], errors="ignore")
-                      .merge(uni_enriched[keep_cols].drop_duplicates("symbol"), on="symbol", how="left")
-            )
-            df_vfq["sector"] = df_vfq.get("sector", "Unknown")
-            df_vfq["sector"] = df_vfq["sector"].replace("", "Unknown").fillna("Unknown")
+                # Asegura sector/industry intactos
+                keep_cols = ["symbol", "sector"]
+                if "industry" in uni_enriched.columns:
+                    keep_cols.append("industry")
+                df_vfq = (
+                    df_vfq.drop(columns=["sector","industry"], errors="ignore")
+                          .merge(uni_enriched[keep_cols].drop_duplicates("symbol"),
+                                 on="symbol", how="left")
+                )
+                df_vfq["sector"] = df_vfq["sector"].fillna("Unknown").replace("", "Unknown")
 
             # --------- selección visual (si ya existe un filtro previo), si no usa df_vfq ---------
             df_vfq_sel = st.session_state.get("df_vfq_sel", None)
@@ -481,10 +457,17 @@ with tab3:
                 view["market_cap"] = pd.to_numeric(view["marketCap"], errors="coerce").apply(_fmt_mcap)
 
             # normaliza percentil si viene 0..100
+            # --- Normaliza y crea la columna para la barra de progreso ---
             if "VFQ_pct_sector" in view.columns:
                 pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce")
+
+                # Si por error viene en 0..100 (como en tu captura), lo paso a 0..1
                 pct = np.where(pct > 1.5, pct / 100.0, pct)
-                view["VFQ pct (sector)"] = (pd.Series(pct, index=view.index) * 100).astype(float)
+
+                # Clampeo seguro 0..1 y creo la columna mostrable 0..100
+                pct = pd.Series(pct, index=view.index).clip(0.0, 1.0)
+                view["VFQ pct (sector)"] = (pct * 100).round(2).clip(0, 100)
+
 
             # redondeos cómodos
             for col in ["VFQ", "value_adj_neut", "quality_adj_neut", "BreakoutScore", "momentum_score", "beta", "price"]:
