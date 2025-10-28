@@ -93,7 +93,7 @@ with st.sidebar:
     preset = st.segmented_control("Preset", options=["Laxo","Balanceado","Estricto"], default="Balanceado")
 
     with st.expander("Universo & Screener", expanded=True):
-        limit = st.slider("Límite del universo", 50, 800, 300, 50)
+        limit = st.slider("Límite del universo", 100, 2000, 300, 50)
         min_mcap = st.number_input("MarketCap mínimo (USD)", value=5e8, step=1e8, format="%.0f")
         ipo_days = st.slider("Antigüedad IPO (días)", 90, 1500, 365, 30)
 
