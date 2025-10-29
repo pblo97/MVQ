@@ -132,14 +132,28 @@ def _enrich_sector_industry(uni_df: pd.DataFrame, src_df: pd.DataFrame) -> pd.Da
 
     return out
 
+def _as_series(x, index=None):
+    """Garantiza Serie. Si x es escalar/str/list, lo convierte a Serie con index dado."""
+    import pandas as pd
+    if isinstance(x, pd.Series):
+        return x
+    return pd.Series(x, index=index)
+
 def _ensure_sector_strings(df: pd.DataFrame, sector_col="sector", industry_col="industry") -> pd.DataFrame:
-    """Forza sector/industry a str seguros y rellena Unknown / vacío donde corresponda."""
+    """Sector/industry siempre como strings seguros (sin None) y sin vacíos."""
+    import numpy as np
     if sector_col not in df.columns:
-        df[sector_col] = "Unknown"
+        df[sector_col] = pd.Series(["Unknown"] * len(df), index=df.index)  # <- evita string escalar
     else:
-        df[sector_col] = df[sector_col].astype(str).replace({"": "Unknown"}).fillna("Unknown")
+        s = _as_series(df[sector_col], df.index)
+        s = s.astype(str)
+        s = s.replace({"": "Unknown"})
+        s = s.where(~s.isna(), "Unknown")
+        df[sector_col] = s
+
     if industry_col in df.columns:
-        df[industry_col] = df[industry_col].astype(str).fillna("")
+        t = _as_series(df[industry_col], df.index)
+        df[industry_col] = t.astype(str).where(~t.isna(), "")
     return df
 
 # ==================== HEADER ====================
@@ -359,7 +373,7 @@ with tab3:
             )
 
             with st.status("Descargando fundamentales VFQ (TTM)…", expanded=False) as status:
-                # ✅ ÚNICA llamada, pasando mc_pairs
+                # ÚNICA llamada, pasando mc_pairs
                 df_fund = _cached_download_fundamentals(
                     tuple(sorted(kept_syms)),
                     cache_key=cache_tag,
@@ -370,7 +384,7 @@ with tab3:
                 uni_enriched = _enrich_sector_industry(uni, df_fund)
                 uni_enriched = _ensure_sector_strings(uni_enriched)
 
-                # Base para VFQ
+                # Base para VFQ (mantén right para no perder fundamentales descargados)
                 base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
 
                 # ===== Cálculo VFQ =====
@@ -400,7 +414,6 @@ with tab3:
                 # ===== Percentil intra-sector (0..1) =====
                 score_col = "VFQ" if "VFQ" in df_vfq.columns else ("VFQ_score" if "VFQ_score" in df_vfq.columns else None)
                 if score_col is not None:
-                    # rank pct por sector (si sector viene vacío, ya está como "Unknown")
                     df_vfq["VFQ_pct_sector"] = (
                         df_vfq.groupby(df_vfq["sector"])[score_col]
                               .rank(pct=True, method="average")
@@ -410,7 +423,7 @@ with tab3:
                 else:
                     df_vfq["VFQ_pct_sector"] = 1.0
 
-                # ===== Filtro sanitario robusto =====
+                # ===== Filtro sanitario =====
                 strict_filters = True
                 if strict_filters:
                     rev = _numcol(df_vfq, "revenue_ttm")
@@ -422,7 +435,7 @@ with tab3:
                 else:
                     mask_sane = pd.Series(True, index=df_vfq.index)
 
-                # ===== Filtros cobertura/percentil =====
+                # ===== Filtros cobertura/percentil (usa valores actuales de la sidebar si los pusiste en session) =====
                 min_cov = int(st.session_state.get("min_cov", 0)) if "min_cov" in st.session_state else 0
                 min_pct = float(st.session_state.get("min_pct", 0.0)) if "min_pct" in st.session_state else 0.0
 
@@ -435,7 +448,7 @@ with tab3:
 
                 df_vfq_sel = df_vfq.loc[mask_cov & mask_pct & mask_sane].copy()
 
-                # Guarda en session_state para otros tabs
+                # Guarda para otros tabs
                 st.session_state["vfq"]     = df_vfq
                 st.session_state["vfq_sel"] = df_vfq_sel
 
@@ -455,7 +468,6 @@ with tab3:
             sort_col = "VFQ_score"
         else:
             sort_col = None
-
         view_df = df_vfq_sel.sort_values(sort_col, ascending=False) if sort_col else df_vfq_sel.copy()
 
         # ===== KPIs y gráfico por sector =====
@@ -500,6 +512,7 @@ with tab3:
             ascending = st.toggle("Ascendente", value=False)
 
         view = view_df.copy()
+        view = _ensure_sector_strings(view)
 
         # Filtro por texto
         if search.strip():
@@ -601,6 +614,7 @@ with tab3:
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
+
 
 # ====== Paso 4: SEÑALES (placeholder si tu lógica está en otro módulo) ======
 with tab4:
