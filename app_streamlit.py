@@ -31,7 +31,7 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 
 # ============== IMPORTS DE TU PIPELINE ==============
 from qvm_trend.scoring import (
-    blend_breakout_qvm, build_momentum_proxy,standardize_fundamentals
+    blend_breakout_qvm, build_momentum_proxy
 )
 from qvm_trend.data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
@@ -48,7 +48,7 @@ from qvm_trend.pipeline import (
 from qvm_trend.backtests import backtest_many
 
 # NUEVOS IMPORTS (growth-aware)
-from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules
+from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules, standardize_fundamentals
 
 # ------------------ CACHÉ DE I/O ------------------
 @st.cache_data(ttl=3600, show_spinner=False)
