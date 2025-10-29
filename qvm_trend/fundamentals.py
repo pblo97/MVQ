@@ -1000,97 +1000,113 @@ def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series(np.nan, index=d.index)
     return pd.to_numeric(d[col], errors="coerce")
 
-def apply_quality_guardrails(df: pd.DataFrame,
-                             require_profit_floor: bool = True,
-                             profit_floor_min_hits: int = 1,   # 1 de 3: EBIT/CFO/FCF > 0
-                             max_net_issuance: float = 0.08,   # emisión neta máx. 8% a 1a
-                             max_asset_growth: float = 0.35,   # crecimiento activos máx.
-                             max_accruals_ta: float = 0.15,    # Sloan accruals/TA máx.
-                             max_netdebt_ebitda: float = 4.0,  # apalancamiento máx.
-                             *,
-                             # -------- NUEVO: filtros anti-basura/liquidez --------
-                             min_price: float = 5.0,
-                             min_dollar_vol: float = 2_000_000.0,
-                             min_mcap: float = 500_000_000.0,
-                             drop_pre_rev_biotech: bool = True,
-                             ps_limit_for_loss: float = 40.0,
-                             min_rev_for_non_fin: float = 50_000_000.0
-                             ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Devuelve (df_filtrado, df_con_flags). Si alguna métrica falta, la máscara correspondiente
-    se considera True (tolerante a datos faltantes).
-    """
+def apply_quality_guardrails(
+    df: pd.DataFrame,
+    require_profit_floor: bool = True,
+    profit_floor_min_hits: int = 1,
+    max_net_issuance: float = 0.08,
+    max_asset_growth: float = 0.35,
+    max_accruals_ta: float = 0.15,
+    max_netdebt_ebitda: float = 4.0,
+    *,
+    # Anti-basura / liquidez (puedes sobreescribir desde la UI)
+    min_price: float = 5.0,
+    min_dollar_vol: float = 2_000_000.0,
+    min_mcap: float = 500_000_000.0,
+    drop_pre_rev_biotech: bool = True,
+    ps_limit_for_loss: float = 40.0,
+    min_rev_for_non_fin: float = 50_000_000.0
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     d = df.copy()
 
-    # ------------------------- Liquidez mínima -------------------------
+    # ====== lecturas numéricas robustas ======
     px   = _first_num(d, ["price", "Price", "lastPrice"])
     dv   = _first_num(d, ["avgDollarVol_3m", "dollarVol_3m", "avgDollarVolume3m"])
     mcap = _first_num(d, ["marketCap_unified", "marketCap", "MarketCap", "marketCap_profile"])
 
-    liq_pass = (px >= min_price) & (mcap >= min_mcap)
+    # ====== LIQUIDEZ (dv es opcional) ======
+    liq_pass = (px >= float(min_price)) & (mcap >= float(min_mcap))
     if not dv.isna().all():
-        liq_pass = liq_pass & (dv >= min_dollar_vol)
+        liq_pass = liq_pass & (dv >= float(min_dollar_vol))
+    # Si dv está completamente vacío, NO bloqueamos por eso.
 
-    # ------------------ Anti-junk: pre-revenue & story stocks ---------
+    # ====== ANTI-JUNK ======
     sector   = d.get("sector",   pd.Series(index=d.index, dtype=object)).astype(str)
     industry = d.get("industry", pd.Series(index=d.index, dtype=object)).astype(str)
-
-    rev   = _first_num(d, ["revenue_ttm", "revenueTTM", "totalRevenueTTM"]).fillna(0.0)
-    gp    = _first_num(d, ["gross_profit_ttm", "grossProfitTTM"])
-    sales = _first_num(d, ["sales_ntm", "revenue_ntm", "salesNTM"])  # si no hay, caerá a NaN
-    nmar  = _first_num(d, ["netMargin", "net_margin", "netMarginTTM"])
+    rev      = _first_num(d, ["revenue_ttm", "revenueTTM", "totalRevenueTTM"]).fillna(0.0)
+    gp       = _first_num(d, ["gross_profit_ttm", "grossProfitTTM"])
+    sales    = _first_num(d, ["sales_ntm", "revenue_ntm", "salesNTM"])
+    nmar     = _first_num(d, ["netMargin", "net_margin", "netMarginTTM"])
 
     biotech_flag = sector.str.contains("health", case=False, na=False) & \
                    industry.str.contains("biotech|drug", case=False, na=False)
-    pre_rev = (rev < min_rev_for_non_fin) | (gp.fillna(0.0) <= 0.0)
+    pre_rev = (rev < float(min_rev_for_non_fin)) | (gp.fillna(0.0) <= 0.0)
 
+    # PS ratio (mcap / ventas). Si no hay ventas -> NaN -> no bloquea por story, a menos que haya cifra.
     ps = (mcap / sales.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
-    story_flag = (ps >= ps_limit_for_loss) & (nmar <= 0.0)
+    story_flag = (ps >= float(ps_limit_for_loss)) & (nmar <= 0.0)
 
-    anti_junk_pass = ~((drop_pre_rev_biotech & biotech_flag & pre_rev) | story_flag)
+    anti_junk_pass = ~((bool(drop_pre_rev_biotech) & biotech_flag & pre_rev) | story_flag)
+    anti_junk_pass = anti_junk_pass.fillna(True)
 
-    # ------------------ Profit floor (1 de 3 por defecto) --------------------
+    # ====== PISO DE UTILIDADES (1 de 3) ======
     ebit = _first_num(d, ["ebit_ttm", "EBITTTM", "ebitTTM"])
     cfo  = _first_num(d, ["cfo_ttm", "cashFromOperationsTTM", "operatingCashFlowTTM"])
     fcf  = _first_num(d, ["fcf_ttm", "freeCashFlowTTM", "FCFTTM"])
     hits = (ebit > 0).astype(int) + (cfo > 0).astype(int) + (fcf > 0).astype(int)
     profit_pass = (hits >= int(profit_floor_min_hits)) if require_profit_floor else pd.Series(True, index=d.index, dtype=bool)
+    profit_pass = profit_pass.fillna(True)
 
-    # ------------------ Emisión neta (dilución) ------------------------------
-    # Intenta múltiples nombres; interpreta como % (0.10 = +10%) o fracción anual
-    net_iss = _first_num(d, [
-        "net_issuance", "netIssuance", "net_issuance_ttm",
-        "share_issuance_pct_ttm", "shares_change_1y", "sharesChange1Y"
-    ])
+    # ====== EMISIÓN NETA ======
+    net_iss = _first_num(d, ["net_issuance", "netIssuance", "net_issuance_ttm",
+                             "share_issuance_pct_ttm", "shares_change_1y", "sharesChange1Y"])
     issuance_pass = pd.Series(True, index=d.index, dtype=bool)
     if not net_iss.isna().all():
-        issuance_pass = (net_iss <= max_net_issuance) | net_iss.isna()
+        # si viene en % (p.ej 7.5), asumir 0.075 si > 2
+        net_iss_scaled = net_iss.copy()
+        net_iss_scaled[net_iss_scaled.abs() > 2] = net_iss_scaled[net_iss_scaled.abs() > 2] / 100.0
+        issuance_pass = (net_iss_scaled <= float(max_net_issuance)) | net_iss_scaled.isna()
+    issuance_pass = issuance_pass.fillna(True)
 
-    # ------------------ Crecimiento de activos -------------------------------
-    # Si hay tasa explícita, úsala; si no, intenta construir con TA_ttm y TA_1y
+    # ====== CRECIMIENTO DE ACTIVOS ======
     asset_g = _first_num(d, ["asset_growth_ttm", "assetGrowth", "assets_yoy", "assetsYoY"])
     if asset_g.isna().all():
         ta_now = _first_num(d, ["totalAssetsTTM", "total_assets_ttm", "TotalAssetsTTM"])
         ta_1y  = _first_num(d, ["totalAssetsTTM_1y", "total_assets_ttm_1y", "TotalAssetsTTM_1Y"])
         asset_g = (ta_now / ta_1y.replace(0, np.nan) - 1.0).replace([np.inf, -np.inf], np.nan)
-    asset_pass = pd.Series(True, index=d.index, dtype=bool)
-    if not asset_g.isna().all():
-        asset_pass = (asset_g <= max_asset_growth) | asset_g.isna()
+    # Corrige escala si parece porcentaje mal escalado
+    ag = asset_g.copy()
+    ag[ag.abs() > 2] = ag[ag.abs() > 2] / 100.0
+    asset_pass = (ag <= float(max_asset_growth)) | ag.isna()
+    asset_pass = asset_pass.fillna(True)
 
-    # ------------------ Sloan accruals / Total Assets ------------------------
+    # ====== SLOAN ACCRUALS / TA ======
     accr_ta = _first_num(d, ["accruals_ta", "sloan_accruals_ta", "accrualsTotAssets", "accruals_to_assets"])
-    accruals_pass = pd.Series(True, index=d.index, dtype=bool)
-    if not accr_ta.isna().all():
-        accruals_pass = (accr_ta.abs() <= max_accruals_ta) | accr_ta.isna()
+    ac = accr_ta.copy()
+    ac[ac.abs() > 2] = ac[ac.abs() > 2] / 100.0
+    accruals_pass = (ac.abs() <= float(max_accruals_ta)) | ac.isna()
+    accruals_pass = accruals_pass.fillna(True)
 
-    # ------------------ Apalancamiento: Net Debt / EBITDA --------------------
+    # ====== NET DEBT / EBITDA ======
     nde = _first_num(d, ["netDebtToEBITDA", "net_debt_to_ebitda", "NetDebtToEBITDA"])
-    lev_pass = pd.Series(True, index=d.index, dtype=bool)
-    if not nde.isna().all():
-        lev_pass = (nde <= max_netdebt_ebitda) | nde.isna()
+    nde[nde < 0] = np.nan  # valores negativos → tratar como sin deuda neta
+    lev_pass = (nde <= float(max_netdebt_ebitda)) | nde.isna()
+    lev_pass = lev_pass.fillna(True)
 
-    # -------------------------- Máscara final --------------------------------
+    # ====== máscara final ======
     mask = liq_pass & anti_junk_pass & profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
+
+    # ====== trazabilidad de motivos ======
+    reasons = []
+    reasons.append(np.where(liq_pass, "", "liq"))
+    reasons.append(np.where(anti_junk_pass, "", "junk"))
+    reasons.append(np.where(profit_pass, "", "profit"))
+    reasons.append(np.where(issuance_pass, "", "issue"))
+    reasons.append(np.where(asset_pass, "", "assets"))
+    reasons.append(np.where(accruals_pass, "", "accruals"))
+    reasons.append(np.where(lev_pass, "", "leverage"))
+    reasons = np.column_stack(reasons)
+    d["guard_reason"] = [";".join(r for r in row if r) or "" for row in reasons]
 
     d["guard_liquidity"] = liq_pass
     d["guard_anti_junk"] = anti_junk_pass
@@ -1102,6 +1118,7 @@ def apply_quality_guardrails(df: pd.DataFrame,
     d["guard_all"]       = mask
 
     return d[mask].copy(), d
+
 
 
 # ======================================================================
