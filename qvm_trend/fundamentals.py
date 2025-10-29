@@ -820,9 +820,10 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     """
     Fusiona universo + fundamentales mínimos y calcula VFQ de forma tolerante a NaNs.
     Devuelve un DF con:
-      ['symbol','sector','marketCap_unified','coverage_count','ValueScore','QualityScore','VFQ','VFQ_pct_sector', ...]
+      ['symbol','sector','industry','marketCap_unified','coverage_count',
+       'ValueScore','QualityScore','VFQ','VFQ_pct_sector', ...]
+    Nota: aplica guardrails "blandos" (anti-junk + liquidez) ANULANDO puntajes fuera de regla.
     """
-    # --- merge base
     dfu = df_universe.copy() if isinstance(df_universe, pd.DataFrame) else pd.DataFrame()
     dff = df_fund.copy()     if isinstance(df_fund, pd.DataFrame)     else pd.DataFrame()
 
@@ -832,22 +833,26 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     if "symbol" not in dff.columns:
         dff = pd.DataFrame(columns=["symbol"])
 
+    # --- merge base
     df = dfu.merge(dff, on="symbol", how="left").copy()
     df["symbol"] = df["symbol"].astype(str).str.upper()
 
-    # --- columnas de identificación
-    for col in ["sector","industry"]:
-        if col not in df.columns:
-            df[col] = "Unknown"
-    df["sector"] = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
+    # --- coalesce sector/industry (preferir lo ya presente; completar con faltantes)
+    for c in ["sector", "industry"]:
+        if c not in df.columns:
+            df[c] = np.nan
+    # normalización simple
+    df[["sector","industry"]] = df[["sector","industry"]].astype(str).replace({"None":"", "nan":"", "NaN":""})
+    df.loc[df["sector"].eq(""),   "sector"]   = "Unknown"
+    df.loc[df["industry"].eq(""), "industry"] = "Unknown"
 
-    # --- market cap unificado (robusto a _x/_y y variantes)
+    # --- market cap unificado (robusto a variantes)
     def to_num(colname: str) -> pd.Series:
         return pd.to_numeric(df[colname], errors="coerce") if colname in df.columns else pd.Series(np.nan, index=df.index)
 
     mcap = pd.Series(np.nan, index=df.index)
     mcap_candidates = (
-        ["marketCap", "marketCap_profile", "marketCap_ev"] +
+        ["marketCap", "marketCap_profile", "marketCap_ev", "marketCap_unified"] +
         [c for c in df.columns if c.lower().startswith("marketcap")]
     )
     for c in mcap_candidates:
@@ -870,19 +875,23 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     mcap = mcap.fillna(price_series * shares_series)
     df["marketCap_unified"] = pd.to_numeric(mcap, errors="coerce")
 
-    # --- bucket por tamaño
+    # --- bucket por tamaño (para ranking intra-sector+tamaño)
     df["size_bucket"] = _bucket_by_quantiles(df["marketCap_unified"], q=size_buckets)
     grp_key = df["sector"].astype(str) + "|" + df["size_bucket"].astype(str)
 
     # --------- derivadas para Value/Quality ----------
-    ev  = to_num("evToEbitda")
-    fcf = to_num("fcf_ttm")
-    gp  = to_num("grossProfitTTM")
-    ta  = to_num("totalAssetsTTM")
+    # Ajusta nombres si tus columnas son 'gross_profit_ttm', 'roic_ttm', etc.
+    ev   = to_num("evToEbitda")
+    fcf  = to_num("fcf_ttm")
+    gp   = to_num("grossProfitTTM")       # <- si usas 'gross_profit_ttm', cambia aquí
+    ta   = to_num("totalAssetsTTM")       # <- si usas 'total_assets_ttm', cambia aquí
+    roic = to_num("roic")
+    roa  = to_num("roa")
+    nmar = to_num("netMargin")
 
-    df["inv_ev_ebitda"] = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
-    df["fcf_yield"] = (fcf / df["marketCap_unified"]).replace([np.inf, -np.inf], np.nan)
-    df["gross_profitability"] = (gp / ta).replace([np.inf, -np.inf], np.nan)
+    df["inv_ev_ebitda"]       = (1.0 / ev).replace([np.inf, -np.inf], np.nan)
+    df["fcf_yield"]           = (fcf / df["marketCap_unified"]).replace([np.inf, -np.inf], np.nan)
+    df["gross_profitability"] = (gp  / ta).replace([np.inf, -np.inf], np.nan)
 
     val_cols = [c for c in ["fcf_yield","inv_ev_ebitda"] if c in df.columns]
     q_cols   = [c for c in ["gross_profitability","roic","roa","netMargin"] if c in df.columns]
@@ -891,17 +900,59 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     for c in val_cols + q_cols:
         df[c] = _winsorize(df[c], 0.01)
 
+    # --- guardrails blandos (ANULA puntajes fuera de regla para que no rankeen)
+    # Liquidez
+    px   = to_num("price")
+    dv3m = to_num("avgDollarVol_3m")  # si no la tienes, crea previamente con rolling price*volume
+    mcap = df["marketCap_unified"]
+
+    liq_pass = (px >= 5.0) & (mcap >= 500_000_000.0)
+    if not dv3m.isna().all():
+        liq_pass = liq_pass & (dv3m >= 2_000_000.0)
+
+    # Anti-junk: pre-revenue biotech y story stocks (PS muy alto con pérdidas)
+    sector   = df["sector"].astype(str)
+    industry = df["industry"].astype(str)
+    # usa tus nombres reales si difieren:
+    revenue  = to_num("revenue_ttm")
+    gp_ttm   = to_num("gross_profit_ttm") if "gross_profit_ttm" in df.columns else gp
+    sales_ntm = to_num("sales_ntm") if "sales_ntm" in df.columns else revenue
+    ps = (mcap / sales_ntm.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+
+    biotech_flag = sector.str.contains("health", case=False, na=False) & \
+                   industry.str.contains("biotech|drug", case=False, na=False)
+    pre_rev = (revenue.fillna(0.0) < 50_000_000.0) | (gp_ttm.fillna(0.0) <= 0.0)
+    story_flag = (ps >= 40.0) & (nmar <= 0.0)
+
+    anti_junk_pass = ~((biotech_flag & pre_rev) | story_flag)
+
+    guard_pass = liq_pass & anti_junk_pass
+
+    # --- si no hay campos, devolver frame-base
     fields = val_cols + q_cols
     if len(fields) == 0:
         df["coverage_count"] = 0
         df["ValueScore"] = np.nan
         df["QualityScore"] = np.nan
         df["VFQ"] = np.nan
-        df["VFQ_pct_sector"] = 1.0
+        # percentil robusto
+        try:
+            grp_sz = df.groupby("sector")["symbol"].transform("size")
+            pct_sec = df.groupby("sector")["VFQ"].rank(pct=True)
+            pct_glb = df["VFQ"].rank(pct=True)
+            df["VFQ_pct_sector"] = np.where(grp_sz >= 6, pct_sec, pct_glb)
+        except Exception:
+            df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
+        df["VFQ_pct_sector"] = pd.to_numeric(df["VFQ_pct_sector"], errors="coerce").clip(0.0, 1.0).fillna(1.0)
         return df
+
+    # anular puntajes en fuera-de-guardrail para que queden abajo
+    for c in fields:
+        df.loc[~guard_pass, c] = np.nan
 
     df["coverage_count"] = df[fields].notna().sum(axis=1)
 
+    # ranking intra sector+tamaño (descending = mejor)
     def _rank_group(col: str) -> pd.Series:
         s = pd.to_numeric(df[col], errors="coerce")
         return s.groupby(grp_key).rank(method="average", ascending=False, na_option="bottom")
@@ -910,14 +961,23 @@ def build_vfq_scores(df_universe: pd.DataFrame, df_fund: pd.DataFrame,
     df["QualityScore"] = pd.concat([_rank_group(c) for c in q_cols],  axis=1).mean(axis=1) if q_cols else np.nan
     df["VFQ"]          = pd.concat([df["ValueScore"], df["QualityScore"]], axis=1).mean(axis=1, skipna=True)
 
+    # percentil intra-sector con fallback si el grupo es pequeño
     try:
-        sec = df["sector"].astype(str).replace({None: "Unknown"}).fillna("Unknown")
-        df["VFQ_pct_sector"] = df.groupby(sec)["VFQ"].rank(pct=True)
+        grp_sz  = df.groupby("sector")["symbol"].transform("size")
+        pct_sec = df.groupby("sector")["VFQ"].rank(pct=True)
+        pct_glb = df["VFQ"].rank(pct=True)
+        df["VFQ_pct_sector"] = np.where(grp_sz >= 6, pct_sec, pct_glb)
     except Exception:
         df["VFQ_pct_sector"] = df["VFQ"].rank(pct=True)
-    df["VFQ_pct_sector"] = df["VFQ_pct_sector"].clip(0.0, 1.0).fillna(1.0)
+    df["VFQ_pct_sector"] = pd.to_numeric(df["VFQ_pct_sector"], errors="coerce").clip(0.0, 1.0).fillna(1.0)
+
+    # expone flags para depurar en UI
+    df["guard_liquidity"] = liq_pass
+    df["guard_anti_junk"] = anti_junk_pass
+    df["guard_pass"]      = guard_pass
 
     return df
+
 
 # ======================================================================
 # Guardrails: aplicación de umbrales
@@ -930,56 +990,69 @@ def _num_or_nan(d: pd.DataFrame, col: str) -> pd.Series:
 
 def apply_quality_guardrails(df: pd.DataFrame,
                              require_profit_floor: bool = True,
-                             profit_floor_min_hits: int = 2,   # de {EBIT>0, CFO>0, FCF>0}
-                             max_net_issuance: float = 0.03,
-                             max_asset_growth: float = 0.20,
-                             max_accruals_ta: float = 0.10,
-                             max_netdebt_ebitda: float = 3.0) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Aplica umbrales de guardrails y devuelve:
-      - df_filtrado (cumplen todos)
-      - df_diag (con flags/diagnóstico)
-    Robusto a columnas faltantes.
-    """
+                             profit_floor_min_hits: int = 1,   # ↩️ baja a 1-de-3
+                             max_net_issuance: float = 0.08,   # ↩️ un poco más laxo
+                             max_asset_growth: float = 0.35,   # ↩️ más laxo
+                             max_accruals_ta: float = 0.15,    # ↩️ más laxo
+                             max_netdebt_ebitda: float = 4.0,  # ↩️ más laxo
+                             *,
+                             # -------- NUEVO: filtros anti-basura/liquidez --------
+                             min_price: float = 5.0,
+                             min_dollar_vol: float = 2_000_000.0,
+                             min_mcap: float = 500_000_000.0,
+                             drop_pre_rev_biotech: bool = True,
+                             ps_limit_for_loss: float = 40.0,
+                             min_rev_for_non_fin: float = 50_000_000.0
+                             ) -> tuple[pd.DataFrame, pd.DataFrame]:
     d = df.copy()
 
-    # Asegurar columnas como series numéricas (o NaN)
+    # ... (tu código existente de coerciones y construcción de series numéricas)
+
+    # ------------------------- NUEVO: Liquidez mínima -------------------------
+    px   = _num_or_nan(d, "price")
+    dv   = _num_or_nan(d, "avgDollarVol_3m")  # crea esta columna donde cargas precios, si no la tienes usa vol*price rolling
+    mcap = _num_or_nan(d, "marketCap_unified")
+    liq_pass = (px >= min_price) & (mcap >= min_mcap)
+    if not dv.isna().all():
+        liq_pass = liq_pass & (dv >= min_dollar_vol)
+
+    # ------------------ NUEVO: Pre-revenue biotech / story stocks -------------
+    sector   = d.get("sector", pd.Series(index=d.index, dtype=object)).astype(str)
+    industry = d.get("industry", pd.Series(index=d.index, dtype=object)).astype(str)
+    rev      = _num_or_nan(d, "revenue_ttm").fillna(0.0)
+    gp       = _num_or_nan(d, "gross_profit_ttm")
+    sales    = _num_or_nan(d, "sales_ntm")  # o revenue_ttm si no tienes NTM
+    nmar     = _num_or_nan(d, "netMargin")
+
+    biotech_flag = sector.str.contains("health", case=False, na=False) & \
+                   industry.str.contains("biotech|drug", case=False, na=False)
+
+    pre_rev = (rev < min_rev_for_non_fin) | (gp.fillna(0.0) <= 0.0)
+
+    ps = (mcap / sales.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan)
+    story_flag = (ps >= ps_limit_for_loss) & (nmar <= 0.0)
+
+    anti_junk_pass = ~((drop_pre_rev_biotech & biotech_flag & pre_rev) | story_flag)
+
+    # ------------------ Profit floor (1 de 3 por defecto) --------------------
     ebit = _num_or_nan(d, "ebit_ttm")
     cfo  = _num_or_nan(d, "cfo_ttm")
     fcf  = _num_or_nan(d, "fcf_ttm")
-    neti = _num_or_nan(d, "net_issuance")
-    ag   = _num_or_nan(d, "asset_growth")
-    acc  = _num_or_nan(d, "accruals_ta")
-    ndeb = _num_or_nan(d, "netdebt_ebitda")
+    hits = (ebit > 0).astype(int) + (cfo > 0).astype(int) + (fcf > 0).astype(int)
+    profit_pass = (hits >= int(profit_floor_min_hits)) if require_profit_floor else pd.Series(True, index=d.index)
 
-    # Profit floor (series booleanas)
-    ebit_ok = (ebit > 0)
-    cfo_ok  = (cfo  > 0)
-    fcf_ok  = (fcf  > 0)
-    d["profit_hits"] = ebit_ok.astype(int) + cfo_ok.astype(int) + fcf_ok.astype(int)
-    if require_profit_floor:
-        profit_pass = (d["profit_hits"] >= int(profit_floor_min_hits))
-    else:
-        profit_pass = pd.Series(True, index=d.index)
+    # ... (tu lógica existente de issuance/asset/accruals/leverage → issuance_pass, asset_pass, accruals_pass, lev_pass)
 
-    # Otros guardrails (NaN-safe)
-    issuance_pass = (neti.fillna(0) <= float(max_net_issuance))
-    asset_pass    = (ag.abs()      <= float(max_asset_growth))
-    accruals_pass = (acc.abs()     <= float(max_accruals_ta))
-    # Permitimos NaN en netdebt/EBITDA como "no bloquear"
-    lev_pass      = (ndeb.fillna(0) <= float(max_netdebt_ebitda)) | ndeb.isna()
+    # -------------------------- Máscara final --------------------------------
+    mask = liq_pass & anti_junk_pass & profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
 
-    mask = profit_pass & issuance_pass & asset_pass & accruals_pass & lev_pass
-
-    # flags de diagnóstico
-    d["guard_profit"]   = profit_pass
-    d["guard_issuance"] = issuance_pass
-    d["guard_assets"]   = asset_pass
-    d["guard_accruals"] = accruals_pass
-    d["guard_leverage"] = lev_pass
-    d["guard_all"]      = mask
+    d["guard_liquidity"] = liq_pass
+    d["guard_anti_junk"] = anti_junk_pass
+    d["guard_profit"]    = profit_pass
+    d["guard_all"]       = mask
 
     return d[mask].copy(), d
+
 
 # ======================================================================
 # VFQ dinámico (si quieres definir columnas ad-hoc)

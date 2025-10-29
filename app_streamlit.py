@@ -357,6 +357,7 @@ def _numcol(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(df[col], errors="coerce")
 
 # ====== Paso 3: VFQ (PARCHE COMPLETO) ======
+# ====== Paso 3: VFQ (PARCHE COMPLETO) ======
 with tab3:
     st.subheader("VFQ")
 
@@ -378,7 +379,10 @@ with tab3:
         if run_btn and "kept" in st.session_state:
             uni  = st.session_state["uni"]
             kept = st.session_state["kept"]
-            kept_syms = kept["symbol"].dropna().astype(str).unique().tolist()
+            kept_syms = (
+                kept.get("symbol", pd.Series(dtype=str))
+                    .dropna().astype(str).unique().tolist()
+            )
             if not kept_syms:
                 st.warning("No hay símbolos en 'kept'. Ajusta filtros antes de ejecutar VFQ.")
                 st.stop()
@@ -389,7 +393,7 @@ with tab3:
                    .dropna(subset=["symbol"])
                    .copy()
             )
-            mc_hint_df["symbol"] = mc_hint_df["symbol"].astype(str)
+            mc_hint_df["symbol"]    = mc_hint_df["symbol"].astype(str)
             mc_hint_df["marketCap"] = pd.to_numeric(mc_hint_df["marketCap"], errors="coerce")
             mc_pairs = tuple(
                 (row.symbol, float(row.marketCap))
@@ -408,8 +412,16 @@ with tab3:
                 uni_enriched = _enrich_sector_industry(uni, df_fund)
                 uni_enriched = _ensure_sector_strings(uni_enriched)
 
-                # base para VFQ (right para no perder fundamentales)
-                base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
+                # --- OPTIMIZACIÓN: usa df_fund como driver y trae solo sector/industry del universo ---
+                _cols = ["symbol"]
+                if "sector" in uni_enriched.columns:   _cols.append("sector")
+                if "industry" in uni_enriched.columns: _cols.append("industry")
+
+                base_for_vfq = df_fund.merge(
+                    uni_enriched[_cols].drop_duplicates("symbol"),
+                    on="symbol",
+                    how="left"
+                )
                 base_for_vfq = _ensure_sector_strings(base_for_vfq)
 
                 # ===== cálculo VFQ =====
@@ -425,33 +437,34 @@ with tab3:
                     group_mode=vfq_cfg["group_mode"],
                 )
 
-                # asegura sector/industry (de universo) y strings seguros
-                keep_cols = ["symbol"]
-                if "sector" in uni_enriched.columns:   keep_cols.append("sector")
-                if "industry" in uni_enriched.columns: keep_cols.append("industry")
-                df_vfq = (
-                    df_vfq.drop(columns=["sector", "industry"], errors="ignore")
-                          .merge(uni_enriched[keep_cols].drop_duplicates("symbol"),
-                                 on="symbol", how="left")
-                )
+                # === COALESCE de sector/industry: preferir lo que ya viene en df_vfq y completar con universo ===
+                keys = ["sector", "industry"]
+                tmp_uni = uni_enriched[["symbol"] + [c for c in keys if c in uni_enriched.columns]].drop_duplicates("symbol")
+                df_vfq = df_vfq.merge(tmp_uni, on="symbol", how="left", suffixes=("", "_uni"))
+                for c in keys:
+                    cu = f"{c}_uni"
+                    if c in df_vfq.columns and cu in df_vfq.columns:
+                        df_vfq[c] = df_vfq[c].where(
+                            df_vfq[c].notna() & (df_vfq[c].astype(str).str.len() > 0),
+                            df_vfq[cu]
+                        )
+                        df_vfq.drop(columns=[cu], inplace=True)
+
                 df_vfq = _ensure_sector_strings(df_vfq)
                 df_vfq["symbol"] = df_vfq["symbol"].astype(str)
 
-                # ===== score y percentil =====
+                # ===== score y percentil (único cálculo, robusto con fallback global) =====
                 score_col = "VFQ" if "VFQ" in df_vfq.columns else ("VFQ_score" if "VFQ_score" in df_vfq.columns else None)
                 if score_col is None:
                     st.error("No encontré columna de score ('VFQ' o 'VFQ_score') en df_vfq.")
                     st.stop()
 
-                # VFQ_pct_sector: intra-sector si hay >1 sector; sino global
                 tmp = _ensure_sector_strings(df_vfq.copy())
-                if "sector" in tmp.columns and tmp["sector"].nunique(dropna=False) > 1:
-                    pct = tmp.groupby(tmp["sector"])[score_col].rank(pct=True, method="average").astype(float)
-                else:
-                    pct = tmp[score_col].rank(pct=True, method="average").astype(float)
-                pct = pd.to_numeric(pct, errors="coerce")
-                pct = np.where(pct > 1.5, pct/100.0, pct)  # por si llega 0..100
-                df_vfq["VFQ_pct_sector"] = pd.Series(pct, index=df_vfq.index).clip(0.0, 1.0)
+                grp_sz  = tmp.groupby("sector")["symbol"].transform("size") if "sector" in tmp.columns else pd.Series(0, index=tmp.index)
+                pct_sec = tmp.groupby("sector")[score_col].rank(pct=True) if "sector" in tmp.columns else tmp[score_col].rank(pct=True)
+                pct_glb = tmp[score_col].rank(pct=True)
+                df_vfq["VFQ_pct_sector"] = np.where(grp_sz >= 6, pct_sec, pct_glb)
+                df_vfq["VFQ_pct_sector"] = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").clip(0.0, 1.0).fillna(1.0)
 
                 # ===== filtros UI =====
                 min_cov_val = int(st.session_state.get("min_cov", 0))
@@ -486,6 +499,13 @@ with tab3:
                 mask_sane = _build_mask_sane(df_vfq)
                 st.session_state["mask_sane"] = mask_sane
 
+            # score_col para orden
+            if "VFQ" in df_vfq.columns:
+                score_col = "VFQ"
+            elif "VFQ_score" in df_vfq.columns:
+                score_col = "VFQ_score"
+            else:
+                score_col = None
         else:
             st.info("Primero corre **Guardrails** (botón Ejecutar).")
             st.stop()
@@ -497,6 +517,7 @@ with tab3:
             sort_col = "VFQ_score"
         else:
             sort_col = None
+
         view_df = df_vfq_sel.sort_values(sort_col, ascending=False) if sort_col else df_vfq_sel.copy()
 
         # ===== KPIs + gráfico por sector =====
@@ -583,7 +604,7 @@ with tab3:
             ] if c in view.columns
         ]
 
-        # orden elegido
+        # orden elegido (tabla)
         if sort_by and sort_by in view.columns:
             view = view.sort_values(sort_by, ascending=ascending, na_position="last")
 
@@ -596,46 +617,44 @@ with tab3:
                 st.session_state["mask_sane"] = _ms
 
             tmp = df_vfq.loc[_ms].copy()
+            # usar la misma columna de orden que arriba
             scol = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
             view_df = tmp.sort_values(scol, ascending=False) if scol else tmp.copy()
             view = _ensure_sector_strings(view_df.copy())
-
             if "VFQ_pct_sector" in view.columns and "VFQ pct (sector)" not in view.columns:
                 pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce").clip(0.0, 1.0)
                 view["VFQ pct (sector)"] = (pct * 100).round(2)
-
             pretty_cols = [c for c in pretty_cols if c in view.columns]
+        else:
+            # asegura usar 'sort_col' definido antes
+            if sort_col and sort_col in df_vfq_sel.columns:
+                view = _ensure_sector_strings(df_vfq_sel.sort_values(sort_col, ascending=False).copy())
+            else:
+                view = _ensure_sector_strings(df_vfq_sel.copy())
 
-        # configuración de columnas
-        cfg = {}
-        if "market_cap" in pretty_cols:
-            cfg["market_cap"] = st.column_config.TextColumn("Market Cap", help="Unificado/estimado")
-        if "price" in pretty_cols:
-            cfg["price"] = st.column_config.NumberColumn("Price", format="%.2f")
-        if "beta" in pretty_cols:
-            cfg["beta"] = st.column_config.NumberColumn("Beta", format="%.3f")
-        if "VFQ" in pretty_cols:
-            cfg["VFQ"] = st.column_config.NumberColumn("VFQ", help="Score agregado", format="%.3f")
-        if "VFQ_score" in pretty_cols:
-            cfg["VFQ_score"] = st.column_config.NumberColumn("VFQ_score", help="Score agregado", format="%.3f")
-        if "VFQ pct (sector)" in pretty_cols:
-            cfg["VFQ pct (sector)"] = st.column_config.ProgressColumn(
-                "VFQ pct (sector)", min_value=0, max_value=100, help="Percentil intra-sector (0–100%)"
-            )
-        if "value_adj_neut" in pretty_cols:
-            cfg["value_adj_neut"] = st.column_config.NumberColumn("Value (neut.)", format="%.3f")
-        if "quality_adj_neut" in pretty_cols:
-            cfg["quality_adj_neut"] = st.column_config.NumberColumn("Quality (neut.)", format="%.3f")
-        if "BreakoutScore" in pretty_cols:
-            cfg["BreakoutScore"] = st.column_config.NumberColumn("Breakout", format="%.3f")
-        if "momentum_score" in pretty_cols:
-            cfg["momentum_score"] = st.column_config.NumberColumn("Momentum", format="%.3f")
+        # Exportar un Top N para el tab técnico
+        HIT_N = st.session_state.get("hit_n", 30)
+        st.session_state["vfq_hits_syms"] = (
+            view.get("symbol", pd.Series(dtype=str)).dropna().astype(str).head(HIT_N).tolist()
+        )
 
+        # ===== Render tabla =====
         st.dataframe(
             view[pretty_cols].reset_index(drop=True),
             use_container_width=True,
             hide_index=True,
-            column_config=cfg
+            column_config={
+                **({"market_cap": st.column_config.TextColumn("Market Cap", help="Unificado/estimado")} if "market_cap" in pretty_cols else {}),
+                **({"price":      st.column_config.NumberColumn("Price", format="%.2f")} if "price" in pretty_cols else {}),
+                **({"beta":       st.column_config.NumberColumn("Beta", format="%.3f")} if "beta" in pretty_cols else {}),
+                **({"VFQ":        st.column_config.NumberColumn("VFQ", help="Score agregado", format="%.3f")} if "VFQ" in pretty_cols else {}),
+                **({"VFQ_score":  st.column_config.NumberColumn("VFQ_score", help="Score agregado", format="%.3f")} if "VFQ_score" in pretty_cols else {}),
+                **({"VFQ pct (sector)": st.column_config.ProgressColumn("VFQ pct (sector)", min_value=0, max_value=100, help="Percentil intra-sector (0–100%)")} if "VFQ pct (sector)" in pretty_cols else {}),
+                **({"value_adj_neut":   st.column_config.NumberColumn("Value (neut.)", format="%.3f")} if "value_adj_neut" in pretty_cols else {}),
+                **({"quality_adj_neut": st.column_config.NumberColumn("Quality (neut.)", format="%.3f")} if "quality_adj_neut" in pretty_cols else {}),
+                **({"BreakoutScore":    st.column_config.NumberColumn("Breakout", format="%.3f")} if "BreakoutScore" in pretty_cols else {}),
+                **({"momentum_score":   st.column_config.NumberColumn("Momentum", format="%.3f")} if "momentum_score" in pretty_cols else {}),
+            }
         )
 
         # --------- Descargas ----------
@@ -664,7 +683,6 @@ with tab3:
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
-
 
 # ====== Paso 4: SEÑALES (placeholder si tu lógica está en otro módulo) ======
 with tab4:
