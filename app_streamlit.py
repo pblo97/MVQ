@@ -656,74 +656,6 @@ with tab3:
         )
 
         # ======= Vistas extra: ranking por hits / BreakoutScore =======
-        sig = st.session_state.get("signals", pd.DataFrame()).copy()
-
-        # Blindajes suaves
-        need_cols = ["symbol", "hits", "BreakoutScore", "signal_breakout", "risk_on"]
-        for c in need_cols:
-            if c not in sig.columns:
-                # crea si falta, para no romper la UI
-                sig[c] = 0 if c in ("hits", "BreakoutScore") else False
-
-        # Controles
-        st.markdown("---")
-        c1, c2, c3, c4 = st.columns([0.2, 0.25, 0.25, 0.30])
-        with c1:
-            top_n = st.number_input("Top N", min_value=5, max_value=300, value=50, step=5)
-        with c2:
-            only_risk_on = st.checkbox("Solo risk_on ✅", value=False)
-        with c3:
-            only_breakouts = st.checkbox("Solo con signal_breakout 🚀", value=False)
-        with c4:
-            cols_show = [c for c in [
-                "symbol","hits","BreakoutScore","risk_on","signal_breakout",
-                "ClosePos","P52","RVOL20","UDVol20","ATR_pct","mom_12_1","rs_ma20_slope"
-            ] if c in sig.columns]
-
-        # Filtros rápidos
-        mask = pd.Series(True, index=sig.index)
-        if only_risk_on and "risk_on" in sig.columns:
-            mask &= sig["risk_on"].fillna(False)
-        if only_breakouts and "signal_breakout" in sig.columns:
-            mask &= sig["signal_breakout"].fillna(False)
-        base = sig.loc[mask].copy()
-
-        # —— Vista 1: Top por hits ——
-        if len(base):
-            st.subheader("Top por **hits**")
-            view_hits = (
-                base.sort_values(["hits","BreakoutScore"], ascending=[False, False])
-                    .loc[:, cols_show]
-                    .head(top_n)
-            )
-            st.dataframe(view_hits, use_container_width=True, hide_index=True)
-
-        # —— Vista 2: Top por BreakoutScore ——
-        if len(base):
-            st.subheader("Top por **BreakoutScore**")
-            view_bo = (
-                base.sort_values(["BreakoutScore","hits"], ascending=[False, False])
-                    .loc[:, cols_show]
-                    .head(top_n)
-            )
-            st.dataframe(view_bo, use_container_width=True, hide_index=True)
-
-        # —— Vista 3 (opcional): Ranking combinado ——
-        if len(base):
-            st.subheader("Ranking **combinado** (hits → BreakoutScore)")
-            # si quieres un score compuesto, descomenta estas 2 líneas:
-            # z_hits = (base["hits"] - base["hits"].mean()) / (base["hits"].std() or 1)
-            # z_bo   = (base["BreakoutScore"] - base["BreakoutScore"].mean()) / (base["BreakoutScore"].std() or 1)
-            # base["combo_rank"] = 0.6*z_hits + 0.4*z_bo
-            # view_combo = base.sort_values("combo_rank", ascending=False)
-
-            # por defecto, multi-orden estable:
-            view_combo = (
-                base.sort_values(["hits","BreakoutScore"], ascending=[False, False])
-                    .loc[:, cols_show]
-                    .head(top_n)
-            )
-            st.dataframe(view_combo, use_container_width=True, hide_index=True)
 
 
         # --------- Descargas ----------
@@ -838,6 +770,75 @@ with tab4:
         st.dataframe(sig_df.head(300), use_container_width=True, hide_index=True)
     except Exception as e:
         st.error(f"Error calculando señales: {e}")
+    sig = st.session_state.get("signals", pd.DataFrame()).copy()
+
+    # Blindajes suaves
+    need_cols = ["symbol", "hits", "BreakoutScore", "signal_breakout", "risk_on"]
+    for c in need_cols:
+        if c not in sig.columns:
+            # crea si falta, para no romper la UI
+            sig[c] = 0 if c in ("hits", "BreakoutScore") else False
+
+    # Controles
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns([0.2, 0.25, 0.25, 0.30])
+    with c1:
+        top_n = st.number_input("Top N", min_value=5, max_value=300, value=50, step=5)
+    with c2:
+        only_risk_on = st.checkbox("Solo risk_on ✅", value=False)
+    with c3:
+        only_breakouts = st.checkbox("Solo con signal_breakout 🚀", value=False)
+    with c4:
+        cols_show = [c for c in [
+            "symbol","hits","BreakoutScore","risk_on","signal_breakout",
+            "ClosePos","P52","RVOL20","UDVol20","ATR_pct","mom_12_1","rs_ma20_slope"
+        ] if c in sig.columns]
+
+    # Filtros rápidos
+    mask = pd.Series(True, index=sig.index)
+    if only_risk_on and "risk_on" in sig.columns:
+        mask &= sig["risk_on"].fillna(False)
+    if only_breakouts and "signal_breakout" in sig.columns:
+        mask &= sig["signal_breakout"].fillna(False)
+    base = sig.loc[mask].copy()
+
+    # —— Vista 1: Top por hits ——
+    if len(base):
+        st.subheader("Top por **hits**")
+        view_hits = (
+            base.sort_values(["hits","BreakoutScore"], ascending=[False, False])
+                .loc[:, cols_show]
+                .head(top_n)
+        )
+        st.dataframe(view_hits, use_container_width=True, hide_index=True)
+
+    # —— Vista 2: Top por BreakoutScore ——
+    if len(base):
+        st.subheader("Top por **BreakoutScore**")
+        view_bo = (
+            base.sort_values(["BreakoutScore","hits"], ascending=[False, False])
+                .loc[:, cols_show]
+                .head(top_n)
+        )
+        st.dataframe(view_bo, use_container_width=True, hide_index=True)
+
+    # —— Vista 3 (opcional): Ranking combinado ——
+    if len(base):
+        st.subheader("Ranking **combinado** (hits → BreakoutScore)")
+        # si quieres un score compuesto, descomenta estas 2 líneas:
+        # z_hits = (base["hits"] - base["hits"].mean()) / (base["hits"].std() or 1)
+        # z_bo   = (base["BreakoutScore"] - base["BreakoutScore"].mean()) / (base["BreakoutScore"].std() or 1)
+        # base["combo_rank"] = 0.6*z_hits + 0.4*z_bo
+        # view_combo = base.sort_values("combo_rank", ascending=False)
+
+        # por defecto, multi-orden estable:
+        view_combo = (
+            base.sort_values(["hits","BreakoutScore"], ascending=[False, False])
+                .loc[:, cols_show]
+                .head(top_n)
+        )
+        st.dataframe(view_combo, use_container_width=True, hide_index=True)
+
 # ====== Paso 5: QVM (growth-aware) ======
 # ====== Paso 5: QVM (growth-aware) ======
 with tab5:
