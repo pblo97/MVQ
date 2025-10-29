@@ -251,6 +251,9 @@ with st.sidebar:
     min_cov = st.slider("Cobertura mín. (# métricas)", 0, 8, 1, 1)
     min_pct = st.slider("VFQ pct (intra-sector) mín.", 0.00, 1.00, 0.00, 0.01)
 
+    st.session_state["min_cov"] = int(min_cov)
+    st.session_state["min_pct"] = float(min_pct)
+
 vfq_cfg = dict(
     value_metrics=sel_value,
     quality_metrics=sel_quality,
@@ -388,7 +391,7 @@ with tab3:
 
                 # Base para VFQ (mantén right para no perder fundamentales descargados)
                 base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
-
+                base_for_vfq = _ensure_sector_strings(base_for_vfq)
                 # ===== Cálculo VFQ =====
                 df_vfq = build_vfq_scores_dynamic(
                     base_for_vfq,
