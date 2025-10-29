@@ -404,6 +404,72 @@ with tab3:
                     size_buckets=vfq_cfg["size_buckets"],
                     group_mode=vfq_cfg["group_mode"],
                 )
+                # ====== DIAGNÓSTICO DE FILTROS ======
+                st.toggle("🔍 Mostrar diagnóstico VFQ", value=True, key="show_vfq_diag")
+
+                diag = pd.DataFrame(index=df_vfq.index)
+                diag["symbol"] = df_vfq["symbol"].astype(str)
+
+                # sanity
+                rev = _numcol(df_vfq, "revenue_ttm")
+                gp  = _numcol(df_vfq, "gross_profit_ttm")
+                yoy = _numcol(df_vfq, "revenue_yoy")
+                mask_rev_ok = (rev > 0) | (gp > 0)
+                mask_yoy_ok = (yoy.isna()) | (yoy > -0.05)
+                mask_sane   = mask_rev_ok & mask_yoy_ok
+
+                # coverage
+                if "coverage_count" in df_vfq.columns:
+                    cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0)
+                    mask_cov = cov >= int(st.session_state.get("min_cov", 0))
+                else:
+                    cov = pd.Series(0, index=df_vfq.index)
+                    mask_cov = pd.Series(True, index=df_vfq.index)
+
+                # percentil intra-sector (recalcula si hace falta)
+                if "VFQ_pct_sector" not in df_vfq.columns:
+                    score_col = "VFQ" if "VFQ" in df_vfq.columns else ("VFQ_score" if "VFQ_score" in df_vfq.columns else None)
+                    if score_col is not None:
+                        tmp = _ensure_sector_strings(df_vfq.copy())
+                        if tmp["sector"].nunique() <= 1:
+                            # fallback global si todos quedaron en el mismo sector
+                            df_vfq["VFQ_pct_sector"] = tmp[score_col].rank(pct=True, method="average").astype(float)
+                        else:
+                            df_vfq["VFQ_pct_sector"] = (
+                                tmp.groupby(tmp["sector"])[score_col].rank(pct=True, method="average").astype(float)
+                            )
+                    else:
+                        df_vfq["VFQ_pct_sector"] = 1.0
+
+                pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce")
+                pct = np.where(pct > 1.5, pct/100.0, pct)  # normaliza 0..100 -> 0..1
+                pct = pd.Series(pct, index=df_vfq.index).clip(0.0, 1.0)
+
+                min_pct = float(st.session_state.get("min_pct", 0.0))
+                mask_pct = pct.fillna(1.0) >= min_pct
+
+                # resumen
+                diag["rev_ok"]  = mask_rev_ok
+                diag["yoy_ok"]  = mask_yoy_ok
+                diag["sane"]    = mask_sane
+                diag["cov_cnt"] = cov
+                diag["cov_ok"]  = mask_cov
+                diag["pct"]     = (pct * 100).round(2)
+                diag["pct_ok"]  = mask_pct
+
+                if st.session_state.get("show_vfq_diag", False):
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total", len(diag))
+                    c2.metric("Sanidad OK", int(mask_sane.sum()))
+                    c3.metric(f"Cov ≥ {int(st.session_state.get('min_cov',0))}", int(mask_cov.sum()))
+                    c4.metric(f"Pct ≥ {min_pct:.2f}", int(mask_pct.sum()))
+                    st.dataframe(diag.sort_values(["sane","cov_ok","pct_ok","pct"], ascending=[True, True, True, False]).head(100),
+                                use_container_width=True, hide_index=True)
+
+                # aplica las máscaras reales
+                df_vfq["VFQ_pct_sector"] = pct  # asegura 0..1 en el DF principal
+                df_vfq_sel = df_vfq.loc[mask_cov & mask_pct & mask_sane].copy()
+
 
                 # Asegura sector/industry intactos y tipados a str seguros
                 keep_cols = ["symbol", "sector"]
@@ -585,6 +651,13 @@ with tab3:
             cfg["BreakoutScore"] = st.column_config.NumberColumn("Breakout", format="%.3f")
         if "momentum_score" in pretty_cols:
             cfg["momentum_score"] = st.column_config.NumberColumn("Momentum", format="%.3f")
+
+        if df_vfq_sel.empty:
+            st.warning("Ningún símbolo pasó los filtros. Te muestro el Top por VFQ para depurar.")
+            # relaja progresivamente para inspección
+            tmp = df_vfq.loc[mask_sane, :].copy() if (~mask_sane).any() else df_vfq.copy()
+            sort_col = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
+            view_df = tmp.sort_values(sort_col, ascending=False) if sort_col else tmp.copy()
 
         st.dataframe(
             view[pretty_cols].reset_index(drop=True),
