@@ -1024,8 +1024,12 @@ def apply_quality_guardrails(
     dv   = _first_num(d, ["avgDollarVol_3m", "dollarVol_3m", "avgDollarVolume3m"])
     mcap = _first_num(d, ["marketCap_unified", "marketCap", "MarketCap", "marketCap_profile"])
 
-    # ====== LIQUIDEZ (dv es opcional) ======
-    liq_pass = (px >= float(min_price)) & (mcap >= float(min_mcap))
+    # Cada chequeo “pasa” si el valor está por encima del umbral **o** si es NaN.
+    price_ok = (px >= float(min_price)) | px.isna()
+    mcap_ok  = (mcap >= float(min_mcap)) | mcap.isna()
+    dv_ok    = (dv >= float(min_dollar_vol)) | dv.isna()   # si dv no existe o es todo NaN, no bloquea
+
+    liq_pass = (price_ok & mcap_ok & dv_ok).fillna(True)
     if not dv.isna().all():
         liq_pass = liq_pass & (dv >= float(min_dollar_vol))
     # Si dv está completamente vacío, NO bloqueamos por eso.
