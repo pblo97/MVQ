@@ -31,7 +31,7 @@ hr { border: 0; border-top: 1px solid rgba(255,255,255,.08); margin: .6rem 0 1re
 
 # ============== IMPORTS DE TU PIPELINE ==============
 from qvm_trend.scoring import (
-    blend_breakout_qvm, build_momentum_proxy
+    blend_breakout_qvm, build_momentum_proxy,standardize_fundamentals
 )
 from qvm_trend.data_io import (
     run_fmp_screener, filter_universe, load_prices_panel, load_benchmark,
@@ -956,6 +956,16 @@ with tab5:
             cv = f"{c}_vfq"
             if c not in base.columns and cv in base.columns:
                 base[c] = base[cv]
+
+        base = standardize_fundamentals(base)
+
+        # Si momentum no existe aún, inicializa
+        base["momentum_score"] = pd.to_numeric(base.get("momentum_score", 0.0), errors="coerce").fillna(0.0)
+        diag_cols = ["ev","ebitda_ttm","ebitda_ntm","gross_profit_ttm","sales_ntm",
+             "rd_expense_ttm","operating_income_ttm","total_assets_ttm","net_debt_ttm","noa_ttm"]
+        cov = (base[diag_cols].notna().sum()/len(base)*100).round(1).rename("coverage_%").to_frame()
+        st.caption("Cobertura de fundamentals (post-normalización)")
+        st.dataframe(cov, use_container_width=True)
 
         # ------------------- QVM: value/quality neutralizado -------------------
         qvm_df = compute_qvm_scores(

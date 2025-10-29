@@ -67,6 +67,69 @@ def _col(df: pd.DataFrame, name: str, default=np.nan) -> pd.Series:
         return _to_float(df[name])
     return pd.Series(index=df.index, data=default, dtype=float)
 
+def standardize_fundamentals(df: pd.DataFrame) -> pd.DataFrame:
+    """Mapea alias comunes a los nombres que usa compute_qvm_scores."""
+    alias = {
+        # básicos
+        "market_cap": ["market_cap","marketCap","marketCap_unified","mkt_cap","Market Cap"],
+        "sector":     ["sector","Sector","industry","Industry","gicsSector","GICS_Sector"],
+        # value
+        "ev":                ["ev","enterpriseValue","EnterpriseValue","EV"],
+        "ebitda_ttm":        ["ebitda_ttm","EBITDA_TTM","ebitdaTrailingTwelveMonths","ebitdaTTM"],
+        "ebitda_ntm":        ["ebitda_ntm","EBITDA_NTM","ebitdaForward","ebitdaNextTwelveMonths"],
+        "gross_profit_ttm":  ["gross_profit_ttm","grossProfitTTM","GrossProfitTTM"],
+        "sales_ntm":         ["sales_ntm","revenueNTM","RevenueNTM","salesForward","revenueForward"],
+        "capex_ttm":         ["capex_ttm","capexTTM","CapExTTM","capitalExpenditureTTM"],
+        "sbc_ttm":           ["sbc_ttm","stockBasedCompTTM","shareBasedCompTTM","SBC_TTM"],
+        "fcf_ttm":           ["fcf_ttm","freeCashFlowTTM","FCF_TTM"],
+        "fcf_5y_median":     ["fcf_5y_median","FCF_5Y_MEDIAN","fcfMedian5Y"],
+        # quality / intangible
+        "rd_expense_ttm":        ["rd_expense_ttm","researchDevelopmentTTM","R&D_TTM","researchAndDevTTM"],
+        "operating_income_ttm":  ["operating_income_ttm","operatingIncomeTTM","OperatingIncomeTTM","ebitTTM"],
+        "total_assets_ttm":      ["total_assets_ttm","totalAssetsTTM","TotalAssetsTTM","totalAssets"],
+        "net_debt_ttm":          ["net_debt_ttm","netDebtTTM","NetDebtTTM","netDebt"],
+        "noa_ttm":               ["noa_ttm","netOperatingAssetsTTM","NOA_TTM"],
+        "invested_capital_ttm":  ["invested_capital_ttm","investedCapitalTTM","InvestedCapitalTTM"],
+        "current_liabilities_ttm":["current_liabilities_ttm","currentLiabilitiesTTM","CurrentLiabilitiesTTM"],
+        "tax_rate":              ["tax_rate","effectiveTaxRate","effectiveTaxRateTTM"],
+        "op_margin_hist":        ["op_margin_hist","operatingMarginHistory","opMarginHistory"],
+        # técnico que ya traes
+        "BreakoutScore": ["BreakoutScore"],
+        "RVOL20":        ["RVOL20"],
+        "UDVol20":       ["UDVol20"],
+        "hits":          ["hits"],
+        "P52":           ["P52"],
+        "ClosePos":      ["ClosePos"],
+    }
+
+    out = df.copy()
+    for std, cands in alias.items():
+        if std in out.columns:  # ya existe
+            continue
+        for c in cands:
+            if c in out.columns:
+                out[std] = out[c]
+                break
+
+    # coerción numérica donde aplica
+    num_cols = [
+        "market_cap","ev","ebitda_ttm","ebitda_ntm","gross_profit_ttm","sales_ntm","capex_ttm","sbc_ttm",
+        "fcf_ttm","fcf_5y_median","rd_expense_ttm","operating_income_ttm","total_assets_ttm","net_debt_ttm",
+        "noa_ttm","invested_capital_ttm","current_liabilities_ttm","tax_rate",
+        "BreakoutScore","RVOL20","UDVol20","hits","P52","ClosePos"
+    ]
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # sector seguro
+    if "sector" in out.columns:
+        out["sector"] = out["sector"].astype(str).fillna("Unknown")
+    else:
+        out["sector"] = "Unknown"
+
+    return out
+
 # ----------------------- Intangibles / I+D -----------------------
 def capitalize_rd(df: pd.DataFrame, rd_col="rd_expense_ttm", amort_years: int = 3) -> pd.DataFrame:
     """
@@ -187,83 +250,42 @@ def neutralize_by_sector_cap(df: pd.DataFrame,
                                       ("Large", 10e9, 150e9),
                                       ("Mid",   2e9, 10e9),
                                       ("Small", 0,   2e9))) -> pd.Series:
-    """
-    Estandariza (z-score) un 'score_col' intra-sector e intra-cap y mezcla 50/50.
-    Devuelve una Serie 1D alineada al índice de df.
-    """
     out = df.copy()
-
-    # --- Columnas base y coerción ---
-    if hasattr(out, "columns"):
-        # Evita duplicados 2D tipo 'momentum_score' duplicado
-        out = out.loc[:, ~out.columns.duplicated(keep="last")]
-
     if score_col not in out.columns:
-        # Si falta, devuelve ceros (no rompemos el flujo)
         return pd.Series(0.0, index=out.index, name="z_neut")
 
-    if sector_col not in out.columns:
-        out[sector_col] = "Unknown"
-    out[sector_col] = out[sector_col].astype(str).fillna("Unknown")
+    out["_score_"] = pd.to_numeric(out[score_col], errors="coerce")
+    out[sector_col] = out.get(sector_col, "Unknown").astype(str).fillna("Unknown")
+    out[mcap_col]   = pd.to_numeric(out.get(mcap_col), errors="coerce")
 
-    if mcap_col not in out.columns:
-        out[mcap_col] = np.nan
-    out[mcap_col] = _to_float(out[mcap_col])
+    def _z(s):
+        s = pd.to_numeric(s, errors="coerce")
+        mu, sd = s.mean(skipna=True), s.std(skipna=True)
+        return (s - mu) / (sd if (sd and sd > 0) else 1.0)
 
-    # --- Score numérico 1D ---
-    out["_score_"] = _to_float(out[score_col])
-
-    # --- Buckets por market cap (robusto) ---
+    # cap buckets robusto
     try:
         b_sorted = sorted(list(buckets), key=lambda t: float(t[1]))
         lows  = [float(b[1]) for b in b_sorted]
         highs = [float(b[2]) for b in b_sorted]
-        labels = [str(b[0]) for b in b_sorted]
-
-        for lo, hi in zip(lows, highs):
-            if not (lo < hi):
-                raise ValueError("Cada bucket debe cumplir low < high")
-
         bins = lows + [highs[-1]]
-        bins = np.array(bins, dtype=float)
-        if not np.all(np.diff(bins) > 0):
-            uniq = np.unique(bins)
-            if len(uniq) < 2:
-                raise ValueError("Bins inválidos")
-            bins = uniq
-
-        if len(labels) != (len(bins) - 1):
-            labels = [f"Cap_{i+1}" for i in range(len(bins) - 1)]
-
-        out["_cap_bucket"] = pd.cut(out[mcap_col], bins=bins, labels=labels, include_lowest=True, right=False)
-        if out["_cap_bucket"].notna().sum() == 0:
+        out["_cap_bucket"] = pd.cut(out[mcap_col], bins=bins, labels=[b[0] for b in b_sorted],
+                                    include_lowest=True, right=False)
+        if out["_cap_bucket"].isna().all():
             out["_cap_bucket"] = "Cap_All"
     except Exception:
-        q = out[mcap_col]
-        if q.notna().nunique() < 2:
-            out["_cap_bucket"] = "Cap_All"
-        else:
-            try:
-                out["_cap_bucket"] = pd.qcut(q, q=4, duplicates="drop")
-            except Exception:
-                out["_cap_bucket"] = "Cap_All"
+        out["_cap_bucket"] = "Cap_All"
 
-    # --- z intra-sector / intra-cap ---
-    def _z_by(group: pd.DataFrame) -> pd.Series:
-        return _zscore(group["_score_"])
+    z_sector = out.groupby(sector_col, group_keys=False)["_score_"].apply(_z).reindex(out.index)
+    z_cap    = out.groupby("_cap_bucket", group_keys=False)["_score_"].apply(_z).reindex(out.index)
 
-    # Importante: align al índice original SIEMPRE (evita problemas posteriores)
-    z_sector = out.groupby(sector_col, group_keys=False).apply(_z_by)
-    z_sector = z_sector.reindex(out.index)  # alineación explícita
-    z_cap    = out.groupby("_cap_bucket", group_keys=False).apply(_z_by)
-    z_cap    = z_cap.reindex(out.index)
+    # fallbacks si no hay varianza
+    if z_sector.abs().sum(skipna=True) == 0:
+        z_sector = _z(out["_score_"])
+    if z_cap.abs().sum(skipna=True) == 0:
+        z_cap = _z(out["_score_"])
 
-    # Fallback si z_cap es todo NaN (poco/mala cobertura)
-    if _to_float(z_cap).notna().sum() == 0:
-        z_neut = _to_float(z_sector).fillna(0.0)
-    else:
-        z_neut = (0.5 * _to_float(z_sector) + 0.5 * _to_float(z_cap)).fillna(0.0)
-
+    z_neut = (0.5*z_sector + 0.5*z_cap).fillna(0.0)
     z_neut.name = "z_neut"
     return z_neut
 
