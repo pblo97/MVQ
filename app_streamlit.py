@@ -935,6 +935,10 @@ with tab5:
             base["sector"] = base["sector_vfq"]
 
         # ------------------- QVM growth-aware -------------------
+        if "market_cap" not in base.columns:
+            base["market_cap"] = pd.to_numeric(base.get("marketCap_unified", base.get("marketCap")), errors="coerce")
+        else:
+            base["market_cap"] = pd.to_numeric(base["market_cap"], errors="coerce")
         qvm_df = compute_qvm_scores(
             base.rename(columns={"marketCap": "market_cap"}),
             w_quality=0.40, w_value=0.25, w_momentum=0.35,

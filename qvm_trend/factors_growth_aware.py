@@ -62,6 +62,11 @@ def _rank_pct(s: pd.Series) -> pd.Series:
         return pd.Series(0.0, index=s.index)
     return s.rank(pct=True, method="average").fillna(0.0)
 
+def _col(df: pd.DataFrame, name: str, default=np.nan) -> pd.Series:
+    if name in df.columns:
+        return _to_float(df[name])
+    return pd.Series(index=df.index, data=default, dtype=float)
+
 # ----------------------- Intangibles / I+D -----------------------
 def capitalize_rd(df: pd.DataFrame, rd_col="rd_expense_ttm", amort_years: int = 3) -> pd.DataFrame:
     """
@@ -95,31 +100,21 @@ def capitalize_rd(df: pd.DataFrame, rd_col="rd_expense_ttm", amort_years: int = 
 
 # ----------------------------- Value -----------------------------
 def value_growth_aware(df: pd.DataFrame) -> pd.Series:
-    """
-    Value “growth-aware”:
-      40% EV/EBITDA NTM (invertido)
-      30% EV/Gross Profit TTM (invertido)
-      30% EV/Sales NTM penalizado por Capex/Sales (invertido)
-    + boost si FCF_yield_5y (ajustada por SBC) está en top 20% global
-    Requiere: ev, ebitda_ntm, gross_profit_ttm, sales_ntm, capex_ttm, sbc_ttm
-             y opcionalmente fcf_5y_median (si no, usa fcf_ttm)
-    """
     out = df.copy()
+    ev         = _col(out, "ev")
+    if ev.isna().all():  # fallback: usa market cap si no hay EV
+        ev = _col(out, "market_cap")
 
-    # Forzar numérico en columnas usadas
-    for col in ["ev","ebitda_ntm","gross_profit_ttm","sales_ntm",
-                "capex_ttm","sbc_ttm","fcf_ttm","fcf_5y_median"]:
-        if col in out.columns:
-            out[col] = _to_float(out[col])
+    ebitda_ntm = _col(out, "ebitda_ntm")
+    gp_ttm     = _col(out, "gross_profit_ttm")
+    sales_ntm  = _col(out, "sales_ntm")
 
-    ev          = out.get("ev")
-    ebitda_ntm  = out.get("ebitda_ntm")
-    gp_ttm      = out.get("gross_profit_ttm")
-    sales_ntm   = out.get("sales_ntm")
-    capex_ttm   = out.get("capex_ttm", pd.Series(index=out.index, data=np.nan))
-    sbc_ttm     = out.get("sbc_ttm", pd.Series(index=out.index, data=0.0)).fillna(0.0)
-    fcf_ttm     = out.get("fcf_ttm", pd.Series(index=out.index, data=np.nan))
-    fcf5_med    = out.get("fcf_5y_median", fcf_ttm)
+    capex_ttm  = _col(out, "capex_ttm", 0.0).fillna(0.0)
+    sbc_ttm    = _col(out, "sbc_ttm",   0.0).fillna(0.0)
+    fcf_ttm    = _col(out, "fcf_ttm")
+    fcf5_med   = _col(out, "fcf_5y_median")
+    if fcf5_med.isna().all():
+        fcf5_med = fcf_ttm
 
     ev_over_ebitda = _safe_div(ev, ebitda_ntm)
     ev_over_gp     = _safe_div(ev, gp_ttm)
@@ -127,78 +122,61 @@ def value_growth_aware(df: pd.DataFrame) -> pd.Series:
     capex_sales    = _safe_div(capex_ttm, sales_ntm).fillna(0.0)
     ev_over_sales_pen = ev_over_sales * (1 + capex_sales)
 
-    v1 = _winsorize(1.0 / ev_over_ebitda.replace(0, np.nan), 0.01).fillna(0.0)
-    v2 = _winsorize(1.0 / ev_over_gp.replace(0, np.nan), 0.01).fillna(0.0)
-    v3 = _winsorize(1.0 / ev_over_sales_pen.replace(0, np.nan), 0.01).fillna(0.0)
+    v1 = _winsorize(1.0 / ev_over_ebitda.replace(0, np.nan), 0.01)
+    v2 = _winsorize(1.0 / ev_over_gp.replace(0, np.nan),     0.01)
+    v3 = _winsorize(1.0 / ev_over_sales_pen.replace(0, np.nan), 0.01)
 
-    raw = 0.40 * _zscore(v1) + 0.30 * _zscore(v2) + 0.30 * _zscore(v3)
+    raw = 0.40*_zscore(v1) + 0.30*_zscore(v2) + 0.30*_zscore(v3)
 
-    # Boost por FCF 5y yield ajustado por SBC
     fcf_yield5 = _safe_div((fcf5_med - sbc_ttm), ev)
-    f5_pct = _rank_pct(fcf_yield5)
-    boost = (f5_pct >= 0.80).astype(float) * 0.25
+    boost = (_rank_pct(fcf_yield5) >= 0.80).astype(float) * 0.25
 
-    return (raw + boost).fillna(0.0)
+    return (raw + boost).fillna(0.0).reindex(out.index)
+
 
 # ---------------------------- Quality ----------------------------
 def quality_intangible_aware(df: pd.DataFrame) -> pd.Series:
-    """
-    Quality ajustado por intangibles:
-      - GP/Assets_xRD
-      - ROIC_xRD (NOPAT_xRD / InvestedCapital_xRD)
-      - Estabilidad de márgenes (inv. de la desviación 5y)
-      - Accruals (NOA) bajos
-      - NetCash/EBITDA
-    """
-    # Primero capitalizamos I+D
     out = capitalize_rd(df).copy()
 
-    # Coerción a numérico DESPUÉS de capitalizar
-    for col in [
-        "gross_profit_ttm","assets_xrd","total_assets_ttm","ebitda_ttm",
-        "ebitda_ntm","net_debt_ttm","noa_ttm","invested_capital_ttm",
-        "current_liabilities_ttm","operating_income_ttm","op_income_xrd","tax_rate"
-    ]:
-        if col in out.columns:
-            out[col] = _to_float(out[col])
+    gp         = _col(out, "gross_profit_ttm")
+    assets_xrd = _col(out, "assets_xrd")
+    if assets_xrd.isna().all():
+        assets_xrd = _col(out, "total_assets_ttm")
 
-    gp         = out.get("gross_profit_ttm")
-    assets_xrd = out.get("assets_xrd", out.get("total_assets_ttm"))
-    ebitda     = out.get("ebitda_ttm", out.get("ebitda_ntm"))
-    net_debt   = out.get("net_debt_ttm")
-    noa        = out.get("noa_ttm")
-    ic         = out.get("invested_capital_ttm",
-                  _to_float(out.get("total_assets_ttm", 0)) - _to_float(out.get("current_liabilities_ttm", 0)))
+    ebitda     = _col(out, "ebitda_ttm")
+    if ebitda.isna().all():
+        ebitda = _col(out, "ebitda_ntm")
 
-    tax_rate   = _to_float(out.get("tax_rate", pd.Series(index=out.index, data=0.20))).fillna(0.20)
-    opi_xrd    = _to_float(out.get("op_income_xrd", out.get("operating_income_ttm", 0))).fillna(0.0)
+    net_debt   = _col(out, "net_debt_ttm").fillna(0.0)
+    noa        = _col(out, "noa_ttm")
+    ic         = _col(out, "invested_capital_ttm")
+    if ic.isna().all():
+        ic = _col(out, "total_assets_ttm") - _col(out, "current_liabilities_ttm", 0.0)
+
+    tax_rate   = _col(out, "tax_rate", 0.20).fillna(0.20)
+    opi_xrd    = _col(out, "op_income_xrd")
+    if opi_xrd.isna().all():
+        opi_xrd = _col(out, "operating_income_ttm").fillna(0.0)
     nopat_xrd  = opi_xrd * (1 - tax_rate)
 
-    gp_assets = _winsorize(_safe_div(gp, assets_xrd), 0.01)
-    roic_xrd  = _winsorize(_safe_div(nopat_xrd, ic), 0.01)
+    gp_assets  = _winsorize(_safe_div(gp, assets_xrd), 0.01)
+    roic_xrd   = _winsorize(_safe_div(nopat_xrd, ic),  0.01)
 
-    # Estabilidad de márgenes
     if "op_margin_hist" in out.columns:
         std_margin = out["op_margin_hist"].apply(
             lambda xs: np.nanstd(np.asarray(xs), ddof=0) if isinstance(xs, (list, tuple, np.ndarray)) else np.nan
         )
     else:
-        std_margin = pd.Series(index=out.index, data=np.nan)
+        std_margin = pd.Series(np.nan, index=out.index)
     stab = -_zscore(_winsorize(std_margin.fillna(std_margin.median()), 0.01))
 
-    accruals = _winsorize(_to_float(noa).fillna(_to_float(noa).median()) if noa is not None else pd.Series(index=out.index, data=0.0), 0.01)
+    accruals = _winsorize(_col(out, "noa_ttm").fillna(_col(out, "noa_ttm").median()), 0.01)
     accruals_score = -_zscore(accruals)
 
-    netcash_ebitda = _winsorize(-_safe_div(_to_float(net_debt).fillna(0.0), _to_float(ebitda).abs() + 1e-9), 0.01)
+    netcash_ebitda = _winsorize(-_safe_div(net_debt, ebitda.abs() + 1e-9), 0.01)
 
-    return (
-        0.35 * _zscore(gp_assets) +
-        0.35 * _zscore(roic_xrd)  +
-        0.10 * stab               +
-        0.10 * _zscore(netcash_ebitda) +
-        0.10 * accruals_score
-    ).fillna(0.0)
-
+    return (0.35*_zscore(gp_assets) + 0.35*_zscore(roic_xrd) +
+            0.10*stab + 0.10*_zscore(netcash_ebitda) + 0.10*accruals_score).fillna(0.0).reindex(out.index)
 # ------------------- Sector & Cap Neutralization -----------------
 def neutralize_by_sector_cap(df: pd.DataFrame, 
                              score_col: str, 
