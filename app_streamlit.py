@@ -562,9 +562,25 @@ with tab3:
 
         # ===== Vista =====
         # ===== Vista =====
-        view = _ensure_sector_strings(view_df.copy())
+        # ===== Vista (construir una sola vez) =====
+        # 1) base: seleccionados o fallback
+        if df_vfq_sel.empty:
+            st.warning("Ningún símbolo pasó los filtros. Te muestro el Top por VFQ (sanitizado) para depurar.")
+            _ms = st.session_state.get("mask_sane")
+            if (_ms is None) or (len(_ms) != len(df_vfq)):
+                _ms = _build_mask_sane(df_vfq)
+                st.session_state["mask_sane"] = _ms
+            tmp = df_vfq.loc[_ms].copy()
+            scol = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
+            view = tmp.sort_values(scol, ascending=False) if scol else tmp.copy()
+        else:
+            # NO reemplazar 'view' luego con otro df: trabajamos siempre sobre este
+            sort_col_local = "VFQ" if "VFQ" in df_vfq_sel.columns else ("VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None)
+            view = df_vfq_sel.sort_values(sort_col_local, ascending=False).copy()
 
-        # --- filtro por texto
+        view = _ensure_sector_strings(view)
+
+        # 2) filtro por texto
         if search.strip():
             s = search.strip().lower()
             masks = []
@@ -577,24 +593,21 @@ with tab3:
                     m = m | mm
                 view = view[m]
 
-        # --- Market cap amigable (crear 'market_cap' si hay alguna base)
+        # 3) columnas derivadas SIEMPRE después de fijar 'view'
+        # --- market_cap amigable
         if "marketCap_unified" in view.columns:
             view["market_cap"] = pd.to_numeric(view["marketCap_unified"], errors="coerce").apply(_fmt_mcap)
         elif "marketCap" in view.columns:
             view["market_cap"] = pd.to_numeric(view["marketCap"], errors="coerce").apply(_fmt_mcap)
-        # si no hay ninguna, no se crea y no se pide mostrar
 
-        # --- Asegurar percentil visible (crear 'VFQ pct (sector)' si es posible)
+        # --- percentil visible
         if "VFQ_pct_sector" in view.columns:
             pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce")
-            pct = np.where(pct > 1.5, pct / 100.0, pct)  # por si vino en 0..100
+            pct = np.where(pct > 1.5, pct / 100.0, pct)  # por si llega 0..100
             pct = pd.Series(pct, index=view.index).clip(0.0, 1.0)
             view["VFQ pct (sector)"] = (pct * 100).round(2).clip(0, 100)
         else:
-            # si no existe el campo, intenta derivarlo desde el score
-            _sc = None
-            if "VFQ" in view.columns: _sc = "VFQ"
-            elif "VFQ_score" in view.columns: _sc = "VFQ_score"
+            _sc = "VFQ" if "VFQ" in view.columns else ("VFQ_score" if "VFQ_score" in view.columns else None)
             if _sc is not None:
                 tmp = _ensure_sector_strings(view.copy())
                 if "sector" in tmp.columns and tmp["sector"].nunique(dropna=False) > 1:
@@ -604,19 +617,26 @@ with tab3:
                 pct = pd.to_numeric(pct, errors="coerce").clip(0.0, 1.0)
                 view["VFQ pct (sector)"] = (pct * 100).round(2)
 
-        # --- redondeos ligeros (si existen)
+        # 4) redondeos
         for col in ["VFQ", "VFQ_score", "value_adj_neut", "quality_adj_neut",
                     "BreakoutScore", "momentum_score", "beta", "price"]:
             if col in view.columns:
                 view[col] = pd.to_numeric(view[col], errors="coerce").round(3)
 
-        # --- columnas visibles (solo las que EXISTEN)
+        # 5) ordenar por lo elegido en la UI (sin destruir derivadas)
+        if sort_by and sort_by in view.columns:
+            view = view.sort_values(sort_by, ascending=ascending, na_position="last")
+
+        # 6) columnas visibles (solo las que existan)
         pretty_cols_base = [
             "symbol", "sector", "industry", "market_cap", "price", "beta",
             "VFQ", "VFQ_score", "VFQ pct (sector)", "value_adj_neut",
             "quality_adj_neut", "BreakoutScore", "momentum_score"
         ]
         pretty_cols = [c for c in pretty_cols_base if c in view.columns]
+        if not pretty_cols:
+            pretty_cols = [c for c in ["symbol", "sector", "industry"] if c in view.columns] or view.columns.tolist()
+
 
         # --- orden elegido
         if sort_by and sort_by in view.columns:
