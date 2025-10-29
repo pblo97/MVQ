@@ -48,7 +48,8 @@ from qvm_trend.pipeline import (
 from qvm_trend.backtests import backtest_many
 
 # NUEVOS IMPORTS (growth-aware)
-from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules, standardize_fundamentals
+from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules, FundamentalStandardizer
+
 
 # ------------------ CACHÉ DE I/O ------------------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -840,71 +841,60 @@ with tab4:
         st.dataframe(view_combo, use_container_width=True, hide_index=True)
 
 # ====== Paso 5: QVM (growth-aware) ======
+# =================== TAB 5: QVM (growth-aware) ===================
 with tab5:
     st.subheader("QVM (growth-aware) con Guardrails → Técnico → Ranking")
 
-    # --- parámetros UI ---
+    # --- Parámetros UI ---
     colA, colB, colC = st.columns(3)
     with colA:
-        th_q_neut = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.05)
-        th_v_neut = st.slider("Min Value neut.",   0.0, 1.0, 0.0, 0.05)
-        th_ndebt  = st.slider("Max NetDebt/EBITDA", 0.0, 8.0, 3.0, 0.5)
+        th_q_neut   = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.05)   # puedes subir a 0.2–0.3
+        th_v_neut   = st.slider("Min Value neut.",   0.0, 1.0, 0.0, 0.05)
+        th_ndebt    = st.slider("Max NetDebt/EBITDA", 0.0, 8.0, 3.0, 0.5)
     with colB:
-        th_acc_p  = st.slider("Accruals (NOA) percentil mínimo", 0, 100, 30, 5)
-        beta_prob = st.slider("β prob_up (logit)", 2.0, 12.0, 6.0, 0.5)
-        top_n_show = st.slider("Top N por prob_up", 5, 100, 30, 5)
+        th_acc_p    = st.slider("Accruals (NOA) percentil mínimo", 0, 100, 30, 5)
+        beta_prob   = st.slider("β prob_up (logit)", 2.0, 12.0, 6.0, 0.5)
+        top_n_show  = st.slider("Top N por prob_up", 5, 100, 30, 5)
     with colC:
-        th_bo   = st.slider("Min BreakoutScore", 0, 100, 60, 1)
-        th_hits = st.slider("Min hits", 0, 5, 2, 1)
-        th_rvol = st.slider("Min RVOL20", 0.0, 5.0, 1.5, 0.1)
+        th_bo       = st.slider("Min BreakoutScore", 0, 100, 60, 1)
+        th_hits     = st.slider("Min hits", 0, 5, 2, 1)
+        th_rvol     = st.slider("Min RVOL20", 0.0, 5.0, 1.5, 0.1)
 
     try:
-        sig_df = st.session_state.get("signals", pd.DataFrame())
-        vfq_df = st.session_state.get("vfq", pd.DataFrame())
-        uni_df = st.session_state.get("uni", pd.DataFrame())
-        kept_df = st.session_state.get("kept", pd.DataFrame())
-        panel_prices = st.session_state.get("panel_prices")
+        # ------------------- Orígenes -------------------
+        sig_df        = st.session_state.get("signals", pd.DataFrame())
+        vfq_df        = st.session_state.get("vfq", pd.DataFrame())
+        uni_df        = st.session_state.get("uni", pd.DataFrame())
+        kept_df       = st.session_state.get("kept", pd.DataFrame())
+        panel_prices  = st.session_state.get("panel_prices")  # opcional
 
         if sig_df.empty:
             st.info("Primero corre **Señales**.")
             st.stop()
 
-        # ------------------- helper local robusto -------------------
-        def _as_series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
-            """Devuelve SIEMPRE Serie numérica alineada al índice de df (evita escalares)."""
-            val = df.get(col, None)
-            if isinstance(val, pd.Series):
-                return pd.to_numeric(val, errors="coerce").reindex(df.index)
-            if fallback is not None:
-                val2 = df.get(fallback, None)
-                if isinstance(val2, pd.Series):
-                    return pd.to_numeric(val2, errors="coerce").reindex(df.index)
-            return pd.Series(np.nan, index=df.index)
+        # ------------------- BASE desde señales -------------------
+        base_keep = ["symbol","sector","industry","marketCap","marketCap_unified",
+                     "BreakoutScore","ClosePos","P52","RVOL20","UDVol20","hits","rs_ma20_slope"]
+        base_cols = ["symbol"] + [c for c in base_keep if c in sig_df.columns and c != "symbol"]
+        base = sig_df[base_cols].drop_duplicates("symbol").copy()
 
-        # ------------------- BASE Y MOMENTUM -------------------
-        base_cols = [c for c in [
-            "symbol","sector","marketCap","marketCap_unified","BreakoutScore","ClosePos",
-            "P52","RVOL20","UDVol20","hits","rs_ma20_slope"
-        ] if c in sig_df.columns]
-
-        base = sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]] \
-                    .drop_duplicates("symbol") \
-                    .copy()
-
-        # Merge fundamentals (VFQ / UNI / kept)
+        # Merge VFQ (fundamentales) y UNI (sector/mcap) si existen
         if isinstance(vfq_df, pd.DataFrame) and not vfq_df.empty:
             base = base.merge(vfq_df, on="symbol", how="left", suffixes=("", "_vfq"))
-        if isinstance(uni_df, pd.DataFrame) and {"symbol","sector","marketCap"}.issubset(uni_df.columns):
-            base = base.merge(uni_df[["symbol","sector","marketCap"]], on="symbol", how="left", suffixes=("", "_uni"))
+        if isinstance(uni_df, pd.DataFrame) and {"symbol"}.issubset(uni_df.columns):
+            extra = [c for c in ["symbol","sector","industry","marketCap","market_cap"] if c in uni_df.columns]
+            if len(extra) > 1:
+                base = base.merge(uni_df[extra].drop_duplicates("symbol"), on="symbol", how="left", suffixes=("", "_uni"))
         if isinstance(kept_df, pd.DataFrame) and "symbol" in kept_df.columns:
             base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
 
-        # Momentum desde señales
+        # ------------------- Momentum proxy (coalesce) -------------------
+        # 1) desde señales (idempotente)
         mom_sig = build_momentum_proxy(sig_df)
         if isinstance(mom_sig, pd.Series) and not mom_sig.empty:
             base = base.merge(mom_sig.to_frame("mom_sig"), left_on="symbol", right_index=True, how="left")
 
-        # Momentum desde precios (panel largo o dict)
+        # 2) desde precios (si está panel_prices)
         mom_px = None
         try:
             if isinstance(panel_prices, pd.DataFrame):
@@ -928,73 +918,37 @@ with tab5:
         if isinstance(mom_px, pd.Series) and not mom_px.empty:
             base = base.merge(mom_px.to_frame("mom_px"), left_on="symbol", right_index=True, how="left")
 
-        # Coalesce momentum a 1D
+        # Coalesce momentum → 'momentum_score' 1D
         cand_moms = [c for c in ["momentum_score","mom_sig","mom_px","momentum_score_prices"] if c in base.columns]
         if cand_moms:
             base["momentum_score"] = base[cand_moms].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
-            base.drop(columns=[c for c in ["mom_sig","mom_px","momentum_score_prices"] if c in base.columns], inplace=True)
+            base.drop(columns=[c for c in ["mom_sig","mom_px","momentum_score_prices"] if c in base.columns],
+                      inplace=True, errors="ignore")
         else:
             base["momentum_score"] = 0.0
 
-        # Normaliza claves y dedup
-        base = base.loc[:, ~base.columns.duplicated(keep="last")]
-        base["momentum_score"] = pd.to_numeric(base.get("momentum_score", 0.0), errors="coerce").fillna(0.0)
-        base["sector"] = base.get("sector", base.get("sector_vfq", "Unknown")).astype(str).fillna("Unknown")
-        base["market_cap"] = pd.to_numeric(
-            base.get("market_cap", base.get("marketCap_unified", base.get("marketCap"))),
-            errors="coerce"
-        )
+        # ------------------- Estandarizar fundamentales (alias/num/sector) -------------------
+        if 'FundamentalStandardizer' not in globals():
+            st.error("No se encontró FundamentalStandardizer. Asegúrate de haber pegado el QVM CORE arriba.")
+            st.stop()
 
-        # Copia columnas *_vfq → nombre limpio si faltan
-        _need_cols = [
-            "ev","ebitda_ntm","gross_profit_ttm","sales_ntm","capex_ttm","sbc_ttm",
-            "fcf_ttm","fcf_5y_median","rd_expense_ttm","operating_income_ttm","total_assets_ttm",
-            "ebitda_ttm","net_debt_ttm","noa_ttm","invested_capital_ttm","current_liabilities_ttm",
-            "tax_rate","op_margin_hist"
-        ]
-        for c in _need_cols:
-            cv = f"{c}_vfq"
-            if c not in base.columns and cv in base.columns:
-                base[c] = base[cv]
+        base = FundamentalStandardizer().fit_transform(base)
 
-        base = standardize_fundamentals(base)
+        # Si no hay 'sector' pero sí 'industry', úsala como sector
+        if base["sector"].eq("Unknown").all() and "industry" in base.columns:
+            sec = base["industry"].astype(str).fillna("Unknown")
+            base["sector"] = sec
 
-        # Si momentum no existe aún, inicializa
-        base["momentum_score"] = pd.to_numeric(base.get("momentum_score", 0.0), errors="coerce").fillna(0.0)
-        diag_cols = ["ev","ebitda_ttm","ebitda_ntm","gross_profit_ttm","sales_ntm",
-             "rd_expense_ttm","operating_income_ttm","total_assets_ttm","net_debt_ttm","noa_ttm"]
-        cov = (base[diag_cols].notna().sum()/len(base)*100).round(1).rename("coverage_%").to_frame()
-        st.caption("Cobertura de fundamentals (post-normalización)")
-        st.dataframe(cov, use_container_width=True)
-
-        # ------------------- QVM: value/quality neutralizado -------------------
+        # ------------------- Cálculo QVM -------------------
         qvm_df = compute_qvm_scores(
-            base.rename(columns={"marketCap": "market_cap"}),
+            base,
             w_quality=0.40, w_value=0.25, w_momentum=0.35,
             momentum_col="momentum_score",
             sector_col="sector",
             mcap_col="market_cap"
         )
 
-        # Percentiles sectoriales y mezcla VFQ (sin duplicar luego)
-        def _pct(s: pd.Series) -> pd.Series:
-            s = pd.to_numeric(s, errors="coerce")
-            return s.rank(pct=True, method="average")
-
-        qvm_df["q_pct"]   = qvm_df.groupby("sector")["quality_adj_neut"].transform(_pct).fillna(0.5)
-        qvm_df["v_pct"]   = qvm_df.groupby("sector")["value_adj_neut"  ].transform(_pct).fillna(0.5)
-        qvm_df["vfq_pct"] = 0.6*qvm_df["q_pct"] + 0.4*qvm_df["v_pct"]
-
-        # Métricas de riesgo: siempre como Series
-        ebitda_tt  = _as_series(qvm_df, "ebitda_ttm", fallback="ebitda_ntm")
-        net_debt   = _as_series(qvm_df, "net_debt_ttm")
-        noa        = _as_series(qvm_df, "noa_ttm")
-
-        ebitda_abs = ebitda_tt.abs()
-        qvm_df["ndebt_ebitda"] = (net_debt / (ebitda_abs + 1e-9)).replace([np.inf, -np.inf], np.nan)
-        qvm_df["acc_pct"] = noa.rank(pct=True) if noa.notna().any() else pd.Series(1.0, index=qvm_df.index)
-
-        # Reglas megacap
+        # Guardrails especiales megacaps
         qvm_df = apply_megacap_rules(
             qvm_df,
             momentum_col="momentum_score",
@@ -1002,40 +956,57 @@ with tab5:
             value_col="value_adj_neut"
         )
 
+        # ------------------- Métricas auxiliares (deuda & accruals) -------------------
+        def _pct(s: pd.Series) -> pd.Series:
+            s = pd.to_numeric(s, errors="coerce")
+            return s.rank(pct=True, method="average")
+
+        # percentiles intra-sector para depurar si quieres ver dónde falla
+        qvm_df["q_pct"]  = qvm_df.groupby("sector")["quality_adj_neut"].transform(_pct).fillna(0.5)
+        qvm_df["v_pct"]  = qvm_df.groupby("sector")["value_adj_neut"].transform(_pct).fillna(0.5)
+        qvm_df["vfq_pct"] = 0.6*qvm_df["q_pct"] + 0.4*qvm_df["v_pct"]
+
+        # NetDebt/EBITDA (robusto a numpy.float64)
+        net_debt = pd.to_numeric(qvm_df.get("net_debt_ttm"), errors="coerce")
+        ebitda_ttm = pd.to_numeric(qvm_df.get("ebitda_ttm", qvm_df.get("ebitda_ntm")), errors="coerce").abs()
+        qvm_df["ndebt_ebitda"] = (net_debt / (ebitda_ttm + 1e-9)).replace([np.inf, -np.inf], np.nan)
+
+        # Accruals proxy (percentil de NOA; si falta NOA, no bloquea)
+        noa = pd.to_numeric(qvm_df.get("noa_ttm"), errors="coerce")
+        if noa.isna().all():
+            qvm_df["acc_pct"] = 1.0
+        else:
+            qvm_df["acc_pct"] = noa.rank(pct=True, method="average")
+
         # ------------------- 1) Guardrails fundamentales -------------------
         gr = pd.Series(True, index=qvm_df.index, name="pass_guardrails")
-        gr &= qvm_df["quality_adj_neut"] > th_q_neut
-        gr &= qvm_df["value_adj_neut"]   > th_v_neut
+        gr &= (pd.to_numeric(qvm_df["quality_adj_neut"], errors="coerce") > th_q_neut)
+        gr &= (pd.to_numeric(qvm_df["value_adj_neut"],   errors="coerce") > th_v_neut)
         gr &= (qvm_df["ndebt_ebitda"].isna() | (qvm_df["ndebt_ebitda"] <= th_ndebt))
-        gr &= qvm_df["acc_pct"] >= (th_acc_p/100.0)
+        gr &= (pd.to_numeric(qvm_df["acc_pct"], errors="coerce") >= (th_acc_p/100.0))
         qvm_df["pass_guardrails"] = gr
 
-        # Mostrar rechazados
+        # Tabla de rechazados (para depurar)
         rej_cols = [c for c in ["symbol","sector","market_cap","quality_adj_neut","value_adj_neut",
                                 "ndebt_ebitda","acc_pct","BreakoutScore"] if c in qvm_df.columns]
         st.caption("🚧 Rechazados por guardrails")
-        st.dataframe(qvm_df.loc[~gr, rej_cols].sort_values(
-                        ["quality_adj_neut","value_adj_neut"], ascending=True),
+        st.dataframe(qvm_df.loc[~gr, rej_cols].sort_values(["quality_adj_neut","value_adj_neut"], ascending=True),
                      use_container_width=True, hide_index=True)
 
-        # ------------------- 2) Filtro técnico sobre los que pasan -------------------
+        # ------------------- 2) Filtro técnico (entre los que pasan guardrails) -------------------
         tech_ok = pd.Series(True, index=qvm_df.index, name="pass_tech")
         tech_ok &= (pd.to_numeric(qvm_df.get("BreakoutScore"), errors="coerce") >= th_bo)
         tech_ok &= (pd.to_numeric(qvm_df.get("hits"), errors="coerce").fillna(0) >= th_hits)
         tech_ok &= (pd.to_numeric(qvm_df.get("RVOL20"), errors="coerce").fillna(0) >= th_rvol)
         qvm_df["pass_tech"] = tech_ok
 
-        eligibles_pre_tech = qvm_df.loc[gr, [c for c in [
-            "symbol","sector","market_cap","value_adj_neut","quality_adj_neut",
-            "qvm_score","ndebt_ebitda","acc_pct","vfq_pct"
-        ] if c in qvm_df.columns]].copy()
-
+        eligibles_pre_tech = qvm_df.loc[gr, ["symbol","sector","market_cap","value_adj_neut",
+                                             "quality_adj_neut","qvm_score","ndebt_ebitda","acc_pct","vfq_pct"]]
         st.caption("✅ Elegibles por guardrails (antes del técnico)")
-        st.dataframe(eligibles_pre_tech.sort_values(
-                        ["quality_adj_neut","value_adj_neut","qvm_score"], ascending=False),
+        st.dataframe(eligibles_pre_tech.sort_values(["quality_adj_neut","value_adj_neut","qvm_score"], ascending=False),
                      use_container_width=True, hide_index=True)
 
-        # ------------------- 3) Ranking final (blend QVM + Breakout) -------------------
+        # ------------------- 3) Ranking final -------------------
         def _z(s: pd.Series) -> pd.Series:
             s = pd.to_numeric(s, errors="coerce")
             mu, sd = s.mean(skipna=True), s.std(skipna=True)
@@ -1048,13 +1019,12 @@ with tab5:
         else:
             final_alpha = qvm_df["qvm_score"].rank(pct=True, method="average")
 
-        qvm_df["final_alpha"] = final_alpha
+        qvm_df["final_alpha"]     = final_alpha
         qvm_df["final_alpha_pct"] = pd.to_numeric(final_alpha, errors="coerce").rank(pct=True, method="average")
 
-        pct = qvm_df["final_alpha_pct"].clip(0,1).fillna(0.5)
+        pct = qvm_df["final_alpha_pct"].clip(0, 1).fillna(0.5)
         qvm_df["prob_up"] = 1.0 / (1.0 + np.exp(-beta_prob * (pct - 0.5)))
 
-        # Resultado final: pasan guardrails + técnico
         final_mask = qvm_df["pass_guardrails"] & qvm_df["pass_tech"]
         final_cols = [c for c in [
             "symbol","sector","market_cap","qvm_score","final_alpha","final_alpha_pct","prob_up",
@@ -1071,24 +1041,20 @@ with tab5:
             use_container_width=True, hide_index=True
         )
 
-        # Tabla técnica por hits + BreakoutScore
+        # ----------- Tabla técnica: ordenar por hits y BreakoutScore -----------
         st.subheader("Orden técnico (hits y BreakoutScore)")
         tech_cols = [c for c in ["symbol","hits","BreakoutScore","RVOL20","ClosePos","P52"] if c in qvm_df.columns]
+        tech_table = qvm_df.loc[gr, tech_cols].copy()
         st.dataframe(
-            qvm_df.loc[gr, tech_cols].sort_values(["hits","BreakoutScore","RVOL20"], ascending=False),
+            tech_table.sort_values(["hits","BreakoutScore","RVOL20"], ascending=False),
             use_container_width=True, hide_index=True
         )
 
-        # Persistir
+        # Guarda en sesión
         st.session_state["qvm"] = qvm_df
-
-        # Alertas útiles si faltan fundamentals (evita qvm≈0)
-        if qvm_df[["value_adj_neut","quality_adj_neut"]].abs().sum().sum() == 0:
-            st.warning("⚠️ `value_adj_neut` y `quality_adj_neut` están en 0. Revisa que VFQ/UNI aporten columnas de fundamentales (ev, ebitda, gross_profit, etc.).")
 
     except Exception as e:
         st.error(f"Error en QVM growth-aware: {e}")
-
 
 # ====== Paso 6: EXPORT ======
 with tab6:
