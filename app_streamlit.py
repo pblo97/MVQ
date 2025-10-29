@@ -133,17 +133,15 @@ def _enrich_sector_industry(uni_df: pd.DataFrame, src_df: pd.DataFrame) -> pd.Da
     return out
 
 def _as_series(x, index=None):
-    """Garantiza Serie. Si x es escalar/str/list, lo convierte a Serie con index dado."""
     import pandas as pd
     if isinstance(x, pd.Series):
         return x
     return pd.Series(x, index=index)
 
 def _ensure_sector_strings(df: pd.DataFrame, sector_col="sector", industry_col="industry") -> pd.DataFrame:
-    """Sector/industry siempre como strings seguros (sin None) y sin vacíos."""
-    import numpy as np
+    import numpy as np, pandas as pd
     if sector_col not in df.columns:
-        df[sector_col] = pd.Series(["Unknown"] * len(df), index=df.index)  # <- evita string escalar
+        df[sector_col] = pd.Series(["Unknown"] * len(df), index=df.index)
     else:
         s = _as_series(df[sector_col], df.index)
         s = s.astype(str)
@@ -348,8 +346,12 @@ def _fmt_mcap(x):
         return f"${x:,.0f}"
     except Exception:
         return ""
-def _numcol(df: pd.DataFrame, name: str) -> pd.Series:
-    return pd.to_numeric(df[name], errors="coerce") if name in df.columns else pd.Series(np.nan, index=df.index)
+
+def _numcol(df: pd.DataFrame, col: str) -> pd.Series:
+    import pandas as pd
+    if col not in df.columns:
+        return pd.Series([float("nan")] * len(df), index=df.index)
+    return pd.to_numeric(df[col], errors="coerce")
 
 with tab3:
     st.subheader("VFQ")
