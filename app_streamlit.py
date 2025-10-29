@@ -561,7 +561,6 @@ with tab3:
             ascending = st.toggle("Ascendente", value=False)
 
         # ===== Vista =====
-        # ===== Vista =====
         # ===== Vista (construir una sola vez) =====
         # 1) base: seleccionados o fallback
         if df_vfq_sel.empty:
@@ -571,27 +570,24 @@ with tab3:
                 _ms = _build_mask_sane(df_vfq)
                 st.session_state["mask_sane"] = _ms
             tmp = df_vfq.loc[_ms].copy()
-            scol = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
-            view = tmp.sort_values(scol, ascending=False) if scol else tmp.copy()
+            base_sort_col = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
+            view = tmp.sort_values(base_sort_col, ascending=False) if base_sort_col else tmp.copy()
         else:
-            # NO reemplazar 'view' luego con otro df: trabajamos siempre sobre este
-            sort_col_local = "VFQ" if "VFQ" in df_vfq_sel.columns else ("VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None)
-            view = df_vfq_sel.sort_values(sort_col_local, ascending=False).copy()
+            base_sort_col = "VFQ" if "VFQ" in df_vfq_sel.columns else ("VFQ_score" if "VFQ_score" in df_vfq_sel.columns else None)
+            view = df_vfq_sel.sort_values(base_sort_col, ascending=False).copy()
 
         view = _ensure_sector_strings(view)
 
         # 2) filtro por texto
         if search.strip():
             s = search.strip().lower()
-            masks = []
-            for col in ["symbol", "sector", "industry"]:
+            mask_any = None
+            for col in ("symbol", "sector", "industry"):
                 if col in view.columns:
-                    masks.append(view[col].astype(str).str.lower().str.contains(s, na=False))
-            if masks:
-                m = masks[0]
-                for mm in masks[1:]:
-                    m = m | mm
-                view = view[m]
+                    m = view[col].astype(str).str.lower().str.contains(s, na=False)
+                    mask_any = m if mask_any is None else (mask_any | m)
+            if mask_any is not None:
+                view = view[mask_any]
 
         # 3) columnas derivadas SIEMPRE después de fijar 'view'
         # --- market_cap amigable
@@ -603,7 +599,7 @@ with tab3:
         # --- percentil visible
         if "VFQ_pct_sector" in view.columns:
             pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce")
-            pct = np.where(pct > 1.5, pct / 100.0, pct)  # por si llega 0..100
+            pct = np.where(pct > 1.5, pct / 100.0, pct)  # si llegó 0..100
             pct = pd.Series(pct, index=view.index).clip(0.0, 1.0)
             view["VFQ pct (sector)"] = (pct * 100).round(2).clip(0, 100)
         else:
@@ -636,46 +632,6 @@ with tab3:
         pretty_cols = [c for c in pretty_cols_base if c in view.columns]
         if not pretty_cols:
             pretty_cols = [c for c in ["symbol", "sector", "industry"] if c in view.columns] or view.columns.tolist()
-
-
-        # --- orden elegido
-        if sort_by and sort_by in view.columns:
-            view = view.sort_values(sort_by, ascending=ascending, na_position="last")
-
-        # --- si por alguna razón no quedó ninguna columna bonita, muestra algo
-        if not pretty_cols:
-            pretty_cols = [c for c in ["symbol", "sector", "industry"] if c in view.columns] or view.columns.tolist()
-
-
-        # ===== Fallback cuando no pasa nadie =====
-        if df_vfq_sel.empty:
-            st.warning("Ningún símbolo pasó los filtros. Te muestro el Top por VFQ (sanitizado) para depurar.")
-            _ms = st.session_state.get("mask_sane")
-            if (_ms is None) or (len(_ms) != len(df_vfq)):
-                _ms = _build_mask_sane(df_vfq)
-                st.session_state["mask_sane"] = _ms
-
-            tmp = df_vfq.loc[_ms].copy()
-            # usar la misma columna de orden que arriba
-            scol = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
-            view_df = tmp.sort_values(scol, ascending=False) if scol else tmp.copy()
-            view = _ensure_sector_strings(view_df.copy())
-            if "VFQ_pct_sector" in view.columns and "VFQ pct (sector)" not in view.columns:
-                pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce").clip(0.0, 1.0)
-                view["VFQ pct (sector)"] = (pct * 100).round(2)
-            pretty_cols = [c for c in pretty_cols if c in view.columns]
-        else:
-            # asegura usar 'sort_col' definido antes
-            if sort_col and sort_col in df_vfq_sel.columns:
-                view = _ensure_sector_strings(df_vfq_sel.sort_values(sort_col, ascending=False).copy())
-            else:
-                view = _ensure_sector_strings(df_vfq_sel.copy())
-
-        # Exportar un Top N para el tab técnico
-        HIT_N = st.session_state.get("hit_n", 30)
-        st.session_state["vfq_hits_syms"] = (
-            view.get("symbol", pd.Series(dtype=str)).dropna().astype(str).head(HIT_N).tolist()
-        )
 
         # ===== Render tabla =====
         st.dataframe(
