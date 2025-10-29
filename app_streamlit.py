@@ -154,6 +154,9 @@ def _ensure_sector_strings(df: pd.DataFrame, sector_col="sector", industry_col="
         df[industry_col] = t.astype(str).where(~t.isna(), "")
     return df
 
+def _as_list(x):
+    return x if isinstance(x, (list, tuple, pd.Index, np.ndarray)) else [x]
+
 # ==================== HEADER ====================
 l, r = st.columns([0.85, 0.15])
 with l:

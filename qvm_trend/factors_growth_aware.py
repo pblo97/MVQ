@@ -208,87 +208,86 @@ def neutralize_by_sector_cap(df: pd.DataFrame,
                                       ("Large", 10e9, 150e9),
                                       ("Mid",   2e9, 10e9),
                                       ("Small", 0,   2e9))) -> pd.Series:
+    """
+    Estandariza (z-score) un 'score_col' intra-sector e intra-cap y mezcla 50/50.
+    Devuelve una Serie 1D alineada al índice de df.
+    """
     out = df.copy()
 
-    # Fallbacks básicos
+    # --- Columnas base y coerción ---
+    if hasattr(out, "columns"):
+        # Evita duplicados 2D tipo 'momentum_score' duplicado
+        out = out.loc[:, ~out.columns.duplicated(keep="last")]
+
+    if score_col not in out.columns:
+        # Si falta, devuelve ceros (no rompemos el flujo)
+        return pd.Series(0.0, index=out.index, name="z_neut")
+
     if sector_col not in out.columns:
         out[sector_col] = "Unknown"
+    out[sector_col] = out[sector_col].astype(str).fillna("Unknown")
+
     if mcap_col not in out.columns:
         out[mcap_col] = np.nan
-
     out[mcap_col] = _to_float(out[mcap_col])
 
-    # --- 1) Armar bins válidos (crecientes) a partir de 'buckets' ---
-    #     Ordenamos por límite inferior y reconstruimos "bins" + "labels"
+    # --- Score numérico 1D ---
+    out["_score_"] = _to_float(out[score_col])
+
+    # --- Buckets por market cap (robusto) ---
     try:
-        # Ordena por low ascendente
         b_sorted = sorted(list(buckets), key=lambda t: float(t[1]))
         lows  = [float(b[1]) for b in b_sorted]
         highs = [float(b[2]) for b in b_sorted]
         labels = [str(b[0]) for b in b_sorted]
 
-        # Verificación de consistencia (cada low < high)
         for lo, hi in zip(lows, highs):
             if not (lo < hi):
                 raise ValueError("Cada bucket debe cumplir low < high")
 
-        # Construye bins crecientes: [low0, low1, ..., lowN, highN]
-        # (asumimos rangos contiguos y sin solapamiento en la definición)
         bins = lows + [highs[-1]]
-
-        # Asegura estrictamente crecientes + únicos
         bins = np.array(bins, dtype=float)
         if not np.all(np.diff(bins) > 0):
-            # Si viene algo mal (duplicados/desc), reordena y unifica
             uniq = np.unique(bins)
             if len(uniq) < 2:
-                raise ValueError("No hay cortes suficientes para binning")
+                raise ValueError("Bins inválidos")
             bins = uniq
 
-        # Ajuste de etiquetas al número de intervalos
         if len(labels) != (len(bins) - 1):
-            # Recalcula labels simple (Small < Mid < Large < Mega)
             labels = [f"Cap_{i+1}" for i in range(len(bins) - 1)]
 
-        # --- 2) Cortes por market cap ---
         out["_cap_bucket"] = pd.cut(out[mcap_col], bins=bins, labels=labels, include_lowest=True, right=False)
-
-        # Si todos quedaron NaN (p.ej. datos muy raros), fuerza un solo bucket
         if out["_cap_bucket"].notna().sum() == 0:
             out["_cap_bucket"] = "Cap_All"
-
     except Exception:
-        # Fallback robusto: cuantiles (hasta 4), evitando bins no únicos
-        q = _to_float(out[mcap_col])
+        q = out[mcap_col]
         if q.notna().nunique() < 2:
             out["_cap_bucket"] = "Cap_All"
         else:
             try:
-                # cuantiles 0-25-50-75-100
                 out["_cap_bucket"] = pd.qcut(q, q=4, duplicates="drop")
             except Exception:
                 out["_cap_bucket"] = "Cap_All"
 
-    # --- 3) Estandarización por sector y por cap bucket ---
-    def z_by(group):
-        s = group[score_col]
-        return _zscore(s)
+    # --- z intra-sector / intra-cap ---
+    def _z_by(group: pd.DataFrame) -> pd.Series:
+        return _zscore(group["_score_"])
 
-    # Z por sector
-    z_sector = out.groupby(sector_col, group_keys=False).apply(z_by).rename("z_sector")
+    # Importante: align al índice original SIEMPRE (evita problemas posteriores)
+    z_sector = out.groupby(sector_col, group_keys=False).apply(_z_by)
+    z_sector = z_sector.reindex(out.index)  # alineación explícita
+    z_cap    = out.groupby("_cap_bucket", group_keys=False).apply(_z_by)
+    z_cap    = z_cap.reindex(out.index)
 
-    # Z por cap bucket (si solo hay una categoría, el z-score saldrá todo 0)
-    z_cap = out.groupby("_cap_bucket", group_keys=False).apply(z_by).rename("z_cap")
+    # Fallback si z_cap es todo NaN (poco/mala cobertura)
+    if _to_float(z_cap).notna().sum() == 0:
+        z_neut = _to_float(z_sector).fillna(0.0)
+    else:
+        z_neut = (0.5 * _to_float(z_sector) + 0.5 * _to_float(z_cap)).fillna(0.0)
 
-    out["_z_sector"] = z_sector
-    out["_z_cap"] = z_cap
+    z_neut.name = "z_neut"
+    return z_neut
 
-    # Si por cualquier razón z_cap es todo NaN, usa solo z_sector
-    if _to_float(out["_z_cap"]).notna().sum() == 0:
-        return out["_z_sector"].fillna(0.0)
-
-    # Blend 50/50
-    return (0.5 * out["_z_sector"] + 0.5 * out["_z_cap"]).fillna(0.0)
 # ----------------------------- QVM -------------------------------
 def compute_qvm_scores(df: pd.DataFrame, 
                        w_quality: float = 0.40,
@@ -297,29 +296,48 @@ def compute_qvm_scores(df: pd.DataFrame,
                        momentum_col: str = "momentum_score",
                        sector_col: str = "sector",
                        mcap_col: str = "market_cap") -> pd.DataFrame:
-    df = df.copy()
+    """
+    Calcula value/quality growth-aware, neutraliza por sector+cap y compone QVM.
+    Devuelve df con columnas:
+      value_adj, quality_adj, value_adj_neut, quality_adj_neut, qvm_score
+    (y deja momentum zscoreado embebido en la fórmula)
+    """
+    d = df.copy()
 
-    # 🔧 evita que df["momentum_score"] devuelva un DataFrame por duplicados
-    if hasattr(df, "columns"):
-        df = df.loc[:, ~df.columns.duplicated(keep="last")]
+    # Limpia duplicados que crean columnas 2D
+    if hasattr(d, "columns"):
+        d = d.loc[:, ~d.columns.duplicated(keep="last")]
 
-    df["value_adj"]   = value_growth_aware(df)
-    df["quality_adj"] = quality_intangible_aware(df)
-    df["value_adj_neut"]   = neutralize_by_sector_cap(df, "value_adj",  sector_col, mcap_col)
-    df["quality_adj_neut"] = neutralize_by_sector_cap(df, "quality_adj", sector_col, mcap_col)
+    # Sector seguro
+    if sector_col not in d.columns:
+        d[sector_col] = "Unknown"
+    d[sector_col] = d[sector_col].astype(str).fillna("Unknown")
 
-    if momentum_col not in df.columns:
-        df[momentum_col] = 0.0
+    # Momentum seguro (1D numérico)
+    if momentum_col not in d.columns:
+        d[momentum_col] = 0.0
+    d[momentum_col] = _to_float(d[momentum_col])
 
-    # ✅ ahora _to_float colapsa 2D de forma segura
-    m = _zscore(_to_float(df[momentum_col]))
+    # Value / Quality “growth/intangible aware”
+    d["value_adj"]   = value_growth_aware(d)
+    d["quality_adj"] = quality_intangible_aware(d)
 
-    df["qvm_score"] = (
-        w_quality * _zscore(df["quality_adj_neut"]) +
-        w_value   * _zscore(df["value_adj_neut"])   +
-        w_momentum* m
-    ).fillna(0.0)
-    return df
+    # Neutralización por sector+cap (blindea índices/nombres)
+    d["value_adj_neut"]   = neutralize_by_sector_cap(d, "value_adj",  sector_col, mcap_col)
+    d["quality_adj_neut"] = neutralize_by_sector_cap(d, "quality_adj", sector_col, mcap_col)
+
+    # Z de momentum (global)
+    m_z = _zscore(d[momentum_col])
+
+    # Composición QVM
+    d["qvm_score"] = (
+        w_quality * _zscore(d["quality_adj_neut"]) +
+        w_value   * _zscore(d["value_adj_neut"])   +
+        w_momentum* m_z
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    return d
+
 
 # ----------------------- Guardrails/overrides --------------------
 def apply_megacap_rules(df: pd.DataFrame,
