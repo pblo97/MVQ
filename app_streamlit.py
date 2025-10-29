@@ -48,7 +48,7 @@ from qvm_trend.pipeline import (
 from qvm_trend.backtests import backtest_many
 
 # NUEVOS IMPORTS (growth-aware)
-from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules, FundamentalStandardizer
+from qvm_trend.factors_growth_aware import compute_qvm_scores, apply_megacap_rules
 
 
 # ------------------ CACHÉ DE I/O ------------------
@@ -841,6 +841,149 @@ with tab4:
         st.dataframe(view_combo, use_container_width=True, hide_index=True)
 
 # ====== Paso 5: QVM (growth-aware) ======
+# ============ QVM CORE: FundamentalStandardizer ============
+
+from dataclasses import dataclass, field
+
+@dataclass
+class FundamentalStandardizer:
+    """
+    Normaliza/alia columnas fundamentales y técnicas para que QVM funcione
+    sin 'Unknown' de sector ni Series 2D. Incluye coalesce *_vfq → limpio,
+    coerción numérica, y derivaciones básicas (market_cap, net_debt, etc.)
+    """
+    alias: dict = field(default_factory=lambda: {
+        # básicos
+        "market_cap": ["market_cap","marketCap","marketCap_unified","mkt_cap","Market Cap"],
+        "sector":     ["sector","Sector","industry","Industry","gicsSector","GICS_Sector"],
+        # value
+        "ev":                ["ev","enterpriseValue","EnterpriseValue","EV"],
+        "ebitda_ttm":        ["ebitda_ttm","EBITDA_TTM","ebitdaTrailingTwelveMonths","ebitdaTTM"],
+        "ebitda_ntm":        ["ebitda_ntm","EBITDA_NTM","ebitdaForward","ebitdaNextTwelveMonths"],
+        "gross_profit_ttm":  ["gross_profit_ttm","grossProfitTTM","GrossProfitTTM"],
+        "sales_ntm":         ["sales_ntm","revenueNTM","RevenueNTM","salesForward","revenueForward","revenue_ntm"],
+        "capex_ttm":         ["capex_ttm","capexTTM","CapExTTM","capitalExpenditureTTM"],
+        "sbc_ttm":           ["sbc_ttm","stockBasedCompTTM","shareBasedCompTTM","SBC_TTM"],
+        "fcf_ttm":           ["fcf_ttm","freeCashFlowTTM","FCF_TTM"],
+        "fcf_5y_median":     ["fcf_5y_median","FCF_5Y_MEDIAN","fcfMedian5Y"],
+        # quality / intangible
+        "rd_expense_ttm":        ["rd_expense_ttm","researchDevelopmentTTM","R&D_TTM","researchAndDevTTM"],
+        "operating_income_ttm":  ["operating_income_ttm","operatingIncomeTTM","OperatingIncomeTTM","ebitTTM"],
+        "total_assets_ttm":      ["total_assets_ttm","totalAssetsTTM","TotalAssetsTTM","totalAssets"],
+        "net_debt_ttm":          ["net_debt_ttm","netDebtTTM","NetDebtTTM","netDebt"],
+        "total_debt_ttm":        ["total_debt_ttm","totalDebtTTM","TotalDebtTTM","totalDebt"],
+        "cash_ttm":              ["cash_ttm","cashAndEquivalentsTTM","cashAndCashEquivalentsTTM","cashAndEquivalents"],
+        "noa_ttm":               ["noa_ttm","netOperatingAssetsTTM","NOA_TTM"],
+        "invested_capital_ttm":  ["invested_capital_ttm","investedCapitalTTM","InvestedCapitalTTM"],
+        "current_liabilities_ttm":["current_liabilities_ttm","currentLiabilitiesTTM","CurrentLiabilitiesTTM"],
+        "tax_rate":              ["tax_rate","effectiveTaxRate","effectiveTaxRateTTM"],
+        "op_margin_hist":        ["op_margin_hist","operatingMarginHistory","opMarginHistory"],
+        # técnico
+        "BreakoutScore": ["BreakoutScore"],
+        "RVOL20":        ["RVOL20"],
+        "UDVol20":       ["UDVol20"],
+        "hits":          ["hits"],
+        "P52":           ["P52"],
+        "ClosePos":      ["ClosePos"],
+        "momentum_score":["momentum_score","mom","momo","mom_sig","mom_px","momentum_score_prices"],
+    })
+
+    def _first_present(self, df: pd.DataFrame, std: str):
+        """Toma la primera columna candidata presente; si no está, intenta *_vfq."""
+        # ya existe la estándar
+        if std in df.columns:
+            return df[std]
+        # busca alias directos
+        for c in self.alias.get(std, []):
+            if c in df.columns:
+                return df[c]
+        # busca versión *_vfq
+        cand_vfq = f"{std}_vfq"
+        if cand_vfq in df.columns:
+            return df[cand_vfq]
+        # busca alias con _vfq
+        for c in self.alias.get(std, []):
+            c_v = f"{c}_vfq"
+            if c_v in df.columns:
+                return df[c_v]
+        # default vacío
+        return pd.Series(np.nan, index=df.index)
+
+    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+
+        # Elimina columnas duplicadas por nombre (causa Series 2D)
+        out = out.loc[:, ~out.columns.duplicated(keep="last")]
+
+        # Asegura 'symbol'
+        if "symbol" not in out.columns:
+            raise ValueError("Falta columna 'symbol'")
+
+        # Construye y coalesce columnas estándar
+        std_cols = [
+            # básicos
+            "market_cap","sector",
+            # value
+            "ev","ebitda_ttm","ebitda_ntm","gross_profit_ttm","sales_ntm",
+            "capex_ttm","sbc_ttm","fcf_ttm","fcf_5y_median",
+            # quality/intangible
+            "rd_expense_ttm","operating_income_ttm","total_assets_ttm",
+            "net_debt_ttm","total_debt_ttm","cash_ttm","noa_ttm",
+            "invested_capital_ttm","current_liabilities_ttm","tax_rate","op_margin_hist",
+            # técnico
+            "BreakoutScore","RVOL20","UDVol20","hits","P52","ClosePos","momentum_score"
+        ]
+        for std in std_cols:
+            s = self._first_present(out, std)
+            # promedia fila a fila si llegó DataFrame (2D)
+            if isinstance(s, pd.DataFrame):
+                s = s.apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
+            out[std] = s
+
+        # Sector: si queda Unknown y hay industry, úsala
+        if out["sector"].isna().all() and "industry" in out.columns:
+            out["sector"] = out["industry"].astype(str)
+
+        out["sector"] = out["sector"].astype(str).fillna("Unknown")
+        # Market cap: coalesce si faltó
+        if out["market_cap"].isna().all():
+            for alt in ["marketCap_unified","marketCap","mkt_cap"]:
+                if alt in df.columns:
+                    out["market_cap"] = pd.to_numeric(df[alt], errors="coerce")
+                    break
+
+        # Derivación net_debt si falta: total_debt - cash
+        if out["net_debt_ttm"].isna().all():
+            td = pd.to_numeric(out.get("total_debt_ttm"), errors="coerce")
+            cs = pd.to_numeric(out.get("cash_ttm"), errors="coerce")
+            out["net_debt_ttm"] = (td - cs)
+
+        # Coerción numérica masiva
+        num_cols = [
+            "market_cap","ev","ebitda_ttm","ebitda_ntm","gross_profit_ttm","sales_ntm",
+            "capex_ttm","sbc_ttm","fcf_ttm","fcf_5y_median","rd_expense_ttm",
+            "operating_income_ttm","total_assets_ttm","net_debt_ttm","noa_ttm",
+            "invested_capital_ttm","current_liabilities_ttm","tax_rate",
+            "BreakoutScore","RVOL20","UDVol20","hits","P52","ClosePos","momentum_score"
+        ]
+        for c in num_cols:
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+
+        # Momentum seguro
+        if "momentum_score" not in out.columns or out["momentum_score"].isna().all():
+            out["momentum_score"] = 0.0
+        else:
+            # por si vinieron múltiples fuentes mezcladas
+            if isinstance(out["momentum_score"], pd.DataFrame):
+                out["momentum_score"] = out["momentum_score"].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
+            else:
+                out["momentum_score"] = pd.to_numeric(out["momentum_score"], errors="coerce").fillna(0.0)
+
+        # Limpieza final de duplicados de nombre
+        out = out.loc[:, ~out.columns.duplicated(keep="last")]
+        return out
+
 # =================== TAB 5: QVM (growth-aware) ===================
 with tab5:
     st.subheader("QVM (growth-aware) con Guardrails → Técnico → Ranking")
