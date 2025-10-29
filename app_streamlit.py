@@ -854,7 +854,7 @@ with tab5:
             st.info("Primero corre **Señales**.")
             st.stop()
 
-        # --- Base desde señales ---
+        # ------------------- BASE -------------------
         base_cols = [c for c in ["symbol","sector","marketCap","marketCap_unified",
                                  "BreakoutScore","ClosePos","P52","rs_ma20_slope"]
                      if c in sig_df.columns]
@@ -862,7 +862,6 @@ with tab5:
                 .drop_duplicates("symbol")
                 .copy())
 
-        # Añade VFQ/UNI si existen
         if isinstance(vfq_df, pd.DataFrame) and not vfq_df.empty:
             base = base.merge(vfq_df, on="symbol", how="left", suffixes=("", "_vfq"))
         if isinstance(uni_df, pd.DataFrame) and {"symbol","sector","marketCap"}.issubset(uni_df.columns):
@@ -871,23 +870,18 @@ with tab5:
             base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
 
         # ------------------- MOMENTUM 1D -------------------
-        # 1) Momentum derivado de señales (Series index=symbol)
         mom_sig = build_momentum_proxy(sig_df)
         if isinstance(mom_sig, pd.Series) and not mom_sig.empty:
             base = base.merge(mom_sig.to_frame("mom_sig"), left_on="symbol", right_index=True, how="left")
 
-        # 2) Momentum desde precios (Series index=symbol)
         mom_px = None
         try:
             if isinstance(panel_prices, pd.DataFrame):
-                # panel largo con columnas (symbol, date, close) o (ticker, date, close)
                 df_long = panel_prices.copy()
                 if "symbol" not in df_long.columns and "ticker" in df_long.columns:
                     df_long = df_long.rename(columns={"ticker": "symbol"})
-                # build_momentum_proxy espera (id_col, date_col, price_col) si no deduce
                 mom_px = build_momentum_proxy(df_long, price_col="close", id_col="symbol", date_col="date")
             elif isinstance(panel_prices, dict):
-                # dict {sym: df_prices}; conviértelo a largo
                 frames = []
                 for sym, dfp in panel_prices.items():
                     if isinstance(dfp, pd.DataFrame) and "close" in dfp.columns:
@@ -903,42 +897,57 @@ with tab5:
         if isinstance(mom_px, pd.Series) and not mom_px.empty:
             base = base.merge(mom_px.to_frame("mom_px"), left_on="symbol", right_index=True, how="left")
 
-        # 3) COALESCE a una sola 'momentum_score' (1D)
+        # Coalesce momentum -> una sola columna 1D
         cand_moms = [c for c in ["momentum_score","mom_sig","mom_px","momentum_score_prices"] if c in base.columns]
         if cand_moms:
             base["momentum_score"] = base[cand_moms].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
             for c in ["mom_sig","mom_px","momentum_score_prices"]:
-                if c in base.columns:
-                    base.drop(columns=[c], inplace=True)
-
-        # ------------------- NORMALIZACIONES -------------------
-        # Quita nombres de columnas duplicados (causa típica del error 2D)
-        if hasattr(base, "columns"):
-            base = base.loc[:, ~base.columns.duplicated(keep="last")]
-
-        # Asegura que 'momentum_score' sea Serie numérica 1D
-        if "momentum_score" in base.columns:
-            if isinstance(base["momentum_score"], pd.DataFrame):
-                base["momentum_score"] = pd.to_numeric(base["momentum_score"].iloc[:, 0], errors="coerce")
-            else:
-                base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce")
+                if c in base.columns: base.drop(columns=[c], inplace=True)
         else:
             base["momentum_score"] = 0.0
 
-        # Market cap y sector
+        # ------------------- NORMALIZACIONES CLAVE -------------------
+        # (1) deduplicar nombres
+        if hasattr(base, "columns"):
+            base = base.loc[:, ~base.columns.duplicated(keep="last")]
+
+        # (2) sector y market_cap “seguros”
+        if "sector" not in base.columns and "sector_vfq" in base.columns:
+            base["sector"] = base["sector_vfq"]
+        base["sector"] = base.get("sector", "Unknown").astype(str).fillna("Unknown")
+
         if "market_cap" not in base.columns:
             if "marketCap_unified" in base.columns:
                 base["market_cap"] = pd.to_numeric(base["marketCap_unified"], errors="coerce")
+            elif "marketCap" in base.columns:
+                base["market_cap"] = pd.to_numeric(base["marketCap"], errors="coerce")
             else:
-                base["market_cap"] = pd.to_numeric(base.get("marketCap"), errors="coerce")
-        if "sector" not in base.columns and "sector_vfq" in base.columns:
-            base["sector"] = base["sector_vfq"]
-
-        # ------------------- QVM growth-aware -------------------
-        if "market_cap" not in base.columns:
-            base["market_cap"] = pd.to_numeric(base.get("marketCap_unified", base.get("marketCap")), errors="coerce")
+                base["market_cap"] = np.nan
         else:
             base["market_cap"] = pd.to_numeric(base["market_cap"], errors="coerce")
+
+        # (3) momentum 1D numérico
+        base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce").fillna(0.0)
+
+        # (4) clonar fundamentals desde *_vfq si faltan sin sufijo
+        _need_cols = [
+            # value
+            "ev","ebitda_ntm","gross_profit_ttm","sales_ntm","capex_ttm","sbc_ttm",
+            "fcf_ttm","fcf_5y_median",
+            # quality/intangible
+            "rd_expense_ttm","operating_income_ttm","total_assets_ttm","ebitda_ttm",
+            "net_debt_ttm","noa_ttm","invested_capital_ttm","current_liabilities_ttm",
+            "tax_rate","op_margin_hist"
+        ]
+        for c in _need_cols:
+            c_v = f"{c}_vfq"
+            if c not in base.columns and c_v in base.columns:
+                base[c] = base[c_v]
+
+        # Re-dedup por si se clonó algo
+        base = base.loc[:, ~base.columns.duplicated(keep="last")]
+
+        # ------------------- QVM -------------------
         qvm_df = compute_qvm_scores(
             base.rename(columns={"marketCap": "market_cap"}),
             w_quality=0.40, w_value=0.25, w_momentum=0.35,
@@ -947,7 +956,7 @@ with tab5:
             mcap_col="market_cap"
         )
 
-        # Reglas megacaps (opcionales)
+        # Reglas megacap
         qvm_df = apply_megacap_rules(
             qvm_df,
             momentum_col="momentum_score",
@@ -956,38 +965,44 @@ with tab5:
         )
 
         # ------------------- BLEND con Breakout -------------------
-        def _z(s):
+        def _z(s: pd.Series) -> pd.Series:
             s = pd.to_numeric(s, errors="coerce")
-            mu = s.mean(skipna=True)
-            sd = s.std(skipna=True)
-            if sd and sd > 0:
-                return (s - mu) / sd
+            mu = s.mean(skipna=True); sd = s.std(skipna=True)
+            if sd and sd > 0: return (s - mu) / sd
             return pd.Series(0.0, index=s.index)
 
         if "BreakoutScore" in base.columns:
             b = pd.to_numeric(base["BreakoutScore"], errors="coerce").fillna(0.0)
+            # alinear por symbol por si el orden cambió
+            b = b.reindex(qvm_df.index) if b.index.equals(qvm_df.index) else b
             qvm_z = _z(qvm_df["qvm_score"])
             bo_z  = _z(b)
             final_alpha = 0.70*qvm_z + 0.30*bo_z
         else:
             final_alpha = qvm_df["qvm_score"].rank(pct=True, method="average")
 
-        qvm_df["final_alpha"] = final_alpha
-        pct = qvm_df["final_alpha"].rank(pct=True, method="average")
-        qvm_df["final_alpha_pct"] = pct
+        qvm_df["final_alpha"] = pd.to_numeric(final_alpha, errors="coerce")
+        qvm_df["final_alpha_pct"] = qvm_df["final_alpha"].rank(pct=True, method="average")
 
-        # Probabilidad logística a partir del percentil
+        # Probabilidad logística
         def _probability_from_percentile(pct_s: pd.Series, beta: float = 6.0) -> pd.Series:
             s = pd.to_numeric(pct_s, errors="coerce").fillna(0.5).clip(0, 1)
             return 1.0 / (1.0 + np.exp(-beta * (s - 0.5)))
-        qvm_df["prob_up"] = _probability_from_percentile(pct, beta=beta_prob)
+        qvm_df["prob_up"] = _probability_from_percentile(qvm_df["final_alpha_pct"], beta=beta_prob)
+
+        # ------------------- DIAGNÓSTICO RÁPIDO -------------------
+        good_val = pd.to_numeric(qvm_df.get("value_adj_neut", pd.Series(dtype=float)), errors="coerce").notna().sum()
+        good_qlt = pd.to_numeric(qvm_df.get("quality_adj_neut", pd.Series(dtype=float)), errors="coerce").notna().sum()
+        good_mom = pd.to_numeric(qvm_df.get("momentum_score", pd.Series(dtype=float)), errors="coerce").notna().sum()
+        st.caption(f"Coverage → value:{good_val} | quality:{good_qlt} | momentum:{good_mom}")
 
         # ------------------- VISUAL -------------------
         st.metric("Con QVM calculado", f"{len(qvm_df):,}")
         show_cols = [c for c in [
-            "symbol","sector","market_cap","qvm_score","final_alpha",
-            "value_adj_neut","quality_adj_neut","mega_exception_ok",
-            "final_alpha_pct","prob_up","quality_too_low","BreakoutScore","momentum_score"
+            "symbol","sector","market_cap",
+            "qvm_score","final_alpha","final_alpha_pct","prob_up",
+            "value_adj_neut","quality_adj_neut","mega_exception_ok","quality_too_low",
+            "BreakoutScore","momentum_score"
         ] if c in qvm_df.columns]
 
         st.dataframe(
