@@ -840,28 +840,42 @@ with tab4:
         st.dataframe(view_combo, use_container_width=True, hide_index=True)
 
 # ====== Paso 5: QVM (growth-aware) ======
-# ====== Paso 5: QVM (growth-aware) ======
 with tab5:
-    st.subheader("QVM (growth-aware)")
+    st.subheader("QVM (growth-aware) con Guardrails → Técnico → Ranking")
+
+    # --- parámetros UI (puedes moverlos a sidebar si quieres) ---
+    colA, colB, colC = st.columns(3)
+    with colA:
+        th_q_neut = st.slider("Min Quality neut.", 0.0, 1.0, 0.0, 0.05)   # >0 por defecto
+        th_v_neut = st.slider("Min Value neut.",   0.0, 1.0, 0.0, 0.05)
+        th_ndebt  = st.slider("Max NetDebt/EBITDA", 0.0, 8.0, 3.0, 0.5)
+    with colB:
+        th_acc_p  = st.slider("Accruals (NOA) percentil mínimo", 0, 100, 30, 5)  # no peor 30%
+        beta_prob = st.slider("β prob_up (logit)", 2.0, 12.0, 6.0, 0.5)
+        top_n_show = st.slider("Top N por prob_up", 5, 100, 30, 5)
+    with colC:
+        th_bo   = st.slider("Min BreakoutScore", 0, 100, 60, 1)
+        th_hits = st.slider("Min hits", 0, 5, 2, 1)
+        th_rvol = st.slider("Min RVOL20", 0.0, 5.0, 1.5, 0.1)
+
     try:
         sig_df = st.session_state.get("signals", pd.DataFrame())
         vfq_df = st.session_state.get("vfq", pd.DataFrame())
         uni_df = st.session_state.get("uni", pd.DataFrame())
         kept_df = st.session_state.get("kept", pd.DataFrame())
-        panel_prices = st.session_state.get("panel_prices")  # guardado en tab4
+        panel_prices = st.session_state.get("panel_prices")
 
         if sig_df.empty:
             st.info("Primero corre **Señales**.")
             st.stop()
 
-        # ------------------- BASE -------------------
+        # ------------------- BASE Y MOMENTUM -------------------
         base_cols = [c for c in ["symbol","sector","marketCap","marketCap_unified",
-                                 "BreakoutScore","ClosePos","P52","rs_ma20_slope"]
-                     if c in sig_df.columns]
-        base = (sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]]
-                .drop_duplicates("symbol")
-                .copy())
+                                 "BreakoutScore","ClosePos","P52","RVOL20","UDVol20",
+                                 "hits","rs_ma20_slope"] if c in sig_df.columns]
+        base = sig_df[["symbol"] + [c for c in base_cols if c != "symbol"]].drop_duplicates("symbol").copy()
 
+        # Merge fundamentals (vía VFQ/UNI/kept)
         if isinstance(vfq_df, pd.DataFrame) and not vfq_df.empty:
             base = base.merge(vfq_df, on="symbol", how="left", suffixes=("", "_vfq"))
         if isinstance(uni_df, pd.DataFrame) and {"symbol","sector","marketCap"}.issubset(uni_df.columns):
@@ -869,7 +883,7 @@ with tab5:
         if isinstance(kept_df, pd.DataFrame) and "symbol" in kept_df.columns:
             base = base.merge(kept_df.drop_duplicates("symbol")[["symbol"]], on="symbol", how="right")
 
-        # ------------------- MOMENTUM 1D -------------------
+        # Momentum proxy (fusiona signal+prices si hay)
         mom_sig = build_momentum_proxy(sig_df)
         if isinstance(mom_sig, pd.Series) and not mom_sig.empty:
             base = base.merge(mom_sig.to_frame("mom_sig"), left_on="symbol", right_index=True, how="left")
@@ -897,57 +911,37 @@ with tab5:
         if isinstance(mom_px, pd.Series) and not mom_px.empty:
             base = base.merge(mom_px.to_frame("mom_px"), left_on="symbol", right_index=True, how="left")
 
-        # Coalesce momentum -> una sola columna 1D
+        # Coalesce momentum a 1D
         cand_moms = [c for c in ["momentum_score","mom_sig","mom_px","momentum_score_prices"] if c in base.columns]
         if cand_moms:
             base["momentum_score"] = base[cand_moms].apply(pd.to_numeric, errors="coerce").mean(axis=1, skipna=True)
-            for c in ["mom_sig","mom_px","momentum_score_prices"]:
-                if c in base.columns: base.drop(columns=[c], inplace=True)
+            base.drop(columns=[c for c in ["mom_sig","mom_px","momentum_score_prices"] if c in base.columns], inplace=True)
         else:
             base["momentum_score"] = 0.0
 
-        # ------------------- NORMALIZACIONES CLAVE -------------------
-        # (1) deduplicar nombres
-        if hasattr(base, "columns"):
-            base = base.loc[:, ~base.columns.duplicated(keep="last")]
-
-        # (2) sector y market_cap “seguros”
+        # Normaliza columnas claves
+        base = base.loc[:, ~base.columns.duplicated(keep="last")]
+        base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce").fillna(0.0)
         if "sector" not in base.columns and "sector_vfq" in base.columns:
             base["sector"] = base["sector_vfq"]
         base["sector"] = base.get("sector", "Unknown").astype(str).fillna("Unknown")
+        base["market_cap"] = pd.to_numeric(
+            base.get("market_cap", base.get("marketCap_unified", base.get("marketCap"))), errors="coerce"
+        )
 
-        if "market_cap" not in base.columns:
-            if "marketCap_unified" in base.columns:
-                base["market_cap"] = pd.to_numeric(base["marketCap_unified"], errors="coerce")
-            elif "marketCap" in base.columns:
-                base["market_cap"] = pd.to_numeric(base["marketCap"], errors="coerce")
-            else:
-                base["market_cap"] = np.nan
-        else:
-            base["market_cap"] = pd.to_numeric(base["market_cap"], errors="coerce")
-
-        # (3) momentum 1D numérico
-        base["momentum_score"] = pd.to_numeric(base["momentum_score"], errors="coerce").fillna(0.0)
-
-        # (4) clonar fundamentals desde *_vfq si faltan sin sufijo
+        # Copia cols *_vfq a nombre limpio si faltan
         _need_cols = [
-            # value
             "ev","ebitda_ntm","gross_profit_ttm","sales_ntm","capex_ttm","sbc_ttm",
-            "fcf_ttm","fcf_5y_median",
-            # quality/intangible
-            "rd_expense_ttm","operating_income_ttm","total_assets_ttm","ebitda_ttm",
-            "net_debt_ttm","noa_ttm","invested_capital_ttm","current_liabilities_ttm",
+            "fcf_ttm","fcf_5y_median","rd_expense_ttm","operating_income_ttm","total_assets_ttm",
+            "ebitda_ttm","net_debt_ttm","noa_ttm","invested_capital_ttm","current_liabilities_ttm",
             "tax_rate","op_margin_hist"
         ]
         for c in _need_cols:
-            c_v = f"{c}_vfq"
-            if c not in base.columns and c_v in base.columns:
-                base[c] = base[c_v]
+            cv = f"{c}_vfq"
+            if c not in base.columns and cv in base.columns:
+                base[c] = base[cv]
 
-        # Re-dedup por si se clonó algo
-        base = base.loc[:, ~base.columns.duplicated(keep="last")]
-
-        # ------------------- QVM -------------------
+        # ------------------- QVM: value/quality neutralizado -------------------
         qvm_df = compute_qvm_scores(
             base.rename(columns={"marketCap": "market_cap"}),
             w_quality=0.40, w_value=0.25, w_momentum=0.35,
@@ -955,8 +949,6 @@ with tab5:
             sector_col="sector",
             mcap_col="market_cap"
         )
-
-        # Reglas megacap
         qvm_df = apply_megacap_rules(
             qvm_df,
             momentum_col="momentum_score",
@@ -964,59 +956,97 @@ with tab5:
             value_col="value_adj_neut"
         )
 
-        # ------------------- BLEND con Breakout -------------------
-        def _z(s: pd.Series) -> pd.Series:
-            s = pd.to_numeric(s, errors="coerce")
-            mu = s.mean(skipna=True); sd = s.std(skipna=True)
-            if sd and sd > 0: return (s - mu) / sd
-            return pd.Series(0.0, index=s.index)
+        # Percentiles auxiliares y métricas de riesgo
+        def pct(s): return pd.to_numeric(s, errors="coerce").rank(pct=True, method="average")
+        qvm_df["q_pct"] = qvm_df.groupby("sector")["quality_adj_neut"].transform(pct).fillna(0.5)
+        qvm_df["v_pct"] = qvm_df.groupby("sector")["value_adj_neut"].transform(pct).fillna(0.5)
+        qvm_df["vfq_pct"] = 0.6*qvm_df["q_pct"] + 0.4*qvm_df["v_pct"]
 
-        if "BreakoutScore" in base.columns:
-            b = pd.to_numeric(base["BreakoutScore"], errors="coerce").fillna(0.0)
-            # alinear por symbol por si el orden cambió
-            b = b.reindex(qvm_df.index) if b.index.equals(qvm_df.index) else b
+        net_debt = pd.to_numeric(qvm_df.get("net_debt_ttm"), errors="coerce")
+        ebitda_ttm = pd.to_numeric(qvm_df.get("ebitda_ttm", qvm_df.get("ebitda_ntm")), errors="coerce").abs()
+        qvm_df["ndebt_ebitda"] = (net_debt / (ebitda_ttm + 1e-9)).replace([np.inf, -np.inf], np.nan)
+
+        noa = pd.to_numeric(qvm_df.get("noa_ttm"), errors="coerce")
+        qvm_df["acc_pct"] = noa.rank(pct=True)  # mayor NOA ~ peores accruals ⇒ exigimos percentil >= th_acc_p/100 ser “no tan malo”
+        # Si no hay NOA, no bloqueamos
+        if noa.isna().all():
+            qvm_df["acc_pct"] = 1.0
+
+        # ------------------- 1) GUARDRails fundamentales -------------------
+        gr = pd.Series(True, index=qvm_df.index, name="pass_guardrails")
+        gr &= qvm_df["quality_adj_neut"] > th_q_neut
+        gr &= qvm_df["value_adj_neut"]   > th_v_neut
+        # deuda/ebitda solo si disponible
+        mask_nd = qvm_df["ndebt_ebitda"].isna() | (qvm_df["ndebt_ebitda"] <= th_ndebt)
+        gr &= mask_nd
+        gr &= qvm_df["acc_pct"] >= (th_acc_p/100.0)
+
+        qvm_df["pass_guardrails"] = gr
+
+        # Tabla de rechazados con razones
+        rej = qvm_df.loc[~gr, ["symbol","sector","market_cap","quality_adj_neut","value_adj_neut",
+                               "ndebt_ebitda","acc_pct","BreakoutScore"]].copy()
+        st.caption("🚧 Rechazados por guardrails")
+        st.dataframe(rej.sort_values(["quality_adj_neut","value_adj_neut"], ascending=True),
+                     use_container_width=True, hide_index=True)
+
+        # ------------------- 2) FILTRO TÉCNICO sobre los que pasan -------------------
+        tech_ok = pd.Series(True, index=qvm_df.index, name="pass_tech")
+        tech_ok &= (pd.to_numeric(qvm_df.get("BreakoutScore"), errors="coerce") >= th_bo)
+        tech_ok &= (pd.to_numeric(qvm_df.get("hits"), errors="coerce").fillna(0) >= th_hits)
+        tech_ok &= (pd.to_numeric(qvm_df.get("RVOL20"), errors="coerce").fillna(0) >= th_rvol)
+
+        qvm_df["pass_tech"] = tech_ok
+        eligibles_pre_tech = qvm_df.loc[gr, ["symbol","sector","market_cap","value_adj_neut","quality_adj_neut",
+                                             "qvm_score","ndebt_ebitda","acc_pct","vfq_pct"]].copy()
+
+        st.caption("✅ Elegibles por guardrails (antes del técnico)")
+        st.dataframe(eligibles_pre_tech.sort_values(["quality_adj_neut","value_adj_neut","qvm_score"], ascending=False),
+                     use_container_width=True, hide_index=True)
+
+        # ------------------- 3) RANKING FINAL -------------------
+        def _z(s):
+            s = pd.to_numeric(s, errors="coerce")
+            mu, sd = s.mean(skipna=True), s.std(skipna=True)
+            return (s - mu) / (sd if (sd and sd > 0) else 1.0)
+
+        if "BreakoutScore" in qvm_df.columns:
             qvm_z = _z(qvm_df["qvm_score"])
-            bo_z  = _z(b)
+            bo_z  = _z(qvm_df["BreakoutScore"])
             final_alpha = 0.70*qvm_z + 0.30*bo_z
         else:
             final_alpha = qvm_df["qvm_score"].rank(pct=True, method="average")
 
-        qvm_df["final_alpha"] = pd.to_numeric(final_alpha, errors="coerce")
-        qvm_df["final_alpha_pct"] = qvm_df["final_alpha"].rank(pct=True, method="average")
+        qvm_df["final_alpha"] = final_alpha
+        qvm_df["final_alpha_pct"] = final_alpha.rank(pct=True, method="average")
 
-        # Probabilidad logística
-        def _probability_from_percentile(pct_s: pd.Series, beta: float = 6.0) -> pd.Series:
-            s = pd.to_numeric(pct_s, errors="coerce").fillna(0.5).clip(0, 1)
-            return 1.0 / (1.0 + np.exp(-beta * (s - 0.5)))
-        qvm_df["prob_up"] = _probability_from_percentile(qvm_df["final_alpha_pct"], beta=beta_prob)
+        pct = qvm_df["final_alpha_pct"].clip(0,1).fillna(0.5)
+        qvm_df["prob_up"] = 1.0 / (1.0 + np.exp(-beta_prob * (pct - 0.5)))
 
-        # ------------------- DIAGNÓSTICO RÁPIDO -------------------
-        good_val = pd.to_numeric(qvm_df.get("value_adj_neut", pd.Series(dtype=float)), errors="coerce").notna().sum()
-        good_qlt = pd.to_numeric(qvm_df.get("quality_adj_neut", pd.Series(dtype=float)), errors="coerce").notna().sum()
-        good_mom = pd.to_numeric(qvm_df.get("momentum_score", pd.Series(dtype=float)), errors="coerce").notna().sum()
-        st.caption(f"Coverage → value:{good_val} | quality:{good_qlt} | momentum:{good_mom}")
-
-        # ------------------- VISUAL -------------------
-        st.metric("Con QVM calculado", f"{len(qvm_df):,}")
-        show_cols = [c for c in [
-            "symbol","sector","market_cap",
-            "qvm_score","final_alpha","final_alpha_pct","prob_up",
-            "value_adj_neut","quality_adj_neut","mega_exception_ok","quality_too_low",
-            "BreakoutScore","momentum_score"
+        # Resultado final: pasan guardrails + técnico
+        final_mask = qvm_df["pass_guardrails"] & qvm_df["pass_tech"]
+        final_cols = [c for c in [
+            "symbol","sector","market_cap","qvm_score","final_alpha","final_alpha_pct","prob_up",
+            "value_adj_neut","quality_adj_neut","vfq_pct","momentum_score",
+            "BreakoutScore","hits","RVOL20","ClosePos","P52",
+            "ndebt_ebitda","acc_pct","mega_exception_ok","quality_too_low"
         ] if c in qvm_df.columns]
 
+        st.metric("Seleccionadas (guardrails + técnico)", int(final_mask.sum()))
         st.dataframe(
-            qvm_df[show_cols].sort_values(["final_alpha","qvm_score"], ascending=False).head(300),
+            qvm_df.loc[final_mask, final_cols].sort_values(
+                ["prob_up","final_alpha","qvm_score"], ascending=False
+            ),
             use_container_width=True, hide_index=True
         )
 
-        if "prob_up" in qvm_df.columns:
-            st.subheader(f"Top {top_n_show} por probabilidad de alza")
-            top_cols = [c for c in show_cols if c in qvm_df.columns]
-            st.dataframe(
-                qvm_df.sort_values(["prob_up","final_alpha"], ascending=False).head(top_n_show)[top_cols],
-                use_container_width=True, hide_index=True
-            )
+        # Tabla “técnico” rápida por hits + BreakoutScore (como pediste)
+        st.subheader("Orden técnico (hits y BreakoutScore)")
+        tech_table = qvm_df.loc[gr, ["symbol","hits","BreakoutScore","RVOL20","ClosePos","P52"]].copy()
+        st.dataframe(
+            tech_table.sort_values(["hits","BreakoutScore","RVOL20"], ascending=False),
+            use_container_width=True, hide_index=True
+        )
 
         st.session_state["qvm"] = qvm_df
 
