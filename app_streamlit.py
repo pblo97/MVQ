@@ -561,9 +561,10 @@ with tab3:
             ascending = st.toggle("Ascendente", value=False)
 
         # ===== Vista =====
+        # ===== Vista =====
         view = _ensure_sector_strings(view_df.copy())
 
-        # filtro por texto
+        # --- filtro por texto
         if search.strip():
             s = search.strip().lower()
             masks = []
@@ -576,37 +577,55 @@ with tab3:
                     m = m | mm
                 view = view[m]
 
-        # market cap friendly
+        # --- Market cap amigable (crear 'market_cap' si hay alguna base)
         if "marketCap_unified" in view.columns:
             view["market_cap"] = pd.to_numeric(view["marketCap_unified"], errors="coerce").apply(_fmt_mcap)
         elif "marketCap" in view.columns:
             view["market_cap"] = pd.to_numeric(view["marketCap"], errors="coerce").apply(_fmt_mcap)
+        # si no hay ninguna, no se crea y no se pide mostrar
 
-        # percentil 0..100
+        # --- Asegurar percentil visible (crear 'VFQ pct (sector)' si es posible)
         if "VFQ_pct_sector" in view.columns:
             pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce")
-            pct = np.where(pct > 1.5, pct / 100.0, pct)
+            pct = np.where(pct > 1.5, pct / 100.0, pct)  # por si vino en 0..100
             pct = pd.Series(pct, index=view.index).clip(0.0, 1.0)
             view["VFQ pct (sector)"] = (pct * 100).round(2).clip(0, 100)
+        else:
+            # si no existe el campo, intenta derivarlo desde el score
+            _sc = None
+            if "VFQ" in view.columns: _sc = "VFQ"
+            elif "VFQ_score" in view.columns: _sc = "VFQ_score"
+            if _sc is not None:
+                tmp = _ensure_sector_strings(view.copy())
+                if "sector" in tmp.columns and tmp["sector"].nunique(dropna=False) > 1:
+                    pct = tmp.groupby("sector")[_sc].rank(pct=True, method="average")
+                else:
+                    pct = tmp[_sc].rank(pct=True, method="average")
+                pct = pd.to_numeric(pct, errors="coerce").clip(0.0, 1.0)
+                view["VFQ pct (sector)"] = (pct * 100).round(2)
 
-        # redondeos ligeros
+        # --- redondeos ligeros (si existen)
         for col in ["VFQ", "VFQ_score", "value_adj_neut", "quality_adj_neut",
                     "BreakoutScore", "momentum_score", "beta", "price"]:
             if col in view.columns:
                 view[col] = pd.to_numeric(view[col], errors="coerce").round(3)
 
-        # columnas visibles
-        pretty_cols = [
-            c for c in [
-                "symbol", "sector", "industry", "market_cap", "price", "beta",
-                "VFQ", "VFQ_score", "VFQ pct (sector)", "value_adj_neut", "quality_adj_neut",
-                "BreakoutScore", "momentum_score"
-            ] if c in view.columns
+        # --- columnas visibles (solo las que EXISTEN)
+        pretty_cols_base = [
+            "symbol", "sector", "industry", "market_cap", "price", "beta",
+            "VFQ", "VFQ_score", "VFQ pct (sector)", "value_adj_neut",
+            "quality_adj_neut", "BreakoutScore", "momentum_score"
         ]
+        pretty_cols = [c for c in pretty_cols_base if c in view.columns]
 
-        # orden elegido (tabla)
+        # --- orden elegido
         if sort_by and sort_by in view.columns:
             view = view.sort_values(sort_by, ascending=ascending, na_position="last")
+
+        # --- si por alguna razón no quedó ninguna columna bonita, muestra algo
+        if not pretty_cols:
+            pretty_cols = [c for c in ["symbol", "sector", "industry"] if c in view.columns] or view.columns.tolist()
+
 
         # ===== Fallback cuando no pasa nadie =====
         if df_vfq_sel.empty:
