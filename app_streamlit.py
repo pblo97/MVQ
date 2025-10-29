@@ -356,6 +356,7 @@ def _numcol(df: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series([float("nan")] * len(df), index=df.index)
     return pd.to_numeric(df[col], errors="coerce")
 
+# ====== Paso 3: VFQ (PARCHE COMPLETO) ======
 with tab3:
     st.subheader("VFQ")
     try:
@@ -392,6 +393,7 @@ with tab3:
                 # Base para VFQ (mantén right para no perder fundamentales descargados)
                 base_for_vfq = uni_enriched.merge(df_fund, on="symbol", how="right")
                 base_for_vfq = _ensure_sector_strings(base_for_vfq)
+
                 # ===== Cálculo VFQ =====
                 df_vfq = build_vfq_scores_dynamic(
                     base_for_vfq,
@@ -404,74 +406,8 @@ with tab3:
                     size_buckets=vfq_cfg["size_buckets"],
                     group_mode=vfq_cfg["group_mode"],
                 )
-                # ====== DIAGNÓSTICO DE FILTROS ======
-                st.toggle("🔍 Mostrar diagnóstico VFQ", value=True, key="show_vfq_diag")
 
-                diag = pd.DataFrame(index=df_vfq.index)
-                diag["symbol"] = df_vfq["symbol"].astype(str)
-
-                # sanity
-                rev = _numcol(df_vfq, "revenue_ttm")
-                gp  = _numcol(df_vfq, "gross_profit_ttm")
-                yoy = _numcol(df_vfq, "revenue_yoy")
-                mask_rev_ok = (rev > 0) | (gp > 0)
-                mask_yoy_ok = (yoy.isna()) | (yoy > -0.05)
-                mask_sane   = mask_rev_ok & mask_yoy_ok
-
-                # coverage
-                if "coverage_count" in df_vfq.columns:
-                    cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0)
-                    mask_cov = cov >= int(st.session_state.get("min_cov", 0))
-                else:
-                    cov = pd.Series(0, index=df_vfq.index)
-                    mask_cov = pd.Series(True, index=df_vfq.index)
-
-                # percentil intra-sector (recalcula si hace falta)
-                if "VFQ_pct_sector" not in df_vfq.columns:
-                    score_col = "VFQ" if "VFQ" in df_vfq.columns else ("VFQ_score" if "VFQ_score" in df_vfq.columns else None)
-                    if score_col is not None:
-                        tmp = _ensure_sector_strings(df_vfq.copy())
-                        if tmp["sector"].nunique() <= 1:
-                            # fallback global si todos quedaron en el mismo sector
-                            df_vfq["VFQ_pct_sector"] = tmp[score_col].rank(pct=True, method="average").astype(float)
-                        else:
-                            df_vfq["VFQ_pct_sector"] = (
-                                tmp.groupby(tmp["sector"])[score_col].rank(pct=True, method="average").astype(float)
-                            )
-                    else:
-                        df_vfq["VFQ_pct_sector"] = 1.0
-
-                pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce")
-                pct = np.where(pct > 1.5, pct/100.0, pct)  # normaliza 0..100 -> 0..1
-                pct = pd.Series(pct, index=df_vfq.index).clip(0.0, 1.0)
-
-                min_pct = float(st.session_state.get("min_pct", 0.0))
-                mask_pct = pct.fillna(1.0) >= min_pct
-
-                # resumen
-                diag["rev_ok"]  = mask_rev_ok
-                diag["yoy_ok"]  = mask_yoy_ok
-                diag["sane"]    = mask_sane
-                diag["cov_cnt"] = cov
-                diag["cov_ok"]  = mask_cov
-                diag["pct"]     = (pct * 100).round(2)
-                diag["pct_ok"]  = mask_pct
-
-                if st.session_state.get("show_vfq_diag", False):
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total", len(diag))
-                    c2.metric("Sanidad OK", int(mask_sane.sum()))
-                    c3.metric(f"Cov ≥ {int(st.session_state.get('min_cov',0))}", int(mask_cov.sum()))
-                    c4.metric(f"Pct ≥ {min_pct:.2f}", int(mask_pct.sum()))
-                    st.dataframe(diag.sort_values(["sane","cov_ok","pct_ok","pct"], ascending=[True, True, True, False]).head(100),
-                                use_container_width=True, hide_index=True)
-
-                # aplica las máscaras reales
-                df_vfq["VFQ_pct_sector"] = pct  # asegura 0..1 en el DF principal
-                df_vfq_sel = df_vfq.loc[mask_cov & mask_pct & mask_sane].copy()
-
-
-                # Asegura sector/industry intactos y tipados a str seguros
+                # Asegura sector/industry intactos + strings seguros
                 keep_cols = ["symbol", "sector"]
                 if "industry" in uni_enriched.columns:
                     keep_cols.append("industry")
@@ -482,44 +418,47 @@ with tab3:
                 )
                 df_vfq = _ensure_sector_strings(df_vfq)
 
-                # ===== Percentil intra-sector (0..1) =====
+                # ===== VFQ_pct_sector (una sola vez, con fallback GLOBAL si todos son mismo sector) =====
                 score_col = "VFQ" if "VFQ" in df_vfq.columns else ("VFQ_score" if "VFQ_score" in df_vfq.columns else None)
                 if score_col is not None:
-                    df_vfq["VFQ_pct_sector"] = (
-                        df_vfq.groupby(df_vfq["sector"])[score_col]
-                              .rank(pct=True, method="average")
-                              .astype(float)
-                              .clip(0.0, 1.0)
-                    )
+                    tmp = _ensure_sector_strings(df_vfq.copy())
+                    if tmp["sector"].nunique(dropna=False) <= 1:
+                        pct = tmp[score_col].rank(pct=True, method="average").astype(float)  # global
+                    else:
+                        pct = (
+                            tmp.groupby(tmp["sector"])[score_col]
+                               .rank(pct=True, method="average").astype(float)
+                        )
                 else:
-                    df_vfq["VFQ_pct_sector"] = 1.0
+                    pct = pd.Series(1.0, index=df_vfq.index, dtype=float)
 
-                # ===== Filtro sanitario =====
-                strict_filters = True
-                if strict_filters:
-                    rev = _numcol(df_vfq, "revenue_ttm")
-                    gp  = _numcol(df_vfq, "gross_profit_ttm")
-                    yoy = _numcol(df_vfq, "revenue_yoy")
-                    mask_rev_ok = (rev > 0) | (gp > 0)
-                    mask_yoy_ok = (yoy.isna()) | (yoy > -0.05)
-                    mask_sane   = mask_rev_ok & mask_yoy_ok
-                else:
-                    mask_sane = pd.Series(True, index=df_vfq.index)
+                # normaliza a 0..1 si viniera 0..100
+                pct = pd.to_numeric(pct, errors="coerce")
+                pct = np.where(pct > 1.5, pct/100.0, pct)
+                df_vfq["VFQ_pct_sector"] = pd.Series(pct, index=df_vfq.index).clip(0.0, 1.0)
 
-                # ===== Filtros cobertura/percentil (usa valores actuales de la sidebar si los pusiste en session) =====
-                min_cov = int(st.session_state.get("min_cov", 0)) if "min_cov" in st.session_state else 0
-                min_pct = float(st.session_state.get("min_pct", 0.0)) if "min_pct" in st.session_state else 0.0
+                # ===== Filtro sanitario robusto =====
+                rev = _numcol(df_vfq, "revenue_ttm")
+                gp  = _numcol(df_vfq, "gross_profit_ttm")
+                yoy = _numcol(df_vfq, "revenue_yoy")
+                mask_rev_ok = (rev > 0) | (gp > 0)
+                mask_yoy_ok = (yoy.isna()) | (yoy > -0.05)
+                mask_sane   = mask_rev_ok & mask_yoy_ok
+
+                # ===== Filtros cobertura/percentil (desde session_state) =====
+                min_cov_val = int(st.session_state.get("min_cov", 0))
+                min_pct_val = float(st.session_state.get("min_pct", 0.0))
 
                 if "coverage_count" in df_vfq.columns:
-                    mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= min_cov
+                    mask_cov = pd.to_numeric(df_vfq["coverage_count"], errors="coerce").fillna(0) >= min_cov_val
                 else:
                     mask_cov = pd.Series(True, index=df_vfq.index)
 
-                mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= min_pct
+                mask_pct = pd.to_numeric(df_vfq["VFQ_pct_sector"], errors="coerce").fillna(1.0) >= min_pct_val
 
                 df_vfq_sel = df_vfq.loc[mask_cov & mask_pct & mask_sane].copy()
 
-                # Guarda para otros tabs
+                # Guarda en sesión
                 st.session_state["vfq"]     = df_vfq
                 st.session_state["vfq_sel"] = df_vfq_sel
 
@@ -549,8 +488,7 @@ with tab3:
             st.metric("Seleccionados (filtros)", f"{len(df_vfq_sel):,}")
 
         with right:
-            sec = df_vfq_sel.copy()
-            sec = _ensure_sector_strings(sec)
+            sec = _ensure_sector_strings(df_vfq_sel.copy())
             sector_counts = (
                 sec.groupby("sector", dropna=False)
                    .size().reset_index(name="count")
@@ -582,8 +520,8 @@ with tab3:
         with f3:
             ascending = st.toggle("Ascendente", value=False)
 
-        view = view_df.copy()
-        view = _ensure_sector_strings(view)
+        # ===== Vista =====
+        view = _ensure_sector_strings(view_df.copy())
 
         # Filtro por texto
         if search.strip():
@@ -604,10 +542,10 @@ with tab3:
         elif "marketCap" in view.columns:
             view["market_cap"] = pd.to_numeric(view["marketCap"], errors="coerce").apply(_fmt_mcap)
 
-        # Normaliza percentil si viene 0..100 y crea la barra 0..100
+        # Barra 0..100 del percentil
         if "VFQ_pct_sector" in view.columns:
             pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce")
-            pct = np.where(pct > 1.5, pct / 100.0, pct)  # si llega como 0..100 -> 0..1
+            pct = np.where(pct > 1.5, pct / 100.0, pct)  # si llega 0..100 -> 0..1
             pct = pd.Series(pct, index=view.index).clip(0.0, 1.0)
             view["VFQ pct (sector)"] = (pct * 100).round(2).clip(0, 100)
 
@@ -616,7 +554,7 @@ with tab3:
             if col in view.columns:
                 view[col] = pd.to_numeric(view[col], errors="coerce").round(3)
 
-        # Columnas bonitas
+        # Columnas visibles
         pretty_cols = [
             c for c in [
                 "symbol", "sector", "industry", "market_cap", "price", "beta",
@@ -625,9 +563,22 @@ with tab3:
             ] if c in view.columns
         ]
 
-        # Orden elegido por el usuario
+        # Orden elegido
         if sort_by and sort_by in view.columns:
             view = view.sort_values(sort_by, ascending=ascending, na_position="last")
+
+        # Si ningún símbolo pasó, mostrar top por VFQ para depurar (y ACTUALIZAR view)
+        if df_vfq_sel.empty:
+            st.warning("Ningún símbolo pasó los filtros. Te muestro el Top por VFQ para depurar.")
+            tmp = df_vfq.loc[mask_sane, :].copy() if (~mask_sane).any() else df_vfq.copy()
+            scol = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
+            view_df = tmp.sort_values(scol, ascending=False) if scol else tmp.copy()
+            view = _ensure_sector_strings(view_df.copy())
+            # reconstruye columnas bonitas si faltaran
+            if "VFQ_pct_sector" in view.columns and "VFQ pct (sector)" not in view.columns:
+                pct = pd.to_numeric(view["VFQ_pct_sector"], errors="coerce").clip(0.0, 1.0)
+                view["VFQ pct (sector)"] = (pct * 100).round(2)
+            pretty_cols = [c for c in pretty_cols if c in view.columns]
 
         # Config columnas
         cfg = {}
@@ -651,13 +602,6 @@ with tab3:
             cfg["BreakoutScore"] = st.column_config.NumberColumn("Breakout", format="%.3f")
         if "momentum_score" in pretty_cols:
             cfg["momentum_score"] = st.column_config.NumberColumn("Momentum", format="%.3f")
-
-        if df_vfq_sel.empty:
-            st.warning("Ningún símbolo pasó los filtros. Te muestro el Top por VFQ para depurar.")
-            # relaja progresivamente para inspección
-            tmp = df_vfq.loc[mask_sane, :].copy() if (~mask_sane).any() else df_vfq.copy()
-            sort_col = "VFQ" if "VFQ" in tmp.columns else ("VFQ_score" if "VFQ_score" in tmp.columns else None)
-            view_df = tmp.sort_values(sort_col, ascending=False) if sort_col else tmp.copy()
 
         st.dataframe(
             view[pretty_cols].reset_index(drop=True),
@@ -692,7 +636,6 @@ with tab3:
 
     except Exception as e:
         st.error(f"Error en VFQ: {e}")
-
 
 # ====== Paso 4: SEÑALES (placeholder si tu lógica está en otro módulo) ======
 with tab4:
