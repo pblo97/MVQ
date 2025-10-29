@@ -173,7 +173,8 @@ def quality_intangible_aware(df: pd.DataFrame) -> pd.Series:
     accruals = _winsorize(_col(out, "noa_ttm").fillna(_col(out, "noa_ttm").median()), 0.01)
     accruals_score = -_zscore(accruals)
 
-    netcash_ebitda = _winsorize(-_safe_div(net_debt, ebitda.abs() + 1e-9), 0.01)
+    ebitda_series = _to_float(ebitda)           # fuerza Serie
+    netcash_ebitda = _winsorize(-_safe_div(net_debt, ebitda_series.abs() + 1e-9), 0.01)
 
     return (0.35*_zscore(gp_assets) + 0.35*_zscore(roic_xrd) +
             0.10*stab + 0.10*_zscore(netcash_ebitda) + 0.10*accruals_score).fillna(0.0).reindex(out.index)

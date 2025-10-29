@@ -949,6 +949,32 @@ with tab5:
             sector_col="sector",
             mcap_col="market_cap"
         )
+        def _series(df: pd.DataFrame, col: str, fallback: str | None = None) -> pd.Series:
+            val = df.get(col, None)
+            if isinstance(val, pd.Series):
+                return pd.to_numeric(val, errors="coerce").reindex(df.index)
+            if fallback is not None:
+                val2 = df.get(fallback, None)
+                if isinstance(val2, pd.Series):
+                    return pd.to_numeric(val2, errors="coerce").reindex(df.index)
+            return pd.Series(np.nan, index=df.index)
+
+        def _pct(s: pd.Series) -> pd.Series:
+            s = pd.to_numeric(s, errors="coerce")
+            return s.rank(pct=True, method="average")
+
+        qvm_df["q_pct"] = qvm_df.groupby("sector")["quality_adj_neut"].transform(_pct).fillna(0.5)
+        qvm_df["v_pct"] = qvm_df.groupby("sector")["value_adj_neut"].transform(_pct).fillna(0.5)
+        qvm_df["vfq_pct"] = 0.6*qvm_df["q_pct"] + 0.4*qvm_df["v_pct"]
+
+        net_debt   = _series(qvm_df, "net_debt_ttm")
+        ebitda_tt  = _series(qvm_df, "ebitda_ttm", fallback="ebitda_ntm")
+        ebitda_abs = ebitda_tt.abs()
+        qvm_df["ndebt_ebitda"] = (net_debt / (ebitda_abs + 1e-9)).replace([np.inf, -np.inf], np.nan)
+
+        noa = _series(qvm_df, "noa_ttm")
+        qvm_df["acc_pct"] = 1.0 if noa.isna().all() else noa.rank(pct=True)
+        
         qvm_df = apply_megacap_rules(
             qvm_df,
             momentum_col="momentum_score",
