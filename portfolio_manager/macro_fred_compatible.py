@@ -519,6 +519,39 @@ def fetch_fred_data_macroarimax(
 
     try:
         fred = Fred(api_key=fred_api_key)
+
+        # Test API key with a simple call
+        try:
+            test_series = fred.get_series('DFF', observation_start='2024-01-01', observation_end='2024-01-02')
+            if test_series is None or test_series.empty:
+                msg = "❌ FRED API key test failed - key may not be activated or invalid"
+                messages.append(msg)
+                messages.append("💡 Verify your API key at: https://fred.stlouisfed.org/docs/api/api_key.html")
+                messages.append("💡 Make sure the key is ACTIVATED (check your email for confirmation)")
+                if verbose:
+                    print(msg)
+                return pd.DataFrame(), messages
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'mismatched tag' in error_str or 'xml' in error_str or 'html' in error_str:
+                msg = "❌ FRED API returned HTML error (invalid/inactive API key)"
+                messages.append(msg)
+                messages.append("💡 Common causes:")
+                messages.append("   1. API key not yet activated (check email for confirmation link)")
+                messages.append("   2. API key is invalid or expired")
+                messages.append("   3. API key copy-pasted with extra spaces")
+                messages.append("💡 Solution: Get new API key at https://fred.stlouisfed.org/docs/api/api_key.html")
+                if verbose:
+                    for m in messages:
+                        print(m)
+                return pd.DataFrame(), messages
+            else:
+                msg = f"❌ FRED API test failed: {e}"
+                messages.append(msg)
+                if verbose:
+                    print(msg)
+                return pd.DataFrame(), messages
+
     except Exception as e:
         msg = f"❌ Error initializing FRED API: {e}"
         messages.append(msg)

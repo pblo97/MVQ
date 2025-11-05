@@ -494,9 +494,128 @@ with tab3:
     except Exception as e:
         st.warning(f"Could not compute correlation: {e}")
 
-    # Risk decomposition (placeholder)
-    st.markdown("### Risk Decomposition")
-    st.info("**Coming soon:** Marginal CVaR contributions, VaR backtest, stress scenarios")
+    # CVaR Analysis
+    st.markdown("---")
+    st.markdown("### CVaR & VaR Analysis")
+
+    try:
+        from portfolio_manager.risk.cvar_analysis import (
+            calculate_risk_metrics_summary,
+            calculate_percentage_cvar_contribution,
+            stress_test_scenarios
+        )
+
+        # Get returns data
+        price_panel = load_prices_panel(symbols, start_date.isoformat(), end_date.isoformat(), cache_key="e2e_risk_cvar")
+        returns_df = pd.DataFrame({
+            sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+            for sym in symbols if sym in price_panel
+        }).dropna(how='all')
+
+        if not returns_df.empty and portfolio_df is not None:
+            # Get weights
+            weights_dict = portfolio_df.set_index('symbol')['weight'].to_dict()
+            weights = np.array([weights_dict.get(sym, 0.0) for sym in returns_df.columns])
+
+            # Normalize weights
+            if weights.sum() > 0:
+                weights = weights / weights.sum()
+
+                # 1. Risk Metrics Summary
+                st.markdown("#### VaR & CVaR (Historical vs Parametric)")
+                risk_summary = calculate_risk_metrics_summary(
+                    returns_df=returns_df,
+                    weights=weights,
+                    confidence_levels=[0.95, 0.99]
+                )
+                st.dataframe(risk_summary.style.format({
+                    'VaR_historical': '{:.2f}%',
+                    'CVaR_historical': '{:.2f}%',
+                    'VaR_parametric': '{:.2f}%',
+                    'CVaR_parametric': '{:.2f}%'
+                }), use_container_width=True)
+
+                st.caption("""
+                **VaR (Value at Risk):** Maximum expected loss at confidence level (e.g., 95% = worst loss in 95% of cases)
+                **CVaR (Conditional VaR):** Expected loss given that loss exceeds VaR (tail risk)
+                """)
+
+                # 2. Marginal CVaR Contributions
+                st.markdown("---")
+                st.markdown("#### Marginal CVaR Contributions (Risk Attribution)")
+
+                pct_cvar_contrib = calculate_percentage_cvar_contribution(
+                    returns_df=returns_df,
+                    weights=weights,
+                    confidence_level=0.95,
+                    method='historical'
+                )
+
+                contrib_df = pd.DataFrame({
+                    'Symbol': pct_cvar_contrib.index,
+                    'Weight (%)': [weights_dict.get(sym, 0.0) * 100 for sym in pct_cvar_contrib.index],
+                    'CVaR Contribution (%)': pct_cvar_contrib.values
+                }).sort_values('CVaR Contribution (%)', ascending=False)
+
+                st.dataframe(contrib_df.style.format({
+                    'Weight (%)': '{:.2f}%',
+                    'CVaR Contribution (%)': '{:.2f}%'
+                }), use_container_width=True)
+
+                # Chart
+                if HAVE_PLOTLY:
+                    fig_cvar = px.bar(
+                        contrib_df,
+                        x='Symbol',
+                        y='CVaR Contribution (%)',
+                        title="CVaR Contribution by Asset (95% confidence)",
+                        color='CVaR Contribution (%)',
+                        color_continuous_scale='Reds'
+                    )
+                    st.plotly_chart(fig_cvar, use_container_width=True)
+
+                st.caption("""
+                **Marginal CVaR:** How much each asset contributes to portfolio tail risk.
+                - High contribution = asset drives tail losses
+                - Should sum to 100% (Euler decomposition property)
+                """)
+
+                # 3. Stress Testing
+                st.markdown("---")
+                st.markdown("#### Stress Testing Scenarios")
+
+                stress_results = stress_test_scenarios(
+                    returns_df=returns_df,
+                    weights=weights,
+                    scenarios=None  # Use default scenarios
+                )
+
+                st.dataframe(stress_results.style.format({
+                    'portfolio_loss_pct': '{:.2f}%',
+                    **{col: '{:.2f}%' for col in stress_results.columns if col.endswith('_shock')}
+                }), use_container_width=True)
+
+                # Worst scenario
+                worst_scenario = stress_results.loc[stress_results['portfolio_loss_pct'].idxmin()]
+                st.warning(f"**Worst Scenario:** {worst_scenario['scenario']} → **{worst_scenario['portfolio_loss_pct']:.2f}%** portfolio loss")
+
+                st.caption("""
+                **Stress Scenarios (Historical Events):**
+                - **2008 Financial Crisis:** October 2008 market crash
+                - **2020 COVID Crash:** March 2020 pandemic selloff
+                - **2022 Rate Hike:** Fed tightening impact
+                - **3-sigma / 5-sigma:** Statistical tail events
+                - **Correlation One:** All assets down simultaneously
+                """)
+
+            else:
+                st.warning("Portfolio has zero total weight - cannot calculate CVaR")
+        else:
+            st.warning("Insufficient returns data for CVaR analysis")
+
+    except Exception as e:
+        st.error(f"Error calculating CVaR: {e}")
+        st.exception(e)
 
 # ==================== TAB 4: ASSET QUALITY & EXITS ====================
 with tab4:
