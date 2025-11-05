@@ -251,12 +251,12 @@ with tab1:
     )
 
     # FRED API Key input
-    col_key, col_window = st.columns([2, 1])
+    col_key, col_window, col_help = st.columns([3, 1, 1])
     with col_key:
         # Try to get from secrets first
         default_fred_key = st.secrets.get("FRED_API_KEY", "")
         fred_api_key = st.text_input(
-            "FRED API Key",
+            "FRED API Key (REQUIRED)",
             value=default_fred_key,
             type="password",
             help="Get your free API key at: https://fred.stlouisfed.org/docs/api/api_key.html"
@@ -268,6 +268,24 @@ with tab1:
             index=0,
             help="252d = annual, 126d = semi-annual"
         )
+    with col_help:
+        st.markdown("")  # Spacing
+        st.markdown("")  # Spacing
+        if st.button("❓ Help", help="How to get FRED API key"):
+            st.info("""
+            **How to get FRED API key:**
+
+            1. Go to: https://fred.stlouisfed.org/docs/api/api_key.html
+            2. Click 'Request API Key'
+            3. Fill form and submit
+            4. **CHECK YOUR EMAIL** for activation link
+            5. Click activation link (key won't work without this!)
+            6. Copy 32-character key
+            7. Paste above
+
+            **Key format:** 32 characters (letters + numbers)
+            Example: `abcdef1234567890abcdef1234567890`
+            """)
 
     # Regime Detection Method Selection
     st.markdown("**Regime Detection Method:**")
@@ -346,31 +364,26 @@ with tab1:
                     verbose=False
                 )
 
-            # Show diagnostic messages (only if there are errors/warnings)
-            has_errors = any("❌" in msg or "Failed" in msg or "⚠️" in msg for msg in messages)
-            if has_errors or result_df.empty:
-                with st.expander("🔍 FRED Fetch Diagnostics", expanded=True):
-                    for msg in messages:
-                        if "❌" in msg or "Failed" in msg:
-                            st.error(msg)
-                        elif "⚠️" in msg:
-                            st.warning(msg)
-                        else:
-                            st.info(msg)
-
+            # Show messages
             if result_df.empty:
-                st.warning("⚠️ No FRED data available. Using default regime: NEUTRAL (M=1.0)")
-                if "HMM" in regime_method or "Random Forest" in regime_method:
-                    st.info(f"""
-                    💡 **{regime_method}** requires FRED macro data to function.
-                    Using **Z-Score (default)** instead with neutral regime.
+                # FRED failed - show error prominently
+                st.error("❌ FRED Data Fetch FAILED - Cannot proceed with regime detection")
 
-                    To enable {regime_method}:
-                    1. Get free API key: https://fred.stlouisfed.org/docs/api/api_key.html
-                    2. Enter key above and reload
-                    """)
-                macro_z_eff = 0.0
-                reg = z_to_regime(macro_z_eff)
+                # Show all error messages in a single error box
+                error_messages = [msg for msg in messages if msg and not msg.startswith("📊")]
+                if error_messages:
+                    st.markdown("---")
+                    for msg in error_messages:
+                        if msg.strip():  # Only show non-empty messages
+                            if msg.startswith("🔧") or msg.startswith("⚠️"):
+                                st.warning(msg)
+                            elif msg.strip().isdigit() or msg.strip() == "":
+                                continue  # Skip empty or number-only lines
+                            else:
+                                st.info(msg)
+                    st.markdown("---")
+
+                st.stop()  # Stop execution - FRED is required
             else:
                 # Regime detection: Z-Score, HMM, or Random Forest
                 detection_method = "Z-Score"
@@ -606,23 +619,27 @@ with tab1:
             reg = z_to_regime(macro_z_eff)
     else:
         # No FRED API key provided
+        st.warning("⚠️ FRED API Key REQUIRED for regime detection")
         st.info("""
-        **📊 Macro Regime Detection (Optional)**
+        **🔧 Action Required:**
 
-        **Current status:** Using default regime: **NEUTRAL** (M_macro = 1.0)
+        1. Get FREE FRED API key: https://fred.stlouisfed.org/docs/api/api_key.html
+        2. Click 'Request API Key'
+        3. **CHECK EMAIL** for activation link (key won't work without clicking it!)
+        4. Copy 32-character key
+        5. Paste in field above
 
-        **To enable advanced regime detection** (Z-Score, HMM, Random Forest):
-        1. Get free FRED API key: https://fred.stlouisfed.org/docs/api/api_key.html
-        2. Enter key above
-
-        **What FRED data enables:**
-        - Macro indicators: Fed liquidity, rates, spreads, yield curve
+        **What you'll get with FRED:**
+        - Real-time macro indicators (Fed liquidity, rates, spreads)
         - Automatic regime classification (CRISIS/BEAR/NEUTRAL/BULL)
         - Dynamic M_macro multiplier based on market conditions
-        - HMM and Random Forest regime detection
+        - HMM and Random Forest ML regime detection
+        - Z-score analysis with macro data
 
-        **Note:** Portfolio optimization works without FRED (using M_macro = 1.0)
+        **Key format:** 32 characters (letters + numbers)
+        Example: `abcdef1234567890abcdef1234567890`
         """)
+        st.stop()  # Stop - FRED required
 
     st.session_state['macro_z_eff'] = macro_z_eff
     st.markdown("---")
