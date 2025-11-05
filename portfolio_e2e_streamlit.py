@@ -1935,6 +1935,24 @@ with tab4:
 
                 progress_bar_ps.progress(75)
 
+                # Debug: Check how many valid folds we got
+                if 'n_valid_folds' in search_result.cv_results.columns:
+                    total_valid = search_result.cv_results['n_valid_folds'].sum()
+                    total_possible = len(search_result.cv_results) * search_result.n_folds
+                    st.info(f"📊 Valid folds: {total_valid} / {total_possible} ({100*total_valid/total_possible:.1f}%)")
+
+                    if total_valid < total_possible * 0.5:
+                        st.warning(f"⚠️ More than 50% of folds failed. This may indicate data issues.")
+
+                # Debug: Show score distribution
+                score_col = f'{scoring_metric}_mean'
+                non_nan_scores = search_result.cv_results[score_col].dropna()
+                if len(non_nan_scores) > 0:
+                    st.info(f"📈 Score range: {non_nan_scores.min():.3f} to {non_nan_scores.max():.3f} (median: {non_nan_scores.median():.3f})")
+                else:
+                    st.error("❌ All scores are NaN - all parameter combinations failed!")
+                    st.info("This usually means: (1) insufficient data in test windows, (2) strategy returns all zeros, or (3) numerical instability")
+
                 # Best parameters
                 st.success(f"✓ Grid search completed! Evaluated {search_result.total_evaluations} parameter combinations across {search_result.n_folds} folds")
 
@@ -1966,6 +1984,12 @@ with tab4:
                     }),
                     use_container_width=True
                 )
+
+                # Debug: Show full results in expander
+                with st.expander("🔍 View Full CV Results (Debug)"):
+                    st.dataframe(search_result.cv_results, use_container_width=True)
+                    st.caption(f"Total combinations: {len(search_result.cv_results)}")
+
             except Exception as e_grid:
                 st.error(f"❌ Grid search failed: {e_grid}")
                 st.exception(e_grid)
