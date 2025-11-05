@@ -517,46 +517,52 @@ def fetch_fred_data_macroarimax(
             print(msg)
         return pd.DataFrame(), messages
 
+    # Clean API key thoroughly
+    fred_api_key = fred_api_key.strip()
+    # Remove any hidden characters (BOM, zero-width spaces, etc)
+    fred_api_key = ''.join(c for c in fred_api_key if c.isprintable())
+
     try:
         fred = Fred(api_key=fred_api_key)
 
-        # Test API key with a simple call
+        if verbose:
+            print(f"✓ FRED API initialized (key length: {len(fred_api_key)})")
+
+        # Test API key with a simple call (but don't fail if test fails)
+        test_passed = False
         try:
-            test_series = fred.get_series('DFF', observation_start='2024-01-01', observation_end='2024-01-02')
-            if test_series is None or test_series.empty:
-                msg = "❌ FRED API key test failed - key may not be activated or invalid"
-                messages.append(msg)
-                messages.append("💡 Verify your API key at: https://fred.stlouisfed.org/docs/api/api_key.html")
-                messages.append("💡 Make sure the key is ACTIVATED (check your email for confirmation)")
+            test_series = fred.get_series('DFF', observation_start='2024-01-01', observation_end='2024-01-10')
+            if test_series is not None and not test_series.empty:
+                test_passed = True
                 if verbose:
-                    print(msg)
-                return pd.DataFrame(), messages
+                    print(f"✓ FRED API test passed (fetched {len(test_series)} data points)")
         except Exception as e:
             error_str = str(e).lower()
-            if 'mismatched tag' in error_str or 'xml' in error_str or 'html' in error_str:
-                messages.append("❌ FRED API key is INVALID or NOT ACTIVATED")
+            # Only fail on clear authentication errors
+            if 'mismatched tag' in error_str or 'xml' in error_str or 'html' in error_str or 'bad request' in error_str or '400' in error_str:
+                messages.append("❌ FRED API key authentication failed")
                 messages.append("")
-                messages.append("🔧 SOLUTION - Follow these steps:")
-                messages.append("1. Go to: https://fred.stlouisfed.org/docs/api/api_key.html")
-                messages.append("2. Click 'Request API Key' (or login if you have one)")
-                messages.append("3. CHECK YOUR EMAIL for activation link")
-                messages.append("4. Click the activation link in email")
-                messages.append("5. Copy the 32-character key (letters + numbers)")
-                messages.append("6. Paste here WITHOUT extra spaces")
+                messages.append(f"Error details: {str(e)[:200]}")
                 messages.append("")
-                messages.append("⚠️ Common mistakes:")
-                messages.append("   - Key not activated (must click email link)")
-                messages.append("   - Extra spaces when copying")
-                messages.append("   - Using old/expired key")
+                messages.append("🔧 Possible causes:")
+                messages.append("1. API key invalid or not activated")
+                messages.append("2. API key has extra spaces/characters")
+                messages.append("3. Network/firewall blocking FRED API")
+                messages.append("")
+                messages.append("💡 Try:")
+                messages.append("- Re-copy API key from FRED (remove spaces)")
+                messages.append("- Verify key at: https://fred.stlouisfed.org/docs/api/api_key.html")
+                messages.append("- Check network connection")
                 return pd.DataFrame(), messages
             else:
-                msg = f"❌ FRED API error: {str(e)[:150]}"
-                messages.append(msg)
-                messages.append("Check network connection or API key format")
-                return pd.DataFrame(), messages
+                # Test failed for other reasons (rate limit, series unavailable, etc) - continue anyway
+                if verbose:
+                    print(f"⚠️ FRED test call failed (will try real series): {str(e)[:100]}")
+                messages.append(f"ℹ️ FRED API test inconclusive: {str(e)[:100]}")
+                messages.append("Proceeding with actual data fetch...")
 
     except Exception as e:
-        msg = f"❌ Error initializing FRED API: {e}"
+        msg = f"❌ Error initializing FRED API: {str(e)[:200]}"
         messages.append(msg)
         if verbose:
             print(msg)
