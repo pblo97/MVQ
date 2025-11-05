@@ -1691,111 +1691,111 @@ with tab4:
                 st.exception(e_backtest)
                 st.stop()
 
-                # Display metrics
-                st.markdown("### Backtest Performance Metrics")
+            # Display metrics (moved outside except block to run after successful backtest)
+            st.markdown("### Backtest Performance Metrics")
 
-                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                col_m1.metric("Sharpe Ratio (Strategy)", f"{result.metrics['sharpe_strategy']:.3f}")
-                col_m2.metric("Sharpe Ratio (Benchmark)", f"{result.metrics['sharpe_benchmark']:.3f}")
-                col_m3.metric("Information Ratio", f"{result.metrics['information_ratio']:.3f}")
-                col_m4.metric("Calmar Ratio", f"{result.metrics['calmar_ratio']:.3f}")
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Sharpe Ratio (Strategy)", f"{result.metrics['sharpe_strategy']:.3f}")
+            col_m2.metric("Sharpe Ratio (Benchmark)", f"{result.metrics['sharpe_benchmark']:.3f}")
+            col_m3.metric("Information Ratio", f"{result.metrics['information_ratio']:.3f}")
+            col_m4.metric("Calmar Ratio", f"{result.metrics['calmar_ratio']:.3f}")
 
-                col_m5, col_m6, col_m7, col_m8 = st.columns(4)
-                col_m5.metric("Sortino Ratio", f"{result.metrics['sortino_ratio']:.3f}")
-                col_m6.metric("Win Rate", f"{result.metrics['win_rate']:.1%}")
-                col_m7.metric("Max Drawdown", f"{result.metrics['max_drawdown']:.2%}")
-                col_m8.metric("Total Return", f"{result.metrics['total_return_strategy']:.2%}")
+            col_m5, col_m6, col_m7, col_m8 = st.columns(4)
+            col_m5.metric("Sortino Ratio", f"{result.metrics['sortino_ratio']:.3f}")
+            col_m6.metric("Win Rate", f"{result.metrics['win_rate']:.1%}")
+            col_m7.metric("Max Drawdown", f"{result.metrics['max_drawdown']:.2%}")
+            col_m8.metric("Total Return", f"{result.metrics['total_return_strategy']:.2%}")
 
-                st.caption("""
-                **Metrics Interpretation:**
-                - **Sharpe Ratio:** Risk-adjusted returns (>1.0 = good, >2.0 = excellent)
-                - **Information Ratio:** Excess return vs benchmark per unit of tracking error
-                - **Sortino Ratio:** Like Sharpe, but only penalizes downside volatility
-                - **Calmar Ratio:** Total return / Max Drawdown (risk-adjusted)
-                - **Win Rate:** % of profitable periods
-                """)
+            st.caption("""
+            **Metrics Interpretation:**
+            - **Sharpe Ratio:** Risk-adjusted returns (>1.0 = good, >2.0 = excellent)
+            - **Information Ratio:** Excess return vs benchmark per unit of tracking error
+            - **Sortino Ratio:** Like Sharpe, but only penalizes downside volatility
+            - **Calmar Ratio:** Total return / Max Drawdown (risk-adjusted)
+            - **Win Rate:** % of profitable periods
+            """)
 
-                # Cumulative returns chart
-                st.markdown("---")
-                st.markdown("### Cumulative Returns (Strategy vs Benchmark)")
+            # Cumulative returns chart
+            st.markdown("---")
+            st.markdown("### Cumulative Returns (Strategy vs Benchmark)")
 
-                cum_strategy = (1 + pd.Series(result.strategy_returns)).cumprod()
-                cum_benchmark = (1 + pd.Series(result.benchmark_returns)).cumprod()
-                cum_dates = pd.date_range(end=end_date, periods=len(cum_strategy), freq='D')
+            cum_strategy = (1 + pd.Series(result.strategy_returns)).cumprod()
+            cum_benchmark = (1 + pd.Series(result.benchmark_returns)).cumprod()
+            cum_dates = pd.date_range(end=end_date, periods=len(cum_strategy), freq='D')
 
-                cum_df = pd.DataFrame({
-                    'Date': cum_dates,
-                    'Strategy': cum_strategy.values,
-                    'Benchmark': cum_benchmark.values
+            cum_df = pd.DataFrame({
+                'Date': cum_dates,
+                'Strategy': cum_strategy.values,
+                'Benchmark': cum_benchmark.values
+            })
+
+            if HAVE_PLOTLY:
+                fig_cum = px.line(
+                    cum_df,
+                    x='Date',
+                    y=['Strategy', 'Benchmark'],
+                    title=f"Cumulative Returns ({backtest_method})",
+                    labels={'value': 'Cumulative Return', 'variable': 'Portfolio'}
+                )
+                fig_cum.update_traces(line=dict(width=2))
+                st.plotly_chart(fig_cum, use_container_width=True)
+            else:
+                st.line_chart(cum_df.set_index('Date'))
+
+            # Drawdown chart
+            st.markdown("---")
+            st.markdown("### Drawdown Analysis")
+
+            running_max_strategy = cum_strategy.cummax()
+            drawdown_strategy = (cum_strategy - running_max_strategy) / running_max_strategy
+
+            running_max_benchmark = cum_benchmark.cummax()
+            drawdown_benchmark = (cum_benchmark - running_max_benchmark) / running_max_benchmark
+
+            dd_df = pd.DataFrame({
+                'Date': cum_dates,
+                'Strategy DD': drawdown_strategy.values,
+                'Benchmark DD': drawdown_benchmark.values
+            })
+
+            if HAVE_PLOTLY:
+                fig_dd = px.line(
+                    dd_df,
+                    x='Date',
+                    y=['Strategy DD', 'Benchmark DD'],
+                    title="Drawdown Over Time",
+                    labels={'value': 'Drawdown', 'variable': 'Portfolio'}
+                )
+                fig_dd.update_traces(line=dict(width=2))
+                st.plotly_chart(fig_dd, use_container_width=True)
+            else:
+                st.line_chart(dd_df.set_index('Date'))
+
+            # Download results
+            st.markdown("---")
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                metrics_df = pd.DataFrame([result.metrics])
+                st.download_button(
+                    "📥 Download Metrics",
+                    metrics_df.to_csv(index=False).encode(),
+                    file_name=f"backtest_metrics_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            with col_dl2:
+                returns_export = pd.DataFrame({
+                    'date': cum_dates,
+                    'strategy_return': result.strategy_returns,
+                    'benchmark_return': result.benchmark_returns
                 })
-
-                if HAVE_PLOTLY:
-                    fig_cum = px.line(
-                        cum_df,
-                        x='Date',
-                        y=['Strategy', 'Benchmark'],
-                        title=f"Cumulative Returns ({backtest_method})",
-                        labels={'value': 'Cumulative Return', 'variable': 'Portfolio'}
-                    )
-                    fig_cum.update_traces(line=dict(width=2))
-                    st.plotly_chart(fig_cum, use_container_width=True)
-                else:
-                    st.line_chart(cum_df.set_index('Date'))
-
-                # Drawdown chart
-                st.markdown("---")
-                st.markdown("### Drawdown Analysis")
-
-                running_max_strategy = cum_strategy.cummax()
-                drawdown_strategy = (cum_strategy - running_max_strategy) / running_max_strategy
-
-                running_max_benchmark = cum_benchmark.cummax()
-                drawdown_benchmark = (cum_benchmark - running_max_benchmark) / running_max_benchmark
-
-                dd_df = pd.DataFrame({
-                    'Date': cum_dates,
-                    'Strategy DD': drawdown_strategy.values,
-                    'Benchmark DD': drawdown_benchmark.values
-                })
-
-                if HAVE_PLOTLY:
-                    fig_dd = px.line(
-                        dd_df,
-                        x='Date',
-                        y=['Strategy DD', 'Benchmark DD'],
-                        title="Drawdown Over Time",
-                        labels={'value': 'Drawdown', 'variable': 'Portfolio'}
-                    )
-                    fig_dd.update_traces(line=dict(width=2))
-                    st.plotly_chart(fig_dd, use_container_width=True)
-                else:
-                    st.line_chart(dd_df.set_index('Date'))
-
-                # Download results
-                st.markdown("---")
-                col_dl1, col_dl2 = st.columns(2)
-                with col_dl1:
-                    metrics_df = pd.DataFrame([result.metrics])
-                    st.download_button(
-                        "📥 Download Metrics",
-                        metrics_df.to_csv(index=False).encode(),
-                        file_name=f"backtest_metrics_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                with col_dl2:
-                    returns_export = pd.DataFrame({
-                        'date': cum_dates,
-                        'strategy_return': result.strategy_returns,
-                        'benchmark_return': result.benchmark_returns
-                    })
-                    st.download_button(
-                        "📥 Download Returns",
-                        returns_export.to_csv(index=False).encode(),
-                        file_name=f"backtest_returns_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
+                st.download_button(
+                    "📥 Download Returns",
+                    returns_export.to_csv(index=False).encode(),
+                    file_name=f"backtest_returns_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
 
         except Exception as e:
             st.error(f"❌ Backtest error: {e}")
