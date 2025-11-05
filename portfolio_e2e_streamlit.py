@@ -1561,71 +1561,100 @@ with tab4:
 
     if st.button("🚀 Run Backtest", type="primary"):
         try:
+            st.info("📋 Starting backtest setup...")
+
             from portfolio_manager.backtest.walk_forward import (
                 walk_forward_backtest,
                 expanding_window_backtest,
                 calculate_backtest_metrics
             )
 
-            with st.spinner("🔄 Running walk-forward backtest... (this may take 1-2 minutes)"):
-                # Get returns data
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            status_text.text("Step 1/4: Loading price data...")
+            progress_bar.progress(10)
+
+            # Get returns data
+            try:
                 price_panel = load_prices_panel(
                     symbols + [bench],
                     start_date.isoformat(),
                     end_date.isoformat(),
                     cache_key="e2e_backtest"
                 )
+                st.success(f"✓ Loaded price data for {len(price_panel)} symbols")
+                progress_bar.progress(25)
+            except Exception as e_load:
+                st.error(f"❌ Failed to load price data: {e_load}")
+                st.exception(e_load)
+                st.stop()
 
-                returns_df = pd.DataFrame({
-                    sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
-                    for sym in symbols if sym in price_panel
-                }).dropna(how='all')
+            status_text.text("Step 2/4: Computing returns...")
+            returns_df = pd.DataFrame({
+                sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                for sym in symbols if sym in price_panel
+            }).dropna(how='all')
 
-                if returns_df.empty or len(returns_df) < train_window + test_window:
-                    st.error(f"❌ Insufficient data for backtest. Need at least {train_window + test_window} days ({(train_window + test_window)/21:.0f} months)")
-                    st.stop()
+            if returns_df.empty or len(returns_df) < train_window + test_window:
+                st.error(f"❌ Insufficient data for backtest. Need at least {train_window + test_window} days ({(train_window + test_window)/21:.0f} months)")
+                st.info(f"Current data: {len(returns_df)} days")
+                st.stop()
 
-                # Benchmark weights
-                n_assets = len(returns_df.columns)
-                if benchmark_method == "Equal Weight":
-                    benchmark_weights = np.ones(n_assets) / n_assets
-                elif benchmark_method == "Market Cap":
-                    # Approximate with inverse volatility (proxy for market cap)
-                    vols = returns_df.std()
-                    inv_vol = 1 / vols
-                    benchmark_weights = (inv_vol / inv_vol.sum()).values
-                else:
-                    benchmark_weights = np.ones(n_assets) / n_assets
+            st.success(f"✓ Computed returns: {len(returns_df)} days × {len(returns_df.columns)} assets")
+            progress_bar.progress(40)
 
-                # Strategy function (simplified Kelly)
-                def simple_kelly_strategy(train_returns, base_kelly=0.25, winsor_p=0.01):
-                    """Simplified Kelly strategy for backtest"""
-                    # Winsorize
-                    train_w = train_returns.clip(
-                        lower=train_returns.quantile(winsor_p),
-                        upper=train_returns.quantile(1 - winsor_p)
-                    )
+            status_text.text("Step 3/4: Setting up backtest parameters...")
+            # Benchmark weights
+            n_assets = len(returns_df.columns)
+            if benchmark_method == "Equal Weight":
+                benchmark_weights = np.ones(n_assets) / n_assets
+            elif benchmark_method == "Market Cap":
+                # Approximate with inverse volatility (proxy for market cap)
+                vols = returns_df.std()
+                inv_vol = 1 / vols
+                benchmark_weights = (inv_vol / inv_vol.sum()).values
+            else:
+                benchmark_weights = np.ones(n_assets) / n_assets
 
-                    # Kelly weights: w = Σ^-1 μ / κ
-                    mu = train_w.mean()
-                    cov = train_w.cov()
+            # Strategy function (simplified Kelly)
+            def simple_kelly_strategy(train_returns, base_kelly=0.25, winsor_p=0.01):
+                """Simplified Kelly strategy for backtest"""
+                # Winsorize
+                train_w = train_returns.clip(
+                    lower=train_returns.quantile(winsor_p),
+                    upper=train_returns.quantile(1 - winsor_p)
+                )
 
-                    try:
-                        cov_inv = np.linalg.inv(cov.values + np.eye(len(cov)) * 1e-8)
-                        weights_raw = base_kelly * (cov_inv @ mu.values)
-                        weights_raw = np.clip(weights_raw, 0, None)  # Long-only
+                # Kelly weights: w = Σ^-1 μ / κ
+                mu = train_w.mean()
+                cov = train_w.cov()
 
-                        if weights_raw.sum() > 0:
-                            weights = weights_raw / weights_raw.sum()
-                        else:
-                            weights = np.ones(len(mu)) / len(mu)
-                    except np.linalg.LinAlgError:
-                        # Fallback to equal weight
+                try:
+                    cov_inv = np.linalg.inv(cov.values + np.eye(len(cov)) * 1e-8)
+                    weights_raw = base_kelly * (cov_inv @ mu.values)
+                    weights_raw = np.clip(weights_raw, 0, None)  # Long-only
+
+                    if weights_raw.sum() > 0:
+                        weights = weights_raw / weights_raw.sum()
+                    else:
                         weights = np.ones(len(mu)) / len(mu)
+                except np.linalg.LinAlgError:
+                    # Fallback to equal weight
+                    weights = np.ones(len(mu)) / len(mu)
 
-                    return weights
+                return weights
 
-                # Run backtest
+            progress_bar.progress(50)
+
+            # Calculate expected number of windows
+            n_windows = ((len(returns_df) - train_window - test_window) // step_size) + 1
+            status_text.text(f"Step 4/4: Running {backtest_method} backtest ({n_windows} windows)...")
+            st.info(f"📊 Backtest configuration: Train={train_window_months}mo, Test={test_window_months}mo, Step={step_size_months}mo")
+
+            # Run backtest
+            try:
                 if backtest_method == "Rolling Window":
                     result = walk_forward_backtest(
                         returns_df=returns_df,
@@ -1651,10 +1680,16 @@ with tab4:
                         winsor_p=winsor_p
                     )
 
-                st.success("✓ Backtest completed!")
+                progress_bar.progress(100)
+                status_text.text("✓ Backtest completed!")
+                st.success(f"✓ Backtest completed successfully! Processed {n_windows} windows.")
 
                 # Store in session
                 st.session_state['backtest_result'] = result
+            except Exception as e_backtest:
+                st.error(f"❌ Backtest execution failed: {e_backtest}")
+                st.exception(e_backtest)
+                st.stop()
 
                 # Display metrics
                 st.markdown("### Backtest Performance Metrics")
@@ -1816,32 +1851,55 @@ with tab4:
 
     if st.button("🔍 Run Parameter Search", type="secondary"):
         try:
+            st.info("📋 Starting parameter search...")
+
             from portfolio_manager.optimization.parameter_search import (
                 optimize_kelly_parameters,
                 recommend_parameters,
                 analyze_parameter_sensitivity
             )
 
-            with st.spinner("🔄 Running parameter grid search... (this may take 2-5 minutes)"):
-                # Get returns data
+            # Progress tracking
+            progress_bar_ps = st.progress(0)
+            status_text_ps = st.empty()
+
+            status_text_ps.text("Step 1/5: Loading price data...")
+            progress_bar_ps.progress(10)
+
+            # Get returns data
+            try:
                 price_panel = load_prices_panel(
                     symbols + [bench],
                     start_date.isoformat(),
                     end_date.isoformat(),
                     cache_key="e2e_param_search"
                 )
+                st.success(f"✓ Loaded price data for {len(price_panel)} symbols")
+                progress_bar_ps.progress(20)
+            except Exception as e_load:
+                st.error(f"❌ Failed to load price data: {e_load}")
+                st.exception(e_load)
+                st.stop()
 
-                returns_df = pd.DataFrame({
-                    sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
-                    for sym in symbols if sym in price_panel
-                }).dropna(how='all')
+            status_text_ps.text("Step 2/5: Computing returns...")
+            returns_df = pd.DataFrame({
+                sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                for sym in symbols if sym in price_panel
+            }).dropna(how='all')
 
-                if returns_df.empty or len(returns_df) < 504:  # Need 2 years minimum
-                    st.error(f"❌ Insufficient data for parameter search. Need at least 504 days (~2 years)")
-                    st.stop()
+            if returns_df.empty or len(returns_df) < 504:  # Need 2 years minimum
+                st.error(f"❌ Insufficient data for parameter search. Need at least 504 days (~2 years)")
+                st.info(f"Current data: {len(returns_df)} days")
+                st.stop()
 
-                # Get recommendations based on risk tolerance
-                st.markdown("**🎯 Recommended Parameters (Based on Risk Tolerance):**")
+            st.success(f"✓ Computed returns: {len(returns_df)} days × {len(returns_df.columns)} assets")
+            progress_bar_ps.progress(30)
+
+            # Get recommendations based on risk tolerance
+            status_text_ps.text("Step 3/5: Calculating recommended parameters...")
+            st.markdown("**🎯 Recommended Parameters (Based on Risk Tolerance):**")
+
+            try:
                 recommended = recommend_parameters(
                     returns_df=returns_df,
                     strategy_type='kelly',
@@ -1857,11 +1915,18 @@ with tab4:
                     st.metric("Winsor p", f"{recommended['winsor_p']:.3f}")
 
                 st.info(f"**Rationale:** {recommended['rationale']}")
+                progress_bar_ps.progress(45)
+            except Exception as e_rec:
+                st.warning(f"⚠️ Could not generate recommendations: {e_rec}")
+                progress_bar_ps.progress(45)
 
-                # Run grid search
-                st.markdown("---")
-                st.markdown("**🔬 Grid Search Results:**")
+            # Run grid search
+            st.markdown("---")
+            st.markdown("**🔬 Grid Search Results:**")
+            status_text_ps.text("Step 4/5: Running grid search with cross-validation...")
+            st.info("⏳ This may take 2-5 minutes depending on data size...")
 
+            try:
                 search_result = optimize_kelly_parameters(
                     returns_df=returns_df,
                     scoring=scoring_metric,
@@ -1870,6 +1935,8 @@ with tab4:
                     test_size=63,
                     verbose=False
                 )
+
+                progress_bar_ps.progress(75)
 
                 # Best parameters
                 st.success(f"✓ Grid search completed! Evaluated {search_result.total_evaluations} parameter combinations across {search_result.n_folds} folds")
@@ -1902,12 +1969,18 @@ with tab4:
                     }),
                     use_container_width=True
                 )
+            except Exception as e_grid:
+                st.error(f"❌ Grid search failed: {e_grid}")
+                st.exception(e_grid)
+                st.stop()
 
-                # Parameter sensitivity analysis
-                st.markdown("---")
-                st.markdown("**Parameter Sensitivity Analysis:**")
-                st.caption("Shows impact of each parameter on performance (averaging over other parameters)")
+            # Parameter sensitivity analysis
+            st.markdown("---")
+            st.markdown("**Parameter Sensitivity Analysis:**")
+            st.caption("Shows impact of each parameter on performance (averaging over other parameters)")
+            status_text_ps.text("Step 5/5: Running sensitivity analysis...")
 
+            try:
                 sensitivity = analyze_parameter_sensitivity(
                     returns_df=returns_df,
                     param_grid={
@@ -1918,6 +1991,9 @@ with tab4:
                     scoring=scoring_metric,
                     n_splits=3  # Fewer splits for sensitivity (faster)
                 )
+
+                progress_bar_ps.progress(100)
+                status_text_ps.text("✓ Parameter search completed!")
 
                 if HAVE_PLOTLY:
                     # Create subplots for each parameter
@@ -1957,25 +2033,28 @@ with tab4:
                     for param_name, sens_df in sensitivity.items():
                         st.markdown(f"**{param_name.replace('_', ' ').title()}:**")
                         st.dataframe(sens_df, use_container_width=True)
+            except Exception as e_sens:
+                st.warning(f"⚠️ Sensitivity analysis failed: {e_sens}")
+                st.info("Grid search results are still available above")
 
-                # Download CV results
-                st.markdown("---")
-                st.download_button(
-                    "📥 Download Full CV Results",
-                    search_result.cv_results.to_csv(index=False).encode(),
-                    file_name=f"parameter_search_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                    mime="text/csv"
-                )
+            # Download CV results
+            st.markdown("---")
+            st.download_button(
+                "📥 Download Full CV Results",
+                search_result.cv_results.to_csv(index=False).encode(),
+                file_name=f"parameter_search_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                mime="text/csv"
+            )
 
-                st.caption("""
-                **Interpretation:**
-                - **mean_score**: Average performance across all cross-validation folds
-                - **std_score**: Standard deviation (lower = more stable across folds)
-                - **Sensitivity**: Shows which parameters have the most impact on performance
-                - **Best practices**: Use parameters with high mean_score AND low std_score (robust)
+            st.caption("""
+            **Interpretation:**
+            - **mean_score**: Average performance across all cross-validation folds
+            - **std_score**: Standard deviation (lower = more stable across folds)
+            - **Sensitivity**: Shows which parameters have the most impact on performance
+            - **Best practices**: Use parameters with high mean_score AND low std_score (robust)
 
-                **Note:** Top parameters may differ slightly from recommendations due to universe-specific characteristics
-                """)
+            **Note:** Top parameters may differ slightly from recommendations due to universe-specific characteristics
+            """)
 
         except Exception as e_ps:
             st.error(f"❌ Parameter search error: {e_ps}")
