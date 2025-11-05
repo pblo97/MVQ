@@ -37,6 +37,7 @@ class RegimeState:
     beta_cap: float  # Beta cap for this regime
     vol_cap: float  # Position cap for this regime
     description: str
+    probability: float = 1.0  # Confidence/probability for this regime (default 1.0 for deterministic)
 
 
 class HiddenMarkovRegime:
