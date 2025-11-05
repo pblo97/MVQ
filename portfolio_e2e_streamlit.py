@@ -140,17 +140,35 @@ with tab1:
         try:
             with st.spinner("🔄 Fetching FRED data and calculating macro z-score..."):
                 # Auto-fetch FRED and calculate z-score
-                result_df, macro_z_eff = calculate_macro_zscore_auto_fred(
+                result_df, macro_z_eff, messages = calculate_macro_zscore_auto_fred(
                     fred_api_key=fred_api_key.strip(),
                     start_date=start_date.isoformat(),
                     end_date=end_date.isoformat(),
                     window=window_days,
                     weights=get_macroarimax_default_weights(),
-                    clip_z=3.5
+                    clip_z=3.5,
+                    verbose=False
                 )
+
+            # Show diagnostic messages
+            with st.expander("🔍 FRED Fetch Diagnostics", expanded=(result_df.empty)):
+                for msg in messages:
+                    if "❌" in msg or "Failed" in msg:
+                        st.error(msg)
+                    elif "⚠️" in msg:
+                        st.warning(msg)
+                    else:
+                        st.info(msg)
 
             if result_df.empty:
                 st.warning("⚠️ No FRED data fetched. Using default macro_z = 0.0 (NEUTRAL)")
+                st.info("""
+                **Troubleshooting:**
+                1. **Check API Key:** Verify your FRED API key is valid
+                2. **Get API Key:** https://fred.stlouisfed.org/docs/api/api_key.html
+                3. **Network:** Ensure you can access FRED API (not blocked by firewall)
+                4. **Check diagnostics above** for specific error messages
+                """)
                 macro_z_eff = 0.0
             else:
                 reg = z_to_regime(macro_z_eff)
