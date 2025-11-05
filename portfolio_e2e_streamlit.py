@@ -140,17 +140,35 @@ with tab1:
         try:
             with st.spinner("🔄 Fetching FRED data and calculating macro z-score..."):
                 # Auto-fetch FRED and calculate z-score
-                result_df, macro_z_eff = calculate_macro_zscore_auto_fred(
+                result_df, macro_z_eff, messages = calculate_macro_zscore_auto_fred(
                     fred_api_key=fred_api_key.strip(),
                     start_date=start_date.isoformat(),
                     end_date=end_date.isoformat(),
                     window=window_days,
                     weights=get_macroarimax_default_weights(),
-                    clip_z=3.5
+                    clip_z=3.5,
+                    verbose=False
                 )
+
+            # Show diagnostic messages
+            with st.expander("🔍 FRED Fetch Diagnostics", expanded=(result_df.empty)):
+                for msg in messages:
+                    if "❌" in msg or "Failed" in msg:
+                        st.error(msg)
+                    elif "⚠️" in msg:
+                        st.warning(msg)
+                    else:
+                        st.info(msg)
 
             if result_df.empty:
                 st.warning("⚠️ No FRED data fetched. Using default macro_z = 0.0 (NEUTRAL)")
+                st.info("""
+                **Troubleshooting:**
+                1. **Check API Key:** Verify your FRED API key is valid
+                2. **Get API Key:** https://fred.stlouisfed.org/docs/api/api_key.html
+                3. **Network:** Ensure you can access FRED API (not blocked by firewall)
+                4. **Check diagnostics above** for specific error messages
+                """)
                 macro_z_eff = 0.0
             else:
                 reg = z_to_regime(macro_z_eff)
@@ -505,21 +523,67 @@ with tab4:
 
     # Exit signals
     st.markdown("---")
-    st.markdown("### Exit Signals (MA200, Momentum 12-1, VFQ Degradation)")
+    st.markdown("### Exit Signals (MA200, Momentum 12-1, Fundamental Degradation)")
 
-    ma_window = st.number_input("MA Window (days)", 100, 400, 200, 10)
-    mom_lookback = st.number_input("Momentum Lookback (days)", 180, 400, 252, 10)
+    # Configuration
+    col_ex1, col_ex2, col_ex3 = st.columns(3)
+    with col_ex1:
+        ma_window = st.number_input("MA Window (days)", 100, 400, 200, 10)
+    with col_ex2:
+        mom_lookback = st.number_input("Momentum Lookback (days)", 180, 400, 252, 10)
+    with col_ex3:
+        use_piotroski = st.checkbox("Use Piotroski F-Score", value=True, help="Piotroski F-Score (9 signals) vs legacy VFQ")
+
+    # Calculate Piotroski historical scores if needed
+    piotroski_hist = None
+    if use_piotroski and fmp_key:
+        with st.spinner("📊 Calculating Piotroski F-Scores (quarterly)..."):
+            try:
+                from portfolio_manager.fundamentals.piotroski import calculate_piotroski_history
+                piotroski_hist = calculate_piotroski_history(symbols, fmp_key)
+
+                if not piotroski_hist.empty:
+                    st.success(f"✓ Piotroski F-Scores calculated for {len(piotroski_hist['symbol'].unique())} symbols")
+
+                    # Show Piotroski summary
+                    with st.expander("📈 Piotroski F-Score Summary"):
+                        # Latest scores
+                        latest_scores = piotroski_hist.sort_values('date').groupby('symbol').tail(1)[['symbol', 'date', 'F_SCORE']]
+                        st.markdown("**Latest F-Scores:**")
+                        st.dataframe(latest_scores.sort_values('F_SCORE', ascending=False), use_container_width=True)
+
+                        st.markdown("""
+                        **Interpretation (Piotroski 2000):**
+                        - **8-9:** Excellent fundamental quality
+                        - **7:** Strong fundamentals
+                        - **5-6:** Above average
+                        - **3-4:** Below average
+                        - **0-2:** Weak fundamentals
+
+                        **9 Signals:** ROA>0, CFO>0, ΔROA>0, Accrual<0, ΔLEVER<0, ΔLIQUID>0, EQ_OFFER=0, ΔMARGIN>0, ΔTURN>0
+                        """)
+                else:
+                    st.warning("⚠️ Could not calculate Piotroski scores (insufficient fundamental data)")
+            except Exception as e:
+                st.error(f"Error calculating Piotroski: {e}")
+                st.warning("Falling back to technical signals only")
 
     try:
         price_panel = load_prices_panel(symbols + [bench], start_date.isoformat(), end_date.isoformat(), cache_key="e2e_exits")
 
-        exit_table = build_exit_table(
+        # Use enhanced exit table with Piotroski
+        from portfolio_manager.monitor.exits_enhanced import build_exit_table_enhanced
+
+        exit_table = build_exit_table_enhanced(
             panel=price_panel,
             bench_close=None,
             ma_window=int(ma_window),
             mom_lookback=int(mom_lookback),
             review_freq="Q",
-            vfq_hist=None,  # TODO: integrate FMP historical quality
+            piotroski_hist=piotroski_hist,
+            vfq_hist=None,  # Legacy fallback
+            use_piotroski=use_piotroski,
+            degradation_threshold=2,  # F-Score drop ≥ 2 = degradation
             vfq_col="VFQ",
             vfq_delta_thr=0.10
         )

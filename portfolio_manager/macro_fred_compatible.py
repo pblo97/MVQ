@@ -485,8 +485,9 @@ def adjust_thresholds_quarter_end(
 def fetch_fred_data_macroarimax(
     fred_api_key: str,
     start_date: str = "2020-01-01",
-    end_date: Optional[str] = None
-) -> pd.DataFrame:
+    end_date: Optional[str] = None,
+    verbose: bool = False
+) -> tuple[pd.DataFrame, List[str]]:
     """
     Obtiene indicadores FRED automáticamente usando fredapi.
     Igual que en MacroArimax/liquidity stress.
@@ -495,23 +496,35 @@ def fetch_fred_data_macroarimax(
         fred_api_key: API key de FRED (https://fred.stlouisfed.org/docs/api/api_key.html)
         start_date: Fecha inicio (YYYY-MM-DD)
         end_date: Fecha fin (default: hoy)
+        verbose: Si True, imprime mensajes de diagnóstico
 
     Returns:
-        DataFrame con indicadores FRED (index = Date)
+        (DataFrame con indicadores FRED (index = Date), lista de mensajes de diagnóstico)
 
     Example:
-        >>> df = fetch_fred_data_macroarimax(api_key="your_key", start_date="2020-01-01")
+        >>> df, msgs = fetch_fred_data_macroarimax(api_key="your_key", start_date="2020-01-01")
         >>> df.columns
         ['RRPONTSYD', 'WTREGEN', 'WRESBAL', 'SOFR', 'EFFR', 'OBFR', ...]
     """
+    messages = []
+
     try:
         from fredapi import Fred
     except ImportError:
-        raise ImportError(
-            "fredapi not installed. Install with: pip install fredapi"
-        )
+        msg = "❌ fredapi not installed. Install with: pip install fredapi"
+        messages.append(msg)
+        if verbose:
+            print(msg)
+        return pd.DataFrame(), messages
 
-    fred = Fred(api_key=fred_api_key)
+    try:
+        fred = Fred(api_key=fred_api_key)
+    except Exception as e:
+        msg = f"❌ Error initializing FRED API: {e}"
+        messages.append(msg)
+        if verbose:
+            print(msg)
+        return pd.DataFrame(), messages
 
     # Series FRED requeridas (matching MacroArimax spec)
     series_map = {
@@ -536,19 +549,43 @@ def fetch_fred_data_macroarimax(
 
     df = pd.DataFrame()
     failed_series = []
+    success_count = 0
 
     for name, fred_code in series_map.items():
         try:
             series_data = fred.get_series(fred_code, observation_start=start_date, observation_end=end_date)
             df[name] = series_data
+            success_count += 1
         except Exception as e:
-            failed_series.append((name, str(e)))
+            error_msg = str(e)
+            failed_series.append((name, error_msg))
+            if verbose:
+                print(f"  ⚠️ {name}: {error_msg}")
             continue
 
+    # Report results
+    msg_success = f"✓ Fetched {success_count}/{len(series_map)} indicators from FRED"
+    messages.append(msg_success)
+    if verbose:
+        print(msg_success)
+
     if failed_series:
-        print(f"⚠️  Warning: Failed to fetch {len(failed_series)} series:")
+        msg_failed = f"⚠️ Failed to fetch {len(failed_series)} series:"
+        messages.append(msg_failed)
+        if verbose:
+            print(msg_failed)
         for name, error in failed_series:
-            print(f"  - {name}: {error}")
+            msg_detail = f"  - {name}: {error}"
+            messages.append(msg_detail)
+            if verbose:
+                print(msg_detail)
+
+    if df.empty:
+        msg = "❌ No data fetched from FRED. Check API key and network connection."
+        messages.append(msg)
+        if verbose:
+            print(msg)
+        return pd.DataFrame(), messages
 
     # Convert index to datetime
     if not isinstance(df.index, pd.DatetimeIndex):
@@ -559,7 +596,12 @@ def fetch_fred_data_macroarimax(
     # Resample to daily and forward fill (FRED has different frequencies)
     df = df.resample('D').last().ffill()
 
-    return df
+    msg_final = f"✓ Final dataset: {len(df)} days × {len(df.columns)} indicators"
+    messages.append(msg_final)
+    if verbose:
+        print(msg_final)
+
+    return df, messages
 
 
 def calculate_macro_zscore_auto_fred(
@@ -568,8 +610,9 @@ def calculate_macro_zscore_auto_fred(
     end_date: Optional[str] = None,
     window: int = 252,
     weights: Optional[Dict[str, float]] = None,
-    clip_z: float = 3.5
-) -> tuple[pd.DataFrame, float]:
+    clip_z: float = 3.5,
+    verbose: bool = False
+) -> tuple[pd.DataFrame, float, List[str]]:
     """
     Pipeline completo: Fetch FRED → calcula z-scores MacroArimax → devuelve último.
 
@@ -580,46 +623,69 @@ def calculate_macro_zscore_auto_fred(
         window: Ventana rolling (252d anual, 126d semi)
         weights: Pesos por indicador
         clip_z: Clip limit |z| ≤ clip_z
+        verbose: Si True, imprime mensajes de diagnóstico
 
     Returns:
-        (DataFrame con z-scores, composite_z último valor)
+        (DataFrame con z-scores, composite_z último valor, lista de mensajes de diagnóstico)
 
     Example:
-        >>> result_df, z_last = calculate_macro_zscore_auto_fred(
+        >>> result_df, z_last, msgs = calculate_macro_zscore_auto_fred(
         ...     fred_api_key="your_key",
         ...     window=252,
         ...     weights=get_macroarimax_default_weights()
         ... )
         >>> print(f"Current macro z-score: {z_last:.2f}")
     """
+    messages = []
+
     # Fetch FRED data
-    print("📊 Fetching FRED data...")
-    fred_df = fetch_fred_data_macroarimax(
+    msg = "📊 Fetching FRED data..."
+    messages.append(msg)
+    if verbose:
+        print(msg)
+
+    fred_df, fetch_msgs = fetch_fred_data_macroarimax(
         fred_api_key=fred_api_key,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
+        verbose=verbose
     )
+
+    # Aggregate fetch messages
+    messages.extend(fetch_msgs)
 
     if fred_df.empty:
-        print("❌ No FRED data fetched")
-        return pd.DataFrame(), 0.0
-
-    print(f"✓ Fetched {len(fred_df.columns)} indicators, {len(fred_df)} days")
+        msg = "❌ No FRED data fetched - cannot calculate z-score"
+        messages.append(msg)
+        if verbose:
+            print(msg)
+        return pd.DataFrame(), 0.0, messages
 
     # Calculate z-scores using MacroArimax method
-    result_df = calculate_composite_zscore_macroarimax(
-        indicators_df=fred_df,
-        window=window,
-        weights=weights,
-        clip_z=clip_z
-    )
+    try:
+        result_df = calculate_composite_zscore_macroarimax(
+            indicators_df=fred_df,
+            window=window,
+            weights=weights,
+            clip_z=clip_z
+        )
 
-    # Extract last composite_z
-    if 'composite_z' in result_df.columns:
-        composite_z_last = float(result_df['composite_z'].dropna().iloc[-1]) if not result_df['composite_z'].dropna().empty else 0.0
-    else:
-        composite_z_last = 0.0
+        # Extract last composite_z
+        if 'composite_z' in result_df.columns:
+            composite_z_last = float(result_df['composite_z'].dropna().iloc[-1]) if not result_df['composite_z'].dropna().empty else 0.0
+        else:
+            composite_z_last = 0.0
 
-    print(f"✓ Composite z-score (last): {composite_z_last:.2f}")
+        msg = f"✓ Composite z-score (last): {composite_z_last:.2f}"
+        messages.append(msg)
+        if verbose:
+            print(msg)
 
-    return result_df, composite_z_last
+        return result_df, composite_z_last, messages
+
+    except Exception as e:
+        msg = f"❌ Error calculating z-score: {e}"
+        messages.append(msg)
+        if verbose:
+            print(msg)
+        return pd.DataFrame(), 0.0, messages
