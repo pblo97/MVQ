@@ -270,30 +270,65 @@ with tab1:
             help="252d = annual, 126d = semi-annual"
         )
 
-    # HMM vs Z-Score regime detection
+    # Regime Detection Method Selection
     st.markdown("**Regime Detection Method:**")
-    col_regime1, col_regime2 = st.columns(2)
+    with st.expander("📚 About Regime Detection Methods"):
+        st.markdown("""
+        **Z-Score (Default):**
+        - Simple composite z-score from macro indicators
+        - Fast, interpretable, no training required
+        - Thresholds: z > 0.5 = BULL, z < -0.5 = BEAR
+
+        **HMM (Hidden Markov Model):**
+        - Unsupervised learning (Hamilton 1989)
+        - Discovers hidden states from data patterns
+        - Provides transition probabilities and persistence
+        - Best for: Detecting regime changes automatically
+
+        **Random Forest (Machine Learning):**
+        - Supervised learning (Breiman 2001)
+        - Trained on labeled historical regimes (2008 GFC, 2020 COVID, etc.)
+        - Uses multiple features: macro + technical + momentum
+        - Provides feature importance and probability per regime
+        - Best for: Interpretable ML with confidence scores
+
+        **Academic References:**
+        - Hamilton (1989): A New Approach to the Economic Analysis of Nonstationary Time Series
+        - Breiman (2001): Random Forests
+        - Ballings et al. (2015): Evaluating Multiple Classifiers for Stock Price Direction Prediction
+        """)
+
+    col_regime1, col_regime2 = st.columns([2, 1])
     with col_regime1:
-        use_hmm_regime = st.checkbox(
-            "Use HMM Regime Detection",
-            value=False,
-            help="Hidden Markov Model for regime detection (Hamilton 1989) - More sophisticated than z-score"
+        regime_method = st.radio(
+            "Method",
+            options=["Z-Score (Simple)", "HMM (Unsupervised ML)", "Random Forest (Supervised ML)"],
+            index=0,
+            help="Select regime detection algorithm"
         )
     with col_regime2:
-        if use_hmm_regime:
+        if "HMM" in regime_method:
             n_hmm_states = st.selectbox(
                 "HMM States",
                 options=[2, 3, 4],
                 index=1,
                 help="2=BEAR/BULL, 3=BEAR/NEUTRAL/BULL, 4=CRISIS/BEAR/NEUTRAL/BULL"
             )
+        elif "Random Forest" in regime_method:
+            rf_train_on_load = st.checkbox(
+                "Auto-train on load",
+                value=True,
+                help="Train Random Forest on historical data automatically"
+            )
         else:
             n_hmm_states = 3
+            rf_train_on_load = True
 
     macro_z_eff = 0.0
     macro_bundle = None
     result_df = None
     hmm_model = None
+    rf_model = None
     current_regime_state = None
 
     if fred_api_key and fred_api_key.strip():
@@ -331,8 +366,40 @@ with tab1:
                 """)
                 macro_z_eff = 0.0
             else:
-                # Regime detection: HMM or Z-Score
-                if use_hmm_regime and not result_df.empty:
+                # Regime detection: Z-Score, HMM, or Random Forest
+                detection_method = "Z-Score"
+
+                if "Random Forest" in regime_method and not result_df.empty:
+                    try:
+                        from portfolio_manager.regime.random_forest_regime import RandomForestRegime
+
+                        with st.spinner("🌳 Training Random Forest on labeled historical regimes..."):
+                            # Prepare features
+                            rf_model = RandomForestRegime(n_estimators=100, max_depth=10, random_state=42)
+                            features_df = rf_model.prepare_features(result_df)
+
+                            if len(features_df) >= 252:  # At least 1 year of data
+                                # Create labeled regimes from known historical periods
+                                labels = rf_model.create_labeled_regimes(features_df.index)
+
+                                # Train model
+                                rf_model.train(features_df, labels, cv_folds=5)
+
+                                # Get current regime
+                                reg = rf_model.predict_regime(features_df)
+                                detection_method = "Random Forest"
+
+                                st.success(f"✓ Random Forest trained. Current regime: **{reg.label}** (confidence={reg.probability:.1%}, M={reg.m_multiplier:.2f})")
+                                st.info(f"📊 Model accuracy (5-fold CV): **{rf_model.cv_score:.1%}**")
+                            else:
+                                st.warning("⚠️ Insufficient data for Random Forest (need ≥252 days / 1 year). Falling back to z-score.")
+                                reg = z_to_regime(macro_z_eff)
+                    except Exception as e_rf:
+                        st.warning(f"⚠️ Random Forest failed: {e_rf}. Falling back to z-score.")
+                        st.exception(e_rf)
+                        reg = z_to_regime(macro_z_eff)
+
+                elif "HMM" in regime_method and not result_df.empty:
                     try:
                         from portfolio_manager.regime.hmm_regime import HiddenMarkovRegime
 
@@ -352,8 +419,8 @@ with tab1:
                                 hmm_model.fit(features_df)
 
                                 # Get current regime
-                                current_regime_state = hmm_model.predict_regime(features_df)
-                                reg = current_regime_state
+                                reg = hmm_model.predict_regime(features_df)
+                                detection_method = "HMM"
 
                                 st.success(f"✓ HMM trained with {n_hmm_states} states. Current regime: **{reg.label}** (M={reg.m_multiplier:.2f})")
                             else:
@@ -366,12 +433,12 @@ with tab1:
                     # Default: Z-Score regime detection
                     reg = z_to_regime(macro_z_eff)
 
-                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                 col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
                 col_m2.metric("Regime", reg.label)
                 col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
+                col_m4.metric("Method", detection_method)
 
-                detection_method = "HMM" if (use_hmm_regime and hmm_model is not None) else "Z-Score"
                 st.success(f"✓ FRED data fetched. Regime detection: **{detection_method}** | Current: **{reg.label}** (M={reg.m_multiplier:.2f})")
 
                 # Charts & details
@@ -395,8 +462,80 @@ with tab1:
                     if display_cols:
                         st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
 
+                # Random Forest diagnostics (if enabled)
+                if "Random Forest" in regime_method and rf_model is not None:
+                    with st.expander("🌳 Random Forest Regime Analysis"):
+                        st.markdown(f"**Random Forest Classifier (Supervised Learning)**")
+                        st.markdown("Based on Breiman (2001) - Random Forests | Ballings et al. (2015) - Stock Price Direction Prediction")
+
+                        # Current regime probabilities
+                        try:
+                            regime_probs = rf_model.get_regime_probabilities(features_df)
+                            st.markdown("**Current Regime Probabilities:**")
+                            prob_df = pd.DataFrame({
+                                'Regime': list(regime_probs.keys()),
+                                'Probability': list(regime_probs.values())
+                            }).sort_values('Probability', ascending=False)
+                            prob_df['M_multiplier'] = prob_df['Regime'].map({
+                                'CRISIS': 0.6, 'BEAR': 0.8, 'NEUTRAL': 1.0, 'BULL': 1.2
+                            })
+                            prob_df['Beta_cap'] = prob_df['Regime'].map({
+                                'CRISIS': 0.7, 'BEAR': 0.9, 'NEUTRAL': 1.0, 'BULL': 1.3
+                            })
+
+                            st.dataframe(prob_df.style.format({
+                                'Probability': '{:.1%}',
+                                'M_multiplier': '{:.2f}',
+                                'Beta_cap': '{:.2f}'
+                            }), use_container_width=True)
+
+                            # Feature importance
+                            st.markdown("---")
+                            st.markdown("**Feature Importance (Top 10):**")
+                            st.caption("Shows which features matter most for regime classification")
+
+                            feature_importance = rf_model.get_feature_importance(top_n=10)
+
+                            if HAVE_PLOTLY:
+                                fig_imp = go.Figure(go.Bar(
+                                    x=feature_importance.values,
+                                    y=feature_importance.index,
+                                    orientation='h',
+                                    marker=dict(color=feature_importance.values, colorscale='Viridis')
+                                ))
+                                fig_imp.update_layout(
+                                    title="Feature Importance",
+                                    xaxis_title="Importance",
+                                    yaxis_title="Feature",
+                                    height=400,
+                                    yaxis={'categoryorder': 'total ascending'}
+                                )
+                                st.plotly_chart(fig_imp, use_container_width=True)
+                            else:
+                                st.bar_chart(feature_importance)
+
+                            # Model quality metrics
+                            st.markdown("---")
+                            st.markdown("**Model Quality:**")
+                            qual_col1, qual_col2 = st.columns(2)
+                            with qual_col1:
+                                st.metric("Cross-Validation Accuracy", f"{rf_model.cv_score:.1%}")
+                            with qual_col2:
+                                st.metric("Number of Trees", rf_model.n_estimators)
+
+                            st.info(f"""
+                            **Training Details:**
+                            - Trained on {len(features_df)} days of historical data
+                            - Labeled periods: 2008 GFC, 2020 COVID crash, 2022 bear market
+                            - Features: macro z-scores + momentum + volatility + drawdown
+                            - Validation: {rf_model.cv_score:.1%} accuracy (5-fold CV)
+                            """)
+
+                        except Exception as e_rf_diag:
+                            st.warning(f"Could not display Random Forest diagnostics: {e_rf_diag}")
+
                 # HMM diagnostics (if enabled)
-                if use_hmm_regime and hmm_model is not None:
+                if "HMM" in regime_method and hmm_model is not None:
                     with st.expander("🧠 HMM Regime Analysis"):
                         st.markdown(f"**Hidden Markov Model with {n_hmm_states} States**")
                         st.markdown("Based on Hamilton (1989) - State-Space Models with Regime Switching")
