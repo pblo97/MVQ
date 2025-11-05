@@ -51,9 +51,8 @@ st.caption("Kelly Fraccional + Macro Régimen + Quality Score 3D + Exit Monitori
 persist = PortfolioStatePersistence(snapshots_dir="snapshots/")
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "📊 Portfolio Overview",
-    "🌐 Macro Monitor",
     "⚠️ Risk Analytics",
     "🚪 Asset Quality & Exits",
     "📈 Backtest & Reports"
@@ -330,6 +329,8 @@ with tab1:
     hmm_model = None
     rf_model = None
     current_regime_state = None
+    detection_method = "Z-Score"
+    reg = z_to_regime(0.0)  # Default regime
 
     if fred_api_key and fred_api_key.strip():
         try:
@@ -345,26 +346,31 @@ with tab1:
                     verbose=False
                 )
 
-            # Show diagnostic messages
-            with st.expander("🔍 FRED Fetch Diagnostics", expanded=(result_df.empty)):
-                for msg in messages:
-                    if "❌" in msg or "Failed" in msg:
-                        st.error(msg)
-                    elif "⚠️" in msg:
-                        st.warning(msg)
-                    else:
-                        st.info(msg)
+            # Show diagnostic messages (only if there are errors/warnings)
+            has_errors = any("❌" in msg or "Failed" in msg or "⚠️" in msg for msg in messages)
+            if has_errors or result_df.empty:
+                with st.expander("🔍 FRED Fetch Diagnostics", expanded=True):
+                    for msg in messages:
+                        if "❌" in msg or "Failed" in msg:
+                            st.error(msg)
+                        elif "⚠️" in msg:
+                            st.warning(msg)
+                        else:
+                            st.info(msg)
 
             if result_df.empty:
-                st.warning("⚠️ No FRED data fetched. Using default macro_z = 0.0 (NEUTRAL)")
-                st.info("""
-                **Troubleshooting:**
-                1. **Check API Key:** Verify your FRED API key is valid
-                2. **Get API Key:** https://fred.stlouisfed.org/docs/api/api_key.html
-                3. **Network:** Ensure you can access FRED API (not blocked by firewall)
-                4. **Check diagnostics above** for specific error messages
-                """)
+                st.warning("⚠️ No FRED data available. Using default regime: NEUTRAL (M=1.0)")
+                if "HMM" in regime_method or "Random Forest" in regime_method:
+                    st.info(f"""
+                    💡 **{regime_method}** requires FRED macro data to function.
+                    Using **Z-Score (default)** instead with neutral regime.
+
+                    To enable {regime_method}:
+                    1. Get free API key: https://fred.stlouisfed.org/docs/api/api_key.html
+                    2. Enter key above and reload
+                    """)
                 macro_z_eff = 0.0
+                reg = z_to_regime(macro_z_eff)
             else:
                 # Regime detection: Z-Score, HMM, or Random Forest
                 detection_method = "Z-Score"
@@ -594,35 +600,28 @@ with tab1:
                             st.warning(f"Could not display HMM diagnostics: {e_diag}")
 
         except Exception as e:
-            st.error(f"❌ Error fetching FRED data or calculating z-score: {e}")
-            st.exception(e)
-            st.warning("Using default macro_z = 0.0 (NEUTRAL)")
+            st.error(f"❌ Error fetching FRED data: {e}")
+            st.warning("Using default regime: NEUTRAL (M=1.0)")
             macro_z_eff = 0.0
+            reg = z_to_regime(macro_z_eff)
     else:
+        # No FRED API key provided
         st.info("""
-        **Macro z-score calculation (Auto-fetch from FRED)**
+        **📊 Macro Regime Detection (Optional)**
 
-        **Required:** FRED API Key (free)
-        👉 Get yours at: https://fred.stlouisfed.org/docs/api/api_key.html
+        **Current status:** Using default regime: **NEUTRAL** (M_macro = 1.0)
 
-        **What this does:**
-        1. Automatically fetches indicators from FRED:
-           - **$ family:** RRPONTSYD (RRP), WTREGEN (TGA), WRESBAL (Reserves), WALCL (Fed Balance)
-           - **bp family:** SOFR, EFFR, OBFR, TGCRRATE (Repo), BAMLH0A0HYM2 (HY OAS), T10Y2Y (Curve)
+        **To enable advanced regime detection** (Z-Score, HMM, Random Forest):
+        1. Get free FRED API key: https://fred.stlouisfed.org/docs/api/api_key.html
+        2. Enter key above
 
-        2. Calculates Net Liquidity: `NL = WRESBAL - WTREGEN - RRPONTSYD`
+        **What FRED data enables:**
+        - Macro indicators: Fed liquidity, rates, spreads, yield curve
+        - Automatic regime classification (CRISIS/BEAR/NEUTRAL/BULL)
+        - Dynamic M_macro multiplier based on market conditions
+        - HMM and Random Forest regime detection
 
-        3. Computes z-score using **MacroArimax method:**
-           - Normalization by families ($ billions separate from bp)
-           - Economic signs (drain vs inject liquidity)
-           - Winsorization p1-p99 + clip |z| ≤ 3.5
-           - Rolling window: 252d (annual) or 126d (semi-annual)
-
-        4. Returns composite z-score → regime (ON/NEUTRAL/OFF) → M_macro multiplier
-
-        **Without API key:** uses default macro_z = 0.0 (NEUTRAL regime)
-
-        **Note:** This is the same calculation as your MacroArimax/liquidity stress program!
+        **Note:** Portfolio optimization works without FRED (using M_macro = 1.0)
         """)
 
     st.session_state['macro_z_eff'] = macro_z_eff
@@ -1145,61 +1144,8 @@ with tab1:
             except Exception as e:
                 st.error(f"Error saving state: {e}")
 
-# ==================== TAB 2: MACRO MONITOR ====================
+# ==================== TAB 2: RISK ANALYTICS ====================
 with tab2:
-    st.subheader("🌐 Macro Monitor")
-
-    if macro_bundle is not None and HAVE_PLOTLY:
-        # Z-score gauge
-        macro_z_val = st.session_state.get('macro_z_eff', 0.0)
-        reg = z_to_regime(macro_z_val)
-
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Macro Z-Score", f"{macro_z_val:.2f}")
-        col_m2.metric("Regime", reg.label)
-        col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
-
-        # Gauge
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=reg.m_multiplier,
-            gauge={"axis": {"range": [0.6, 1.3]}, "bar": {"color": "darkblue"}},
-            title={"text": "M_macro Multiplier"}
-        ))
-        st.plotly_chart(fig_gauge, use_container_width=True)
-
-        # Composite Z timeline
-        if 'COMPOSITE_Z' in macro_bundle.columns:
-            fig_comp = px.line(
-                macro_bundle.rename_axis('Date').reset_index(),
-                x='Date',
-                y='COMPOSITE_Z',
-                title="Composite Z-Score Timeline"
-            )
-            st.plotly_chart(fig_comp, use_container_width=True)
-
-        # Overlay signal
-        if 'Overlay_Signal' in macro_bundle.columns:
-            fig_overlay = px.step(
-                macro_bundle.rename_axis('Date').reset_index(),
-                x='Date',
-                y='Overlay_Signal',
-                title="Overlay Signal (0/1)"
-            )
-            st.plotly_chart(fig_overlay, use_container_width=True)
-
-    else:
-        st.info("Upload or auto-load `macro_monitor_bundle.csv` to view macro charts")
-        st.markdown("""
-        **Macro Monitor generates:**
-        - COMPOSITE_Z (Term, Credit, Liquidity, USD)
-        - Overlay Signal (grid-search OOS)
-        - Markov regime probabilities
-        - Suggested beta_cap & pos_cap per regime
-        """)
-
-# ==================== TAB 3: RISK ANALYTICS ====================
-with tab3:
     st.subheader("⚠️ Risk Analytics")
 
     portfolio_df = st.session_state.get('portfolio_df')
@@ -1352,8 +1298,8 @@ with tab3:
         st.error(f"Error calculating CVaR: {e}")
         st.exception(e)
 
-# ==================== TAB 4: ASSET QUALITY & EXITS ====================
-with tab4:
+# ==================== TAB 3: ASSET QUALITY & EXITS ====================
+with tab3:
     st.subheader("🚪 Asset Quality & Exit Signals")
 
     # Quality scores table
@@ -1527,8 +1473,8 @@ with tab4:
     except Exception as e:
         st.error(f"Error building exit table: {e}")
 
-# ==================== TAB 5: BACKTEST & REPORTS ====================
-with tab5:
+# ==================== TAB 4: BACKTEST & REPORTS ====================
+with tab4:
     st.subheader("📈 Walk-Forward Backtest & Historical Reports")
 
     # Walk-Forward Backtest Section
@@ -1538,6 +1484,8 @@ with tab5:
     - Train on rolling window → Test on next period → Step forward
     - No look-ahead bias, simulates real trading conditions
     - Comprehensive metrics: Sharpe, Sortino, Information Ratio, Calmar, Max Drawdown
+
+    **Note:** Backtest runs independently - no need to save portfolio states first!
     """)
 
     # Backtest Configuration
@@ -1988,13 +1936,14 @@ with tab5:
             st.error(f"❌ Parameter search error: {e_ps}")
             st.exception(e_ps)
 
-    # Available snapshots
+    # Available snapshots (Optional Feature)
     st.markdown("---")
-    st.markdown("### Historical Portfolio Snapshots")
+    st.markdown("### Historical Portfolio Snapshots (Optional)")
+    st.caption("View previously saved portfolio states from Tab 1. This is separate from the backtest above.")
     try:
         dates_avail = persist.list_available_dates()
         if dates_avail:
-            st.write(f"Found {len(dates_avail)} snapshots:")
+            st.write(f"✓ Found {len(dates_avail)} saved snapshots:")
             st.write(", ".join(dates_avail[-10:]))  # últimos 10
 
             # Load specific date
@@ -2005,7 +1954,7 @@ with tab5:
                     st.dataframe(state['portfolio'], use_container_width=True)
                     st.success(f"✓ Loaded state from {sel_date}")
         else:
-            st.write("No snapshots found. Save a portfolio state in Tab 1 first.")
+            st.info("💡 No snapshots saved yet. To save portfolio states, go to Tab 1 and click 'Save Portfolio State'.")
     except Exception as e:
         st.warning(f"Could not list snapshots: {e}")
 
