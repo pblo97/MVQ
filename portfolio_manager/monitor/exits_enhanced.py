@@ -1,9 +1,12 @@
 # portfolio_manager/monitor/exits_enhanced.py
 """
-Enhanced Exit Monitoring with Piotroski F-Score Integration
+Enhanced Exit Monitoring with Piotroski F-Score & Mohanram G-Score Integration
 
-Extends qvm_trend/pm/exits.py with robust fundamental degradation detection
-using Piotroski F-Score (academic best practice).
+Extends qvm_trend/pm/exits.py with robust fundamental degradation detection:
+- Piotroski F-Score (2000): For VALUE stocks (high B/M)
+- Mohanram G-Score (2005): For GROWTH stocks (low B/M)
+
+Academic best practices for fundamental quality assessment.
 """
 from __future__ import annotations
 import numpy as np
@@ -16,8 +19,9 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from qvm_trend.pm.exits import _ma, _mom_12_1, _next_q_end
 
-# Import Piotroski module
+# Import Piotroski & Mohanram modules
 from portfolio_manager.fundamentals.piotroski import detect_fundamental_degradation
+from portfolio_manager.fundamentals.mohanram import detect_growth_degradation
 
 
 def build_exit_table_enhanced(
@@ -28,10 +32,12 @@ def build_exit_table_enhanced(
     mom_lookback: int = 252,
     review_freq: str = "Q",
     # Fundamental degradation options
-    piotroski_hist: Optional[pd.DataFrame] = None,  # History of Piotroski F-Scores
+    piotroski_hist: Optional[pd.DataFrame] = None,  # History of Piotroski F-Scores (VALUE stocks)
+    mohanram_hist: Optional[pd.DataFrame] = None,    # History of Mohanram G-Scores (GROWTH stocks)
     vfq_hist: Optional[pd.DataFrame] = None,         # Legacy VFQ history (fallback)
     use_piotroski: bool = True,                      # Use Piotroski (default) vs VFQ
-    degradation_threshold: int = 2,                  # F-Score drop indicating degradation
+    use_mohanram: bool = False,                      # Use Mohanram for GROWTH stocks
+    degradation_threshold: int = 2,                  # F-Score/G-Score drop indicating degradation
     vfq_col: str = "VFQ",
     vfq_delta_thr: float = 0.10
 ) -> pd.DataFrame:
@@ -92,8 +98,33 @@ def build_exit_table_enhanced(
 
         # ========== FUNDAMENTAL DEGRADATION ==========
 
-        if use_piotroski and piotroski_hist is not None and not piotroski_hist.empty:
-            # Use Piotroski F-Score
+        fund_signal_type = None  # Track which signal was used
+
+        if use_mohanram and mohanram_hist is not None and not mohanram_hist.empty:
+            # Use Mohanram G-Score (GROWTH stocks)
+            try:
+                growth_info = detect_growth_degradation(
+                    mohanram_hist=mohanram_hist,
+                    symbol=sym,
+                    degradation_threshold=degradation_threshold
+                )
+
+                f_last = growth_info['g_score_last']
+                f_prev = growth_info['g_score_prev']
+                f_delta = growth_info['g_score_delta']
+                fund_flag = growth_info['degradation_flag']
+                fund_signal_type = "Mohanram G-Score"
+            except Exception:
+                # Mohanram failed, try Piotroski
+                use_mohanram_failed = True
+            else:
+                use_mohanram_failed = False
+        else:
+            use_mohanram_failed = False
+
+        # Fallback to Piotroski if Mohanram not used or failed
+        if (not use_mohanram or use_mohanram_failed) and use_piotroski and piotroski_hist is not None and not piotroski_hist.empty:
+            # Use Piotroski F-Score (VALUE stocks)
             fund_info = detect_fundamental_degradation(
                 piotroski_hist=piotroski_hist,
                 symbol=sym,
@@ -104,8 +135,9 @@ def build_exit_table_enhanced(
             f_prev = fund_info['f_score_prev']
             f_delta = fund_info['f_score_delta']
             fund_flag = fund_info['degradation_flag']
+            fund_signal_type = "Piotroski F-Score"
 
-        else:
+        elif (not use_mohanram or use_mohanram_failed) and not use_piotroski:
             # Fallback to VFQ (legacy system)
             if vfq_hist is not None and not vfq_hist.empty:
                 from qvm_trend.pm.exits import _vfq_trend
@@ -115,12 +147,21 @@ def build_exit_table_enhanced(
                 f_delta = vfq_info.get('vfq_chg_1q', np.nan)
                 f_prev = float(f_last - f_delta) if np.isfinite(f_last) and np.isfinite(f_delta) else np.nan
                 fund_flag = vfq_info.get('vfq_trend', 'N/A')
+                fund_signal_type = "VFQ"
             else:
                 # No fundamental data
                 f_last = np.nan
                 f_prev = np.nan
                 f_delta = np.nan
                 fund_flag = 'N/A'
+                fund_signal_type = None
+        elif use_mohanram_failed and not (use_piotroski and piotroski_hist is not None):
+            # Mohanram failed and no Piotroski available
+            f_last = np.nan
+            f_prev = np.nan
+            f_delta = np.nan
+            fund_flag = 'N/A'
+            fund_signal_type = None
 
         # ========== EXIT LOGIC ==========
 
@@ -130,8 +171,10 @@ def build_exit_table_enhanced(
         if mom_flag:
             reasons.append("Momentum 12-1 < 0")
         if fund_flag == "Degrading":
-            signal_type = "Piotroski" if (use_piotroski and piotroski_hist is not None) else "VFQ"
-            reasons.append(f"Fundamentals ↓ ({signal_type})")
+            if fund_signal_type:
+                reasons.append(f"Fundamentals ↓ ({fund_signal_type})")
+            else:
+                reasons.append("Fundamentals ↓")
 
         # Action rules
         action = "HOLD"

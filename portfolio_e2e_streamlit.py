@@ -909,13 +909,21 @@ with tab4:
     st.markdown("### Exit Signals (MA200, Momentum 12-1, Fundamental Degradation)")
 
     # Configuration
-    col_ex1, col_ex2, col_ex3 = st.columns(3)
+    col_ex1, col_ex2, col_ex3, col_ex4 = st.columns(4)
     with col_ex1:
         ma_window = st.number_input("MA Window (days)", 100, 400, 200, 10)
     with col_ex2:
         mom_lookback = st.number_input("Momentum Lookback (days)", 180, 400, 252, 10)
     with col_ex3:
-        use_piotroski = st.checkbox("Use Piotroski F-Score", value=True, help="Piotroski F-Score (9 signals) vs legacy VFQ")
+        use_piotroski = st.checkbox("Use Piotroski F-Score", value=True, help="Piotroski (VALUE stocks)")
+    with col_ex4:
+        use_mohanram = st.checkbox("Use Mohanram G-Score", value=False, help="Mohanram (GROWTH stocks)")
+
+    # Educational note
+    if use_piotroski and use_mohanram:
+        st.info("💡 **Dual Mode:** Piotroski for VALUE (high B/M) | Mohanram for GROWTH (low B/M)")
+    elif use_mohanram:
+        st.info("💡 **Mohanram G-Score:** For GROWTH stocks. Focuses on R&D, Capex, advertising (Mohanram 2005)")
 
     # Calculate Piotroski historical scores if needed
     piotroski_hist = None
@@ -929,7 +937,7 @@ with tab4:
                     st.success(f"✓ Piotroski F-Scores calculated for {len(piotroski_hist['symbol'].unique())} symbols")
 
                     # Show Piotroski summary
-                    with st.expander("📈 Piotroski F-Score Summary"):
+                    with st.expander("📈 Piotroski F-Score Summary (VALUE stocks)"):
                         # Latest scores
                         latest_scores = piotroski_hist.sort_values('date').groupby('symbol').tail(1)[['symbol', 'date', 'F_SCORE']]
                         st.markdown("**Latest F-Scores:**")
@@ -944,6 +952,8 @@ with tab4:
                         - **0-2:** Weak fundamentals
 
                         **9 Signals:** ROA>0, CFO>0, ΔROA>0, Accrual<0, ΔLEVER<0, ΔLIQUID>0, EQ_OFFER=0, ΔMARGIN>0, ΔTURN>0
+
+                        **Best for:** VALUE stocks (high Book-to-Market)
                         """)
                 else:
                     st.warning("⚠️ Could not calculate Piotroski scores (insufficient fundamental data)")
@@ -951,10 +961,51 @@ with tab4:
                 st.error(f"Error calculating Piotroski: {e}")
                 st.warning("Falling back to technical signals only")
 
+    # Calculate Mohanram historical scores if needed
+    mohanram_hist = None
+    if use_mohanram and fmp_key:
+        with st.spinner("📊 Calculating Mohanram G-Scores (quarterly)..."):
+            try:
+                from portfolio_manager.fundamentals.mohanram import calculate_mohanram_history
+                mohanram_hist = calculate_mohanram_history(symbols, fmp_key)
+
+                if not mohanram_hist.empty:
+                    st.success(f"✓ Mohanram G-Scores calculated for {len(mohanram_hist['symbol'].unique())} symbols")
+
+                    # Show Mohanram summary
+                    with st.expander("📈 Mohanram G-Score Summary (GROWTH stocks)"):
+                        # Latest scores
+                        latest_scores = mohanram_hist.sort_values('date').groupby('symbol').tail(1)[['symbol', 'date', 'G_SCORE']]
+                        st.markdown("**Latest G-Scores:**")
+                        st.dataframe(latest_scores.sort_values('G_SCORE', ascending=False), use_container_width=True)
+
+                        st.markdown("""
+                        **Interpretation (Mohanram 2005):**
+                        - **7-8:** Excellent growth quality
+                        - **6:** Strong growth fundamentals
+                        - **4-5:** Above average
+                        - **2-3:** Below average
+                        - **0-1:** Weak growth fundamentals
+
+                        **8 Signals:**
+                        - Profitability: ROA, CFO, ROA > CFO
+                        - Stability: ROA variability, Sales variability
+                        - Investment: R&D, Capex, Advertising
+
+                        **Best for:** GROWTH stocks (low Book-to-Market)
+
+                        **Reference:** Mohanram (2005) - Separating Winners from Losers
+                        """)
+                else:
+                    st.warning("⚠️ Could not calculate Mohanram scores (insufficient fundamental data)")
+            except Exception as e:
+                st.error(f"Error calculating Mohanram: {e}")
+                st.warning("Falling back to technical signals only")
+
     try:
         price_panel = load_prices_panel(symbols + [bench], start_date.isoformat(), end_date.isoformat(), cache_key="e2e_exits")
 
-        # Use enhanced exit table with Piotroski
+        # Use enhanced exit table with Piotroski & Mohanram
         from portfolio_manager.monitor.exits_enhanced import build_exit_table_enhanced
 
         exit_table = build_exit_table_enhanced(
@@ -964,9 +1015,11 @@ with tab4:
             mom_lookback=int(mom_lookback),
             review_freq="Q",
             piotroski_hist=piotroski_hist,
+            mohanram_hist=mohanram_hist,  # Mohanram G-Score (GROWTH stocks)
             vfq_hist=None,  # Legacy fallback
             use_piotroski=use_piotroski,
-            degradation_threshold=2,  # F-Score drop ≥ 2 = degradation
+            use_mohanram=use_mohanram,
+            degradation_threshold=2,  # F/G-Score drop ≥ 2 = degradation
             vfq_col="VFQ",
             vfq_delta_thr=0.10
         )
