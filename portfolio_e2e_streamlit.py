@@ -158,6 +158,69 @@ with st.sidebar:
         help="Kelly = return-optimized | HRP = risk-diversified"
     )
 
+    # Transaction costs (advanced)
+    st.markdown("---")
+    st.subheader("💰 Transaction Costs (Advanced)")
+    with st.expander("📚 About Transaction Costs in Optimization"):
+        st.markdown("""
+        **Why integrate costs into optimization?**
+
+        Traditional Kelly ignores transaction costs → **overtrading**.
+
+        **Kelly with Transaction Costs (Gârleanu & Pedersen 2013):**
+
+        Objective: `max E[log(1 + R)] - λ × cost × turnover`
+
+        - **E[log(1 + R)]**: Kelly growth objective
+        - **turnover**: ||w_new - w_old||₁ (sum of absolute weight changes)
+        - **cost**: Transaction cost rate (bps)
+        - **λ**: Cost penalty multiplier (sensitivity)
+
+        **Trade-off:**
+        - Higher returns vs Lower turnover
+        - Automatically reduces rebalancing frequency
+        - More realistic performance estimates
+
+        **When to use:**
+        - Portfolios rebalanced frequently (monthly, weekly)
+        - High-cost assets (illiquid, large positions)
+        - Transaction costs > 5 bps
+
+        **Academic References:**
+        - Gârleanu & Pedersen (2013): Dynamic Trading with Predictable Returns and Transaction Costs
+        - Liu & Loewenstein (2002): Optimal Portfolio Selection with Transaction Costs
+        """)
+
+    use_transaction_costs = st.checkbox(
+        "Integrate Transaction Costs into Optimization",
+        value=False,
+        help="Trades off growth vs turnover (Gârleanu & Pedersen 2013)"
+    )
+
+    if use_transaction_costs:
+        col_tc1, col_tc2 = st.columns(2)
+        with col_tc1:
+            transaction_cost_bps = st.number_input(
+                "Transaction Cost (bps)",
+                min_value=0.0,
+                max_value=100.0,
+                value=10.0,
+                step=1.0,
+                help="Round-trip cost per trade (e.g., 10 bps = 0.1%)"
+            )
+        with col_tc2:
+            cost_penalty_lambda = st.slider(
+                "Cost Penalty λ",
+                min_value=0.1,
+                max_value=10.0,
+                value=1.0,
+                step=0.1,
+                help="Higher λ = more cost-averse (reduces turnover)"
+            )
+    else:
+        transaction_cost_bps = 10.0
+        cost_penalty_lambda = 1.0
+
     st.markdown("---")
     st.subheader("Caps & Constraints")
     beta_cap_user = st.number_input("Beta Cap (Σβ·w)", 0.25, 2.0, 1.2, 0.05)
