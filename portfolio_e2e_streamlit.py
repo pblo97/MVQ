@@ -270,9 +270,31 @@ with tab1:
             help="252d = annual, 126d = semi-annual"
         )
 
+    # HMM vs Z-Score regime detection
+    st.markdown("**Regime Detection Method:**")
+    col_regime1, col_regime2 = st.columns(2)
+    with col_regime1:
+        use_hmm_regime = st.checkbox(
+            "Use HMM Regime Detection",
+            value=False,
+            help="Hidden Markov Model for regime detection (Hamilton 1989) - More sophisticated than z-score"
+        )
+    with col_regime2:
+        if use_hmm_regime:
+            n_hmm_states = st.selectbox(
+                "HMM States",
+                options=[2, 3, 4],
+                index=1,
+                help="2=BEAR/BULL, 3=BEAR/NEUTRAL/BULL, 4=CRISIS/BEAR/NEUTRAL/BULL"
+            )
+        else:
+            n_hmm_states = 3
+
     macro_z_eff = 0.0
     macro_bundle = None
     result_df = None
+    hmm_model = None
+    current_regime_state = None
 
     if fred_api_key and fred_api_key.strip():
         try:
@@ -309,14 +331,48 @@ with tab1:
                 """)
                 macro_z_eff = 0.0
             else:
-                reg = z_to_regime(macro_z_eff)
+                # Regime detection: HMM or Z-Score
+                if use_hmm_regime and not result_df.empty:
+                    try:
+                        from portfolio_manager.regime.hmm_regime import HiddenMarkovRegime
+
+                        with st.spinner("🔄 Training HMM on macro features..."):
+                            # Prepare features for HMM
+                            feature_cols = [col for col in result_df.columns if col.endswith('_z') or col == 'composite_z']
+                            features_df = result_df[feature_cols].dropna()
+
+                            if len(features_df) >= 126:  # At least 6 months of data
+                                # Train HMM
+                                hmm_model = HiddenMarkovRegime(
+                                    n_states=n_hmm_states,
+                                    covariance_type='full',
+                                    n_iter=100,
+                                    random_state=42
+                                )
+                                hmm_model.fit(features_df)
+
+                                # Get current regime
+                                current_regime_state = hmm_model.predict_regime(features_df)
+                                reg = current_regime_state
+
+                                st.success(f"✓ HMM trained with {n_hmm_states} states. Current regime: **{reg.label}** (M={reg.m_multiplier:.2f})")
+                            else:
+                                st.warning("⚠️ Insufficient data for HMM (need ≥126 days). Falling back to z-score.")
+                                reg = z_to_regime(macro_z_eff)
+                    except Exception as e_hmm:
+                        st.warning(f"⚠️ HMM failed: {e_hmm}. Falling back to z-score.")
+                        reg = z_to_regime(macro_z_eff)
+                else:
+                    # Default: Z-Score regime detection
+                    reg = z_to_regime(macro_z_eff)
 
                 col_m1, col_m2, col_m3 = st.columns(3)
                 col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
                 col_m2.metric("Regime", reg.label)
                 col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
 
-                st.success(f"✓ FRED data fetched & z-score calculated: **{macro_z_eff:.2f}** (Regime: {reg.label})")
+                detection_method = "HMM" if (use_hmm_regime and hmm_model is not None) else "Z-Score"
+                st.success(f"✓ FRED data fetched. Regime detection: **{detection_method}** | Current: **{reg.label}** (M={reg.m_multiplier:.2f})")
 
                 # Charts & details
                 with st.expander("📈 View composite z-score timeline & breakdown"):
@@ -338,6 +394,65 @@ with tab1:
                     display_cols = [col for col in result_df.columns if col.endswith('_z')]
                     if display_cols:
                         st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
+
+                # HMM diagnostics (if enabled)
+                if use_hmm_regime and hmm_model is not None:
+                    with st.expander("🧠 HMM Regime Analysis"):
+                        st.markdown(f"**Hidden Markov Model with {n_hmm_states} States**")
+                        st.markdown("Based on Hamilton (1989) - State-Space Models with Regime Switching")
+
+                        # Current regime probabilities
+                        try:
+                            regime_probs = hmm_model.get_regime_probabilities(features_df)
+                            st.markdown("**Current Regime Probabilities:**")
+                            prob_df = pd.DataFrame({
+                                'State': [s.label for s in hmm_model.regime_states.values()],
+                                'Probability': regime_probs,
+                                'M_multiplier': [s.m_multiplier for s in hmm_model.regime_states.values()],
+                                'Beta_cap': [s.beta_cap for s in hmm_model.regime_states.values()]
+                            })
+                            st.dataframe(prob_df.style.format({'Probability': '{:.2%}', 'M_multiplier': '{:.2f}', 'Beta_cap': '{:.2f}'}), use_container_width=True)
+
+                            # Transition matrix
+                            st.markdown("**Regime Transition Matrix:**")
+                            transition_analysis = hmm_model.analyze_transitions()
+                            trans_matrix = transition_analysis['transition_matrix']
+
+                            # Create heatmap
+                            if HAVE_PLOTLY:
+                                state_labels = [s.label for s in hmm_model.regime_states.values()]
+                                fig_trans = go.Figure(data=go.Heatmap(
+                                    z=trans_matrix,
+                                    x=state_labels,
+                                    y=state_labels,
+                                    colorscale='RdYlGn',
+                                    text=trans_matrix,
+                                    texttemplate='%{text:.2%}',
+                                    textfont={"size": 12}
+                                ))
+                                fig_trans.update_layout(
+                                    title="Transition Probabilities (From → To)",
+                                    xaxis_title="To State",
+                                    yaxis_title="From State",
+                                    height=400
+                                )
+                                st.plotly_chart(fig_trans, use_container_width=True)
+                            else:
+                                st.dataframe(pd.DataFrame(trans_matrix,
+                                    columns=[s.label for s in hmm_model.regime_states.values()],
+                                    index=[s.label for s in hmm_model.regime_states.values()]
+                                ).style.format('{:.2%}'), use_container_width=True)
+
+                            # Regime persistence
+                            st.markdown("**Regime Persistence:**")
+                            persistence_col1, persistence_col2 = st.columns(2)
+                            with persistence_col1:
+                                st.metric("Average Persistence", f"{transition_analysis['average_persistence']:.2%}")
+                            with persistence_col2:
+                                st.metric("Most Stable Regime", transition_analysis['most_persistent_regime'].label)
+
+                        except Exception as e_diag:
+                            st.warning(f"Could not display HMM diagnostics: {e_diag}")
 
         except Exception as e:
             st.error(f"❌ Error fetching FRED data or calculating z-score: {e}")
@@ -654,6 +769,160 @@ with tab1:
 
         except Exception as e:
             st.warning(f"Could not compute covariance diagnostics: {e}")
+
+    # Transaction costs diagnostics (if enabled)
+    if use_transaction_costs:
+        st.markdown("---")
+        st.markdown("### 💰 Transaction Costs Analysis")
+
+        try:
+            from portfolio_manager.allocation.kelly_with_costs import (
+                kelly_with_transaction_costs,
+                compare_with_without_costs,
+                optimal_rebalancing_frequency
+            )
+
+            with st.expander("📊 Transaction Cost Impact Analysis", expanded=False):
+                st.markdown("""
+                **Cost-Aware Kelly Optimization**
+
+                Objective: `max E[log(1 + R)] - λ × cost × turnover`
+
+                This analysis shows the trade-off between expected returns and transaction costs.
+                """)
+
+                # Get returns data
+                price_panel = load_prices_panel(symbols, start_date.isoformat(), end_date.isoformat(), cache_key="e2e_tc_diag")
+                returns_df = pd.DataFrame({
+                    sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                    for sym in symbols if sym in price_panel
+                }).dropna(how='all')
+
+                if not returns_df.empty and len(returns_df) >= 60:
+                    # Get current portfolio weights as "old" weights for comparison
+                    current_weights = portfolio_df.set_index('symbol')['weight']
+                    current_weights = current_weights.reindex(returns_df.columns, fill_value=0.0)
+
+                    # Run cost-aware optimization
+                    try:
+                        with st.spinner("Running cost-aware Kelly optimization..."):
+                            optimal_weights, diagnostics = kelly_with_transaction_costs(
+                                returns_df=returns_df,
+                                current_weights=current_weights,
+                                base_kelly=base_kelly,
+                                transaction_cost_bps=transaction_cost_bps,
+                                cost_penalty_lambda=cost_penalty_lambda,
+                                method='SLSQP'
+                            )
+
+                        # Display diagnostics
+                        st.markdown("**Optimization Results:**")
+                        diag_col1, diag_col2, diag_col3 = st.columns(3)
+
+                        with diag_col1:
+                            st.metric("Expected Return", f"{diagnostics['expected_return']:.2%}")
+                            st.metric("Expected Log Return", f"{diagnostics['expected_log_return']:.4f}")
+
+                        with diag_col2:
+                            st.metric("Turnover", f"{diagnostics['turnover']:.4f}")
+                            st.metric("Transaction Cost", f"{diagnostics['transaction_cost']:.4f}")
+
+                        with diag_col3:
+                            st.metric("Net Objective", f"{diagnostics['net_objective']:.4f}")
+                            st.metric("Cost Impact", f"{diagnostics['transaction_cost'] / max(diagnostics['expected_log_return'], 1e-8):.1%}")
+
+                        # Compare with/without costs
+                        st.markdown("**With vs Without Transaction Costs:**")
+                        comparison = compare_with_without_costs(
+                            returns_df=returns_df,
+                            current_weights=current_weights,
+                            base_kelly=base_kelly,
+                            transaction_cost_bps=transaction_cost_bps,
+                            cost_penalty_lambda=cost_penalty_lambda
+                        )
+
+                        comp_df = pd.DataFrame({
+                            'Metric': ['Expected Return', 'Turnover', 'Transaction Cost', 'Net Return'],
+                            'Without Costs': [
+                                f"{comparison['without_costs']['expected_return']:.2%}",
+                                f"{comparison['without_costs']['turnover']:.4f}",
+                                "N/A",
+                                f"{comparison['without_costs']['expected_return']:.2%}"
+                            ],
+                            'With Costs': [
+                                f"{comparison['with_costs']['expected_return']:.2%}",
+                                f"{comparison['with_costs']['turnover']:.4f}",
+                                f"{comparison['with_costs']['transaction_cost']:.4f}",
+                                f"{comparison['with_costs']['net_return']:.2%}"
+                            ],
+                            'Difference': [
+                                f"{comparison['return_difference']:.2%}",
+                                f"{comparison['turnover_difference']:.4f}",
+                                "N/A",
+                                f"{comparison['return_difference']:.2%}"
+                            ]
+                        })
+                        st.dataframe(comp_df, use_container_width=True)
+
+                        # Rebalancing frequency analysis
+                        st.markdown("**Optimal Rebalancing Frequency:**")
+                        st.caption("Simulates different rebalancing frequencies to find optimal trade-off")
+
+                        rebal_analysis = optimal_rebalancing_frequency(
+                            returns_df=returns_df.iloc[-252:] if len(returns_df) > 252 else returns_df,  # Last year
+                            current_weights=current_weights,
+                            frequencies=[1, 5, 21, 63, 126],  # Daily, Weekly, Monthly, Quarterly, Semi-annual
+                            transaction_cost_bps=transaction_cost_bps
+                        )
+
+                        if HAVE_PLOTLY:
+                            fig_rebal = go.Figure()
+                            fig_rebal.add_trace(go.Scatter(
+                                x=rebal_analysis['frequency_label'],
+                                y=rebal_analysis['gross_return'],
+                                mode='lines+markers',
+                                name='Gross Return',
+                                line=dict(color='blue')
+                            ))
+                            fig_rebal.add_trace(go.Scatter(
+                                x=rebal_analysis['frequency_label'],
+                                y=rebal_analysis['net_return'],
+                                mode='lines+markers',
+                                name='Net Return (after costs)',
+                                line=dict(color='green')
+                            ))
+                            fig_rebal.update_layout(
+                                title="Rebalancing Frequency vs Returns",
+                                xaxis_title="Rebalancing Frequency",
+                                yaxis_title="Annualized Return",
+                                yaxis_tickformat='.1%',
+                                height=400
+                            )
+                            st.plotly_chart(fig_rebal, use_container_width=True)
+                        else:
+                            st.dataframe(rebal_analysis, use_container_width=True)
+
+                        optimal_freq = rebal_analysis.loc[rebal_analysis['net_return'].idxmax(), 'frequency_label']
+                        st.success(f"**Optimal frequency:** {optimal_freq} (maximizes net return)")
+
+                        st.caption("""
+                        **Interpretation:**
+                        - **Turnover**: Sum of absolute weight changes ||w_new - w_old||₁
+                        - **Transaction Cost**: Total cost paid for rebalancing
+                        - **Net Return**: Gross return minus transaction costs
+                        - **Optimal frequency**: Balance between staying up-to-date and minimizing costs
+
+                        **Academic Reference:** Gârleanu & Pedersen (2013) - Dynamic Trading with Predictable Returns and Transaction Costs
+                        """)
+
+                    except Exception as e_opt:
+                        st.error(f"Could not run cost-aware optimization: {e_opt}")
+                        st.exception(e_opt)
+                else:
+                    st.warning("Insufficient return data for transaction cost analysis (need ≥60 days)")
+
+        except Exception as e_tc:
+            st.warning(f"Could not load transaction cost analysis: {e_tc}")
 
     # Sizing section
     st.markdown("---")
@@ -1364,6 +1633,221 @@ with tab5:
         except Exception as e:
             st.error(f"❌ Backtest error: {e}")
             st.exception(e)
+
+    # Parameter Grid Search Section
+    st.markdown("---")
+    st.markdown("### 🔍 Parameter Grid Search & Cross-Validation")
+    st.markdown("""
+    **Hyperparameter optimization with walk-forward cross-validation** (Bergmeir & Benítez 2012):
+    - Grid search over Kelly parameters (base_kelly, lambda_corr, winsor_p)
+    - Time-series cross-validation (respects temporal order, no data snooping)
+    - Multiple scoring metrics: Sharpe, Sortino, Information Ratio, Calmar
+    - Risk-tolerance-based recommendations (conservative, moderate, aggressive)
+    """)
+
+    with st.expander("📚 About Parameter Grid Search"):
+        st.markdown("""
+        **Why parameter optimization?**
+
+        Default parameters may not be optimal for your specific universe and time period.
+        Grid search with cross-validation finds the best hyperparameters while avoiding overfitting.
+
+        **How it works:**
+        1. Define parameter grid (e.g., base_kelly: [0.10, 0.15, 0.20, 0.25])
+        2. For each parameter combination:
+           - Split data into N folds (walk-forward)
+           - Train on fold → test on next fold → step forward
+           - Calculate performance metric (e.g., Sharpe ratio)
+        3. Select best parameters based on average cross-validation score
+
+        **Academic References:**
+        - Bergmeir & Benítez (2012): On the use of cross-validation for time series predictor evaluation
+        - Harvey et al. (2016): ... and the Cross-Section of Expected Returns
+        - López de Prado (2018): Advances in Financial Machine Learning (Ch. 7)
+        """)
+
+    col_ps1, col_ps2 = st.columns(2)
+    with col_ps1:
+        risk_tolerance = st.selectbox(
+            "Risk Tolerance",
+            options=["Conservative", "Moderate", "Aggressive"],
+            index=1,
+            help="Conservative = lower Kelly, higher corr penalty | Aggressive = higher Kelly"
+        )
+    with col_ps2:
+        scoring_metric = st.selectbox(
+            "Scoring Metric",
+            options=["sharpe", "sortino", "information_ratio", "calmar"],
+            index=0,
+            help="Metric to optimize (higher is better)"
+        )
+
+    if st.button("🔍 Run Parameter Search", type="secondary"):
+        try:
+            from portfolio_manager.optimization.parameter_search import (
+                optimize_kelly_parameters,
+                recommend_parameters,
+                analyze_parameter_sensitivity
+            )
+
+            with st.spinner("🔄 Running parameter grid search... (this may take 2-5 minutes)"):
+                # Get returns data
+                price_panel = load_prices_panel(
+                    symbols + [bench],
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    cache_key="e2e_param_search"
+                )
+
+                returns_df = pd.DataFrame({
+                    sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                    for sym in symbols if sym in price_panel
+                }).dropna(how='all')
+
+                if returns_df.empty or len(returns_df) < 504:  # Need 2 years minimum
+                    st.error(f"❌ Insufficient data for parameter search. Need at least 504 days (~2 years)")
+                    st.stop()
+
+                # Get recommendations based on risk tolerance
+                st.markdown("**🎯 Recommended Parameters (Based on Risk Tolerance):**")
+                recommended = recommend_parameters(
+                    returns_df=returns_df,
+                    strategy_type='kelly',
+                    risk_tolerance=risk_tolerance.lower()
+                )
+
+                rec_col1, rec_col2, rec_col3 = st.columns(3)
+                with rec_col1:
+                    st.metric("Base Kelly", f"{recommended['base_kelly']:.2f}")
+                with rec_col2:
+                    st.metric("Lambda Corr", f"{recommended['lambda_corr']:.2f}")
+                with rec_col3:
+                    st.metric("Winsor p", f"{recommended['winsor_p']:.3f}")
+
+                st.info(f"**Rationale:** {recommended['rationale']}")
+
+                # Run grid search
+                st.markdown("---")
+                st.markdown("**🔬 Grid Search Results:**")
+
+                search_result = optimize_kelly_parameters(
+                    returns_df=returns_df,
+                    scoring=scoring_metric,
+                    n_splits=5,
+                    train_size=252,
+                    test_size=63,
+                    verbose=False
+                )
+
+                # Best parameters
+                st.success(f"✓ Grid search completed! Evaluated {search_result.total_evaluations} parameter combinations across {search_result.n_folds} folds")
+
+                st.markdown("**Best Parameters Found:**")
+                best_col1, best_col2, best_col3, best_col4 = st.columns(4)
+                with best_col1:
+                    st.metric("Base Kelly", f"{search_result.best_params['base_kelly']:.2f}")
+                with best_col2:
+                    st.metric("Lambda Corr", f"{search_result.best_params['lambda_corr']:.2f}")
+                with best_col3:
+                    st.metric("Winsor p", f"{search_result.best_params['winsor_p']:.3f}")
+                with best_col4:
+                    st.metric(f"Best {scoring_metric.title()}", f"{search_result.best_score:.3f}")
+
+                # CV results table
+                st.markdown("---")
+                st.markdown("**Cross-Validation Results (Top 10):**")
+                cv_results_display = search_result.cv_results.copy()
+                cv_results_display = cv_results_display.sort_values('mean_score', ascending=False).head(10)
+                cv_results_display = cv_results_display.reset_index(drop=True)
+
+                st.dataframe(
+                    cv_results_display.style.format({
+                        'base_kelly': '{:.2f}',
+                        'lambda_corr': '{:.2f}',
+                        'winsor_p': '{:.3f}',
+                        'mean_score': '{:.4f}',
+                        'std_score': '{:.4f}'
+                    }),
+                    use_container_width=True
+                )
+
+                # Parameter sensitivity analysis
+                st.markdown("---")
+                st.markdown("**Parameter Sensitivity Analysis:**")
+                st.caption("Shows impact of each parameter on performance (averaging over other parameters)")
+
+                sensitivity = analyze_parameter_sensitivity(
+                    returns_df=returns_df,
+                    param_grid={
+                        'base_kelly': [0.10, 0.15, 0.20, 0.25, 0.30],
+                        'lambda_corr': [0.0, 0.25, 0.50, 0.75, 1.0],
+                        'winsor_p': [0.005, 0.01, 0.02, 0.03]
+                    },
+                    scoring=scoring_metric,
+                    n_splits=3  # Fewer splits for sensitivity (faster)
+                )
+
+                if HAVE_PLOTLY:
+                    # Create subplots for each parameter
+                    from plotly.subplots import make_subplots
+
+                    param_names = list(sensitivity.keys())
+                    fig_sens = make_subplots(
+                        rows=1, cols=len(param_names),
+                        subplot_titles=[p.replace('_', ' ').title() for p in param_names]
+                    )
+
+                    for idx, (param_name, sens_df) in enumerate(sensitivity.items(), 1):
+                        fig_sens.add_trace(
+                            go.Scatter(
+                                x=sens_df['param_value'],
+                                y=sens_df['mean_score'],
+                                mode='lines+markers',
+                                name=param_name,
+                                error_y=dict(
+                                    type='data',
+                                    array=sens_df['std_score'],
+                                    visible=True
+                                )
+                            ),
+                            row=1, col=idx
+                        )
+
+                    fig_sens.update_layout(
+                        height=400,
+                        showlegend=False,
+                        title_text="Parameter Sensitivity (Mean ± Std)"
+                    )
+                    fig_sens.update_yaxes(title_text=scoring_metric.title(), row=1, col=1)
+
+                    st.plotly_chart(fig_sens, use_container_width=True)
+                else:
+                    for param_name, sens_df in sensitivity.items():
+                        st.markdown(f"**{param_name.replace('_', ' ').title()}:**")
+                        st.dataframe(sens_df, use_container_width=True)
+
+                # Download CV results
+                st.markdown("---")
+                st.download_button(
+                    "📥 Download Full CV Results",
+                    search_result.cv_results.to_csv(index=False).encode(),
+                    file_name=f"parameter_search_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                    mime="text/csv"
+                )
+
+                st.caption("""
+                **Interpretation:**
+                - **mean_score**: Average performance across all cross-validation folds
+                - **std_score**: Standard deviation (lower = more stable across folds)
+                - **Sensitivity**: Shows which parameters have the most impact on performance
+                - **Best practices**: Use parameters with high mean_score AND low std_score (robust)
+
+                **Note:** Top parameters may differ slightly from recommendations due to universe-specific characteristics
+                """)
+
+        except Exception as e_ps:
+            st.error(f"❌ Parameter search error: {e_ps}")
+            st.exception(e_ps)
 
     # Available snapshots
     st.markdown("---")
