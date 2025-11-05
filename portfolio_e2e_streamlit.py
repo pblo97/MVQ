@@ -1914,7 +1914,6 @@ with tab4:
                 with rec_col3:
                     st.metric("Winsor p", f"{recommended['winsor_p']:.3f}")
 
-                st.info(f"**Rationale:** {recommended['rationale']}")
                 progress_bar_ps.progress(45)
             except Exception as e_rec:
                 st.warning(f"⚠️ Could not generate recommendations: {e_rec}")
@@ -1954,7 +1953,7 @@ with tab4:
                 st.markdown("---")
                 st.markdown("**Cross-Validation Results (Top 10):**")
                 cv_results_display = search_result.cv_results.copy()
-                cv_results_display = cv_results_display.sort_values('mean_score', ascending=False).head(10)
+                cv_results_display = cv_results_display.sort_values(f'{scoring_metric}_mean', ascending=False).head(10)
                 cv_results_display = cv_results_display.reset_index(drop=True)
 
                 st.dataframe(
@@ -1962,8 +1961,8 @@ with tab4:
                         'base_kelly': '{:.2f}',
                         'lambda_corr': '{:.2f}',
                         'winsor_p': '{:.3f}',
-                        'mean_score': '{:.4f}',
-                        'std_score': '{:.4f}'
+                        f'{scoring_metric}_mean': '{:.4f}',
+                        f'{scoring_metric}_std': '{:.4f}'
                     }),
                     use_container_width=True
                 )
