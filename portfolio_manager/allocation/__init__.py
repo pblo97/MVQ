@@ -6,6 +6,7 @@ Includes:
 - HRP (Hierarchical Risk Parity) - López de Prado (2016)
 - Kelly Vectorial (Multivariate Kelly Criterion) - with robust covariance
 - Kelly with Transaction Costs - Gârleanu & Pedersen (2013)
+- Black-Litterman Model - Black & Litterman (1992)
 """
 
 from .hrp import (
@@ -31,6 +32,11 @@ from .kelly_with_costs import (
     turnover_aware_kelly
 )
 
+from .black_litterman import (
+    BlackLittermanOptimizer,
+    run_black_litterman
+)
+
 __all__ = [
     # HRP
     'compute_hrp_weights',
@@ -48,5 +54,8 @@ __all__ = [
     'kelly_with_transaction_costs',
     'compare_with_without_costs',
     'optimal_rebalancing_frequency',
-    'turnover_aware_kelly'
+    'turnover_aware_kelly',
+    # Black-Litterman
+    'BlackLittermanOptimizer',
+    'run_black_litterman'
 ]
