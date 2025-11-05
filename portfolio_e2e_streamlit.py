@@ -440,10 +440,12 @@ with tab1:
                         else:
                             st.warning("⚠️ Insufficient data for Random Forest (need ≥252 days / 1 year). Falling back to z-score.")
                             reg = z_to_regime(macro_z_eff)
+                            features_df = None
                 except Exception as e_rf:
                     st.warning(f"⚠️ Random Forest failed: {e_rf}. Falling back to z-score.")
                     st.exception(e_rf)
                     reg = z_to_regime(macro_z_eff)
+                    features_df = None
 
             elif "HMM" in regime_method and not result_df.empty:
                 try:
@@ -472,172 +474,176 @@ with tab1:
                         else:
                             st.warning("⚠️ Insufficient data for HMM (need ≥126 days). Falling back to z-score.")
                             reg = z_to_regime(macro_z_eff)
+                            features_df = None
+                            hmm_model = None
                 except Exception as e_hmm:
                     st.warning(f"⚠️ HMM failed: {e_hmm}. Falling back to z-score.")
+                    st.exception(e_hmm)
                     reg = z_to_regime(macro_z_eff)
+                    features_df = None
+                    hmm_model = None
+            else:
+                # Default: Z-Score regime detection
+                reg = z_to_regime(macro_z_eff)
+
+            # Display metrics and charts (outside the if-else blocks)
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
+            col_m2.metric("Regime", reg.label)
+            col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
+            col_m4.metric("Method", detection_method)
+
+            # Charts & details
+            with st.expander("📈 View composite z-score timeline & breakdown"):
+                if HAVE_PLOTLY:
+                    fig = px.line(
+                        result_df['composite_z'].rename_axis('Date').reset_index(),
+                        x='Date',
+                        y='composite_z',
+                        title="Composite Z-Score (MacroArimax Method)"
+                    )
+                    fig.add_hline(y=0.5, line_dash="dash", line_color="green", annotation_text="ON threshold")
+                    fig.add_hline(y=-0.5, line_dash="dash", line_color="red", annotation_text="OFF threshold")
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
-                    # Default: Z-Score regime detection
-                    reg = z_to_regime(macro_z_eff)
+                    st.line_chart(result_df['composite_z'])
 
-                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
-                col_m2.metric("Regime", reg.label)
-                col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
-                col_m4.metric("Method", detection_method)
+                # Show individual z-scores
+                st.markdown("**Individual z-scores (last 10 days):**")
+                display_cols = [col for col in result_df.columns if col.endswith('_z')]
+                if display_cols:
+                    st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
 
-                st.success(f"✓ FRED data fetched. Regime detection: **{detection_method}** | Current: **{reg.label}** (M={reg.m_multiplier:.2f})")
+            # Random Forest diagnostics (if enabled)
+            if "Random Forest" in regime_method and rf_model is not None and features_df is not None:
+                with st.expander("🌳 Random Forest Regime Analysis"):
+                    st.markdown(f"**Random Forest Classifier (Supervised Learning)**")
+                    st.markdown("Based on Breiman (2001) - Random Forests | Ballings et al. (2015) - Stock Price Direction Prediction")
 
-                # Charts & details
-                with st.expander("📈 View composite z-score timeline & breakdown"):
-                    if HAVE_PLOTLY:
-                        fig = px.line(
-                            result_df['composite_z'].rename_axis('Date').reset_index(),
-                            x='Date',
-                            y='composite_z',
-                            title="Composite Z-Score (MacroArimax Method)"
-                        )
-                        fig.add_hline(y=0.5, line_dash="dash", line_color="green", annotation_text="ON threshold")
-                        fig.add_hline(y=-0.5, line_dash="dash", line_color="red", annotation_text="OFF threshold")
-                        st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.line_chart(result_df['composite_z'])
+                    # Current regime probabilities
+                    try:
+                        regime_probs = rf_model.get_regime_probabilities(features_df)
+                        st.markdown("**Current Regime Probabilities:**")
+                        prob_df = pd.DataFrame({
+                            'Regime': list(regime_probs.keys()),
+                            'Probability': list(regime_probs.values())
+                        }).sort_values('Probability', ascending=False)
+                        prob_df['M_multiplier'] = prob_df['Regime'].map({
+                            'CRISIS': 0.6, 'BEAR': 0.8, 'NEUTRAL': 1.0, 'BULL': 1.2
+                        })
+                        prob_df['Beta_cap'] = prob_df['Regime'].map({
+                            'CRISIS': 0.7, 'BEAR': 0.9, 'NEUTRAL': 1.0, 'BULL': 1.3
+                        })
 
-                    # Show individual z-scores
-                    st.markdown("**Individual z-scores (last 10 days):**")
-                    display_cols = [col for col in result_df.columns if col.endswith('_z')]
-                    if display_cols:
-                        st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
+                        st.dataframe(prob_df.style.format({
+                            'Probability': '{:.1%}',
+                            'M_multiplier': '{:.2f}',
+                            'Beta_cap': '{:.2f}'
+                        }), use_container_width=True)
 
-                # Random Forest diagnostics (if enabled)
-                if "Random Forest" in regime_method and rf_model is not None:
-                    with st.expander("🌳 Random Forest Regime Analysis"):
-                        st.markdown(f"**Random Forest Classifier (Supervised Learning)**")
-                        st.markdown("Based on Breiman (2001) - Random Forests | Ballings et al. (2015) - Stock Price Direction Prediction")
+                        # Feature importance
+                        st.markdown("---")
+                        st.markdown("**Feature Importance (Top 10):**")
+                        st.caption("Shows which features matter most for regime classification")
 
-                        # Current regime probabilities
-                        try:
-                            regime_probs = rf_model.get_regime_probabilities(features_df)
-                            st.markdown("**Current Regime Probabilities:**")
-                            prob_df = pd.DataFrame({
-                                'Regime': list(regime_probs.keys()),
-                                'Probability': list(regime_probs.values())
-                            }).sort_values('Probability', ascending=False)
-                            prob_df['M_multiplier'] = prob_df['Regime'].map({
-                                'CRISIS': 0.6, 'BEAR': 0.8, 'NEUTRAL': 1.0, 'BULL': 1.2
-                            })
-                            prob_df['Beta_cap'] = prob_df['Regime'].map({
-                                'CRISIS': 0.7, 'BEAR': 0.9, 'NEUTRAL': 1.0, 'BULL': 1.3
-                            })
+                        feature_importance = rf_model.get_feature_importance(top_n=10)
 
-                            st.dataframe(prob_df.style.format({
-                                'Probability': '{:.1%}',
-                                'M_multiplier': '{:.2f}',
-                                'Beta_cap': '{:.2f}'
-                            }), use_container_width=True)
+                        if HAVE_PLOTLY:
+                            fig_imp = go.Figure(go.Bar(
+                                x=feature_importance.values,
+                                y=feature_importance.index,
+                                orientation='h',
+                                marker=dict(color=feature_importance.values, colorscale='Viridis')
+                            ))
+                            fig_imp.update_layout(
+                                title="Feature Importance",
+                                xaxis_title="Importance",
+                                yaxis_title="Feature",
+                                height=400,
+                                yaxis={'categoryorder': 'total ascending'}
+                            )
+                            st.plotly_chart(fig_imp, use_container_width=True)
+                        else:
+                            st.bar_chart(feature_importance)
 
-                            # Feature importance
-                            st.markdown("---")
-                            st.markdown("**Feature Importance (Top 10):**")
-                            st.caption("Shows which features matter most for regime classification")
+                        # Model quality metrics
+                        st.markdown("---")
+                        st.markdown("**Model Quality:**")
+                        qual_col1, qual_col2 = st.columns(2)
+                        with qual_col1:
+                            st.metric("Cross-Validation Accuracy", f"{rf_model.cv_score:.1%}")
+                        with qual_col2:
+                            st.metric("Number of Trees", rf_model.n_estimators)
 
-                            feature_importance = rf_model.get_feature_importance(top_n=10)
+                        st.info(f"""
+                        **Training Details:**
+                        - Trained on {len(features_df)} days of historical data
+                        - Labeled periods: 2008 GFC, 2020 COVID crash, 2022 bear market
+                        - Features: macro z-scores + momentum + volatility + drawdown
+                        - Validation: {rf_model.cv_score:.1%} accuracy (5-fold CV)
+                        """)
 
-                            if HAVE_PLOTLY:
-                                fig_imp = go.Figure(go.Bar(
-                                    x=feature_importance.values,
-                                    y=feature_importance.index,
-                                    orientation='h',
-                                    marker=dict(color=feature_importance.values, colorscale='Viridis')
-                                ))
-                                fig_imp.update_layout(
-                                    title="Feature Importance",
-                                    xaxis_title="Importance",
-                                    yaxis_title="Feature",
-                                    height=400,
-                                    yaxis={'categoryorder': 'total ascending'}
-                                )
-                                st.plotly_chart(fig_imp, use_container_width=True)
-                            else:
-                                st.bar_chart(feature_importance)
+                    except Exception as e_rf_diag:
+                        st.warning(f"Could not display Random Forest diagnostics: {e_rf_diag}")
 
-                            # Model quality metrics
-                            st.markdown("---")
-                            st.markdown("**Model Quality:**")
-                            qual_col1, qual_col2 = st.columns(2)
-                            with qual_col1:
-                                st.metric("Cross-Validation Accuracy", f"{rf_model.cv_score:.1%}")
-                            with qual_col2:
-                                st.metric("Number of Trees", rf_model.n_estimators)
+            # HMM diagnostics (if enabled)
+            if "HMM" in regime_method and hmm_model is not None and features_df is not None:
+                with st.expander("🧠 HMM Regime Analysis"):
+                    st.markdown(f"**Hidden Markov Model with {n_hmm_states} States**")
+                    st.markdown("Based on Hamilton (1989) - State-Space Models with Regime Switching")
 
-                            st.info(f"""
-                            **Training Details:**
-                            - Trained on {len(features_df)} days of historical data
-                            - Labeled periods: 2008 GFC, 2020 COVID crash, 2022 bear market
-                            - Features: macro z-scores + momentum + volatility + drawdown
-                            - Validation: {rf_model.cv_score:.1%} accuracy (5-fold CV)
-                            """)
+                    # Current regime probabilities
+                    try:
+                        regime_probs = hmm_model.get_regime_probabilities(features_df)
+                        st.markdown("**Current Regime Probabilities:**")
+                        prob_df = pd.DataFrame({
+                            'State': [s.label for s in hmm_model.regime_states.values()],
+                            'Probability': regime_probs,
+                            'M_multiplier': [s.m_multiplier for s in hmm_model.regime_states.values()],
+                            'Beta_cap': [s.beta_cap for s in hmm_model.regime_states.values()]
+                        })
+                        st.dataframe(prob_df.style.format({'Probability': '{:.2%}', 'M_multiplier': '{:.2f}', 'Beta_cap': '{:.2f}'}), use_container_width=True)
 
-                        except Exception as e_rf_diag:
-                            st.warning(f"Could not display Random Forest diagnostics: {e_rf_diag}")
+                        # Transition matrix
+                        st.markdown("**Regime Transition Matrix:**")
+                        transition_analysis = hmm_model.analyze_transitions()
+                        trans_matrix = transition_analysis['transition_matrix']
 
-                # HMM diagnostics (if enabled)
-                if "HMM" in regime_method and hmm_model is not None:
-                    with st.expander("🧠 HMM Regime Analysis"):
-                        st.markdown(f"**Hidden Markov Model with {n_hmm_states} States**")
-                        st.markdown("Based on Hamilton (1989) - State-Space Models with Regime Switching")
+                        # Create heatmap
+                        if HAVE_PLOTLY:
+                            state_labels = [s.label for s in hmm_model.regime_states.values()]
+                            fig_trans = go.Figure(data=go.Heatmap(
+                                z=trans_matrix,
+                                x=state_labels,
+                                y=state_labels,
+                                colorscale='RdYlGn',
+                                text=trans_matrix,
+                                texttemplate='%{text:.2%}',
+                                textfont={"size": 12}
+                            ))
+                            fig_trans.update_layout(
+                                title="Transition Probabilities (From → To)",
+                                xaxis_title="To State",
+                                yaxis_title="From State",
+                                height=400
+                            )
+                            st.plotly_chart(fig_trans, use_container_width=True)
+                        else:
+                            st.dataframe(pd.DataFrame(trans_matrix,
+                                columns=[s.label for s in hmm_model.regime_states.values()],
+                                index=[s.label for s in hmm_model.regime_states.values()]
+                            ).style.format('{:.2%}'), use_container_width=True)
 
-                        # Current regime probabilities
-                        try:
-                            regime_probs = hmm_model.get_regime_probabilities(features_df)
-                            st.markdown("**Current Regime Probabilities:**")
-                            prob_df = pd.DataFrame({
-                                'State': [s.label for s in hmm_model.regime_states.values()],
-                                'Probability': regime_probs,
-                                'M_multiplier': [s.m_multiplier for s in hmm_model.regime_states.values()],
-                                'Beta_cap': [s.beta_cap for s in hmm_model.regime_states.values()]
-                            })
-                            st.dataframe(prob_df.style.format({'Probability': '{:.2%}', 'M_multiplier': '{:.2f}', 'Beta_cap': '{:.2f}'}), use_container_width=True)
+                        # Regime persistence
+                        st.markdown("**Regime Persistence:**")
+                        persistence_col1, persistence_col2 = st.columns(2)
+                        with persistence_col1:
+                            st.metric("Average Persistence", f"{transition_analysis['average_persistence']:.2%}")
+                        with persistence_col2:
+                            st.metric("Most Stable Regime", transition_analysis['most_persistent_regime'].label)
 
-                            # Transition matrix
-                            st.markdown("**Regime Transition Matrix:**")
-                            transition_analysis = hmm_model.analyze_transitions()
-                            trans_matrix = transition_analysis['transition_matrix']
-
-                            # Create heatmap
-                            if HAVE_PLOTLY:
-                                state_labels = [s.label for s in hmm_model.regime_states.values()]
-                                fig_trans = go.Figure(data=go.Heatmap(
-                                    z=trans_matrix,
-                                    x=state_labels,
-                                    y=state_labels,
-                                    colorscale='RdYlGn',
-                                    text=trans_matrix,
-                                    texttemplate='%{text:.2%}',
-                                    textfont={"size": 12}
-                                ))
-                                fig_trans.update_layout(
-                                    title="Transition Probabilities (From → To)",
-                                    xaxis_title="To State",
-                                    yaxis_title="From State",
-                                    height=400
-                                )
-                                st.plotly_chart(fig_trans, use_container_width=True)
-                            else:
-                                st.dataframe(pd.DataFrame(trans_matrix,
-                                    columns=[s.label for s in hmm_model.regime_states.values()],
-                                    index=[s.label for s in hmm_model.regime_states.values()]
-                                ).style.format('{:.2%}'), use_container_width=True)
-
-                            # Regime persistence
-                            st.markdown("**Regime Persistence:**")
-                            persistence_col1, persistence_col2 = st.columns(2)
-                            with persistence_col1:
-                                st.metric("Average Persistence", f"{transition_analysis['average_persistence']:.2%}")
-                            with persistence_col2:
-                                st.metric("Most Stable Regime", transition_analysis['most_persistent_regime'].label)
-
-                        except Exception as e_diag:
-                            st.warning(f"Could not display HMM diagnostics: {e_diag}")
+                    except Exception as e_diag:
+                        st.warning(f"Could not display HMM diagnostics: {e_diag}")
 
     else:
         # No FRED API key provided
