@@ -534,22 +534,25 @@ def fetch_fred_data_macroarimax(
         except Exception as e:
             error_str = str(e).lower()
             if 'mismatched tag' in error_str or 'xml' in error_str or 'html' in error_str:
-                msg = "❌ FRED API returned HTML error (invalid/inactive API key)"
-                messages.append(msg)
-                messages.append("💡 Common causes:")
-                messages.append("   1. API key not yet activated (check email for confirmation link)")
-                messages.append("   2. API key is invalid or expired")
-                messages.append("   3. API key copy-pasted with extra spaces")
-                messages.append("💡 Solution: Get new API key at https://fred.stlouisfed.org/docs/api/api_key.html")
-                if verbose:
-                    for m in messages:
-                        print(m)
+                messages.append("❌ FRED API key is INVALID or NOT ACTIVATED")
+                messages.append("")
+                messages.append("🔧 SOLUTION - Follow these steps:")
+                messages.append("1. Go to: https://fred.stlouisfed.org/docs/api/api_key.html")
+                messages.append("2. Click 'Request API Key' (or login if you have one)")
+                messages.append("3. CHECK YOUR EMAIL for activation link")
+                messages.append("4. Click the activation link in email")
+                messages.append("5. Copy the 32-character key (letters + numbers)")
+                messages.append("6. Paste here WITHOUT extra spaces")
+                messages.append("")
+                messages.append("⚠️ Common mistakes:")
+                messages.append("   - Key not activated (must click email link)")
+                messages.append("   - Extra spaces when copying")
+                messages.append("   - Using old/expired key")
                 return pd.DataFrame(), messages
             else:
-                msg = f"❌ FRED API test failed: {e}"
+                msg = f"❌ FRED API error: {str(e)[:150]}"
                 messages.append(msg)
-                if verbose:
-                    print(msg)
+                messages.append("Check network connection or API key format")
                 return pd.DataFrame(), messages
 
     except Exception as e:
@@ -688,10 +691,7 @@ def calculate_macro_zscore_auto_fred(
     messages.extend(fetch_msgs)
 
     if fred_df.empty:
-        msg = "❌ No FRED data fetched - cannot calculate z-score"
-        messages.append(msg)
-        if verbose:
-            print(msg)
+        # Don't add redundant message - fetch_msgs already contains error details
         return pd.DataFrame(), 0.0, messages
 
     # Calculate z-scores using MacroArimax method
