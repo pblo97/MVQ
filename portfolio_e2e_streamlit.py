@@ -1978,16 +1978,19 @@ with tab4:
             status_text_ps.text("Step 5/5: Running sensitivity analysis...")
 
             try:
-                sensitivity = analyze_parameter_sensitivity(
-                    returns_df=returns_df,
-                    param_grid={
-                        'base_kelly': [0.10, 0.15, 0.20, 0.25, 0.30],
-                        'lambda_corr': [0.0, 0.25, 0.50, 0.75, 1.0],
-                        'winsor_p': [0.005, 0.01, 0.02, 0.03]
-                    },
-                    scoring=scoring_metric,
-                    n_splits=3  # Fewer splits for sensitivity (faster)
-                )
+                # Analyze sensitivity for each parameter using the already computed grid search results
+                sensitivity = {}
+                param_names = ['base_kelly', 'lambda_corr', 'winsor_p']
+
+                for param_name in param_names:
+                    sens_df = analyze_parameter_sensitivity(search_result, param_name)
+                    # Rename columns to match expected format
+                    sens_df = sens_df.rename(columns={
+                        param_name: 'param_value',
+                        'mean': 'mean_score',
+                        'std': 'std_score'
+                    })
+                    sensitivity[param_name] = sens_df
 
                 progress_bar_ps.progress(100)
                 status_text_ps.text("✓ Parameter search completed!")
