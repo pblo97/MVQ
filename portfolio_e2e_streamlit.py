@@ -1931,8 +1931,6 @@ with tab4:
                     returns_df=returns_df,
                     scoring=scoring_metric,
                     n_splits=5,
-                    train_size=252,
-                    test_size=63,
                     verbose=False
                 )
 
