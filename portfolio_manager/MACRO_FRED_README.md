@@ -164,7 +164,47 @@ composite_z = composite_z.clip(lower=-3.5, upper=3.5)
 
 ## 🔧 Usage
 
-### **1. Basic Usage**
+### **1. Auto-Fetch from FRED (Recommended)**
+
+```python
+from portfolio_manager.macro_fred_compatible import (
+    calculate_macro_zscore_auto_fred,
+    get_macroarimax_default_weights
+)
+
+# Get your free API key at: https://fred.stlouisfed.org/docs/api/api_key.html
+FRED_API_KEY = "your_fred_api_key_here"
+
+# Auto-fetch FRED data and calculate z-score
+result_df, macro_z_last = calculate_macro_zscore_auto_fred(
+    fred_api_key=FRED_API_KEY,
+    start_date="2020-01-01",
+    end_date=None,  # default: today
+    window=252,  # annual rolling window
+    weights=get_macroarimax_default_weights(),
+    clip_z=3.5
+)
+
+print(f"Composite Z-Score: {macro_z_last:.2f}")
+
+# result_df contiene:
+# - RRPONTSYD_z, WTREGEN_z, ... (individual z-scores)
+# - NL_z (Net Liquidity z-score)
+# - composite_z (weighted composite)
+```
+
+**What it fetches automatically:**
+- Core $ family: `RRPONTSYD`, `WTREGEN`, `WRESBAL`, `WALCL`
+- Rates (bp family): `SOFR`, `EFFR`, `OBFR`, `TGCRRATE`
+- Credit: `BAMLH0A0HYM2` (High Yield OAS)
+- Curve: `T10Y2Y` (10y-2y)
+- Auto-calculates: Net Liquidity (`NL`), spreads (`SOFR_EFFR`, `OBFR_SOFR`)
+
+**No CSV needed!** Just provide your FRED API key.
+
+---
+
+### **2. Manual CSV Upload (Alternative)**
 
 ```python
 from portfolio_manager.macro_fred_compatible import (
@@ -188,7 +228,7 @@ print(f"Composite Z-Score: {macro_z_last:.2f}")
 # - composite_z (weighted composite)
 ```
 
-### **2. CSV Format Expected**
+### **3. CSV Format Expected**
 
 ```csv
 Date,RRPONTSYD,WTREGEN,WRESBAL,SOFR,EFFR,OBFR,BAMLH0A0HYM2,T10Y2Y
@@ -213,19 +253,26 @@ Date,RRPONTSYD,WTREGEN,WRESBAL,SOFR,EFFR,OBFR,BAMLH0A0HYM2,T10Y2Y
 
 ## 📈 Integration with Portfolio E2E
 
-### **In `portfolio_e2e_streamlit.py`:**
+### **In `portfolio_e2e_streamlit.py` (Auto-Fetch Mode):**
 
 ```python
 from portfolio_manager.macro_fred_compatible import (
-    calculate_macro_zscore_from_fred_csv,
+    calculate_macro_zscore_auto_fred,
     get_macroarimax_default_weights
 )
 
-uploaded_file = st.file_uploader("Upload FRED CSV")
+# FRED API Key input
+fred_api_key = st.text_input(
+    "FRED API Key",
+    type="password",
+    help="Get your free API key at: https://fred.stlouisfed.org/docs/api/api_key.html"
+)
 
-if uploaded_file:
-    result_df, macro_z = calculate_macro_zscore_from_fred_csv(
-        uploaded_file,
+if fred_api_key:
+    # Auto-fetch FRED data and calculate z-score
+    result_df, macro_z = calculate_macro_zscore_auto_fred(
+        fred_api_key=fred_api_key,
+        start_date="2020-01-01",
         window=252,
         weights=get_macroarimax_default_weights()
     )
@@ -235,6 +282,12 @@ if uploaded_file:
     st.metric("Macro Z-Score", f"{macro_z:.2f}")
     st.metric("Regime", regime.label)
 ```
+
+**Benefits of Auto-Fetch:**
+- ✅ No need to run MacroArimax separately
+- ✅ Always up-to-date data from FRED
+- ✅ Streamlined workflow
+- ✅ Same calculation as MacroArimax (100% compatible)
 
 ---
 

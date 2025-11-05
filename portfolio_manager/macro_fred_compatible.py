@@ -478,3 +478,148 @@ def adjust_thresholds_quarter_end(
         return zscore / qe_multiplier
 
     return zscore
+
+
+# ========== FRED AUTO-FETCH ==========
+
+def fetch_fred_data_macroarimax(
+    fred_api_key: str,
+    start_date: str = "2020-01-01",
+    end_date: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Obtiene indicadores FRED automáticamente usando fredapi.
+    Igual que en MacroArimax/liquidity stress.
+
+    Args:
+        fred_api_key: API key de FRED (https://fred.stlouisfed.org/docs/api/api_key.html)
+        start_date: Fecha inicio (YYYY-MM-DD)
+        end_date: Fecha fin (default: hoy)
+
+    Returns:
+        DataFrame con indicadores FRED (index = Date)
+
+    Example:
+        >>> df = fetch_fred_data_macroarimax(api_key="your_key", start_date="2020-01-01")
+        >>> df.columns
+        ['RRPONTSYD', 'WTREGEN', 'WRESBAL', 'SOFR', 'EFFR', 'OBFR', ...]
+    """
+    try:
+        from fredapi import Fred
+    except ImportError:
+        raise ImportError(
+            "fredapi not installed. Install with: pip install fredapi"
+        )
+
+    fred = Fred(api_key=fred_api_key)
+
+    # Series FRED requeridas (matching MacroArimax spec)
+    series_map = {
+        # Core $ family
+        'RRPONTSYD': 'RRPONTSYD',      # ON RRP
+        'WTREGEN': 'WTREGEN',          # TGA (Treasury General Account)
+        'WRESBAL': 'WRESBAL',          # Bank Reserves
+        'WALCL': 'WALCL',              # Fed Balance Sheet (optional)
+
+        # Rates (bp family)
+        'SOFR': 'SOFR',                # Secured Overnight Financing Rate
+        'EFFR': 'EFFR',                # Effective Fed Funds Rate
+        'OBFR': 'OBFR',                # Overnight Bank Funding Rate
+        'TGCRRATE': 'TGCRRATE',        # Repo GC tri-party rate (optional)
+
+        # Credit
+        'BAMLH0A0HYM2': 'BAMLH0A0HYM2', # High Yield OAS
+
+        # Term structure
+        'T10Y2Y': 'T10Y2Y'             # 10y-2y yield curve
+    }
+
+    df = pd.DataFrame()
+    failed_series = []
+
+    for name, fred_code in series_map.items():
+        try:
+            series_data = fred.get_series(fred_code, observation_start=start_date, observation_end=end_date)
+            df[name] = series_data
+        except Exception as e:
+            failed_series.append((name, str(e)))
+            continue
+
+    if failed_series:
+        print(f"⚠️  Warning: Failed to fetch {len(failed_series)} series:")
+        for name, error in failed_series:
+            print(f"  - {name}: {error}")
+
+    # Convert index to datetime
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, errors='coerce')
+
+    df.index.name = 'Date'
+
+    # Resample to daily and forward fill (FRED has different frequencies)
+    df = df.resample('D').last().ffill()
+
+    return df
+
+
+def calculate_macro_zscore_auto_fred(
+    fred_api_key: str,
+    start_date: str = "2020-01-01",
+    end_date: Optional[str] = None,
+    window: int = 252,
+    weights: Optional[Dict[str, float]] = None,
+    clip_z: float = 3.5
+) -> tuple[pd.DataFrame, float]:
+    """
+    Pipeline completo: Fetch FRED → calcula z-scores MacroArimax → devuelve último.
+
+    Args:
+        fred_api_key: API key de FRED
+        start_date: Fecha inicio (YYYY-MM-DD)
+        end_date: Fecha fin (default: hoy)
+        window: Ventana rolling (252d anual, 126d semi)
+        weights: Pesos por indicador
+        clip_z: Clip limit |z| ≤ clip_z
+
+    Returns:
+        (DataFrame con z-scores, composite_z último valor)
+
+    Example:
+        >>> result_df, z_last = calculate_macro_zscore_auto_fred(
+        ...     fred_api_key="your_key",
+        ...     window=252,
+        ...     weights=get_macroarimax_default_weights()
+        ... )
+        >>> print(f"Current macro z-score: {z_last:.2f}")
+    """
+    # Fetch FRED data
+    print("📊 Fetching FRED data...")
+    fred_df = fetch_fred_data_macroarimax(
+        fred_api_key=fred_api_key,
+        start_date=start_date,
+        end_date=end_date
+    )
+
+    if fred_df.empty:
+        print("❌ No FRED data fetched")
+        return pd.DataFrame(), 0.0
+
+    print(f"✓ Fetched {len(fred_df.columns)} indicators, {len(fred_df)} days")
+
+    # Calculate z-scores using MacroArimax method
+    result_df = calculate_composite_zscore_macroarimax(
+        indicators_df=fred_df,
+        window=window,
+        weights=weights,
+        clip_z=clip_z
+    )
+
+    # Extract last composite_z
+    if 'composite_z' in result_df.columns:
+        composite_z_last = float(result_df['composite_z'].dropna().iloc[-1]) if not result_df['composite_z'].dropna().empty else 0.0
+    else:
+        composite_z_last = 0.0
+
+    print(f"✓ Composite z-score (last): {composite_z_last:.2f}")
+
+    return result_df, composite_z_last

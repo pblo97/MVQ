@@ -104,25 +104,27 @@ with tab1:
         st.warning("Please enter symbols in the sidebar")
         st.stop()
 
-    # ========== MACRO Z-SCORE (FRED) ==========
+    # ========== MACRO Z-SCORE (FRED AUTO-FETCH) ==========
     st.markdown("---")
-    st.subheader("🌐 Macro Indicators (FRED Required)")
+    st.subheader("🌐 Macro Indicators (Auto-fetch from FRED)")
 
-    # Option 1: Upload CSV with FRED indicators from MacroArimax
     from portfolio_manager.macro_fred_compatible import (
-        calculate_macro_zscore_from_fred_csv,
+        calculate_macro_zscore_auto_fred,
         get_macroarimax_default_weights
     )
 
-    col_up1, col_up2 = st.columns([2, 1])
-    with col_up1:
-        uploaded_macro = st.file_uploader(
-            "📊 Upload CSV with FRED indicators (from MacroArimax)",
-            type=["csv"],
-            key="upload_macro",
-            help="CSV with FRED data: RRPONTSYD, WTREGEN, WRESBAL, SOFR, EFFR, OBFR, BAMLH0A0HYM2, T10Y2Y"
+    # FRED API Key input
+    col_key, col_window = st.columns([2, 1])
+    with col_key:
+        # Try to get from secrets first
+        default_fred_key = st.secrets.get("FRED_API_KEY", "")
+        fred_api_key = st.text_input(
+            "FRED API Key",
+            value=default_fred_key,
+            type="password",
+            help="Get your free API key at: https://fred.stlouisfed.org/docs/api/api_key.html"
         )
-    with col_up2:
+    with col_window:
         window_days = st.selectbox(
             "Rolling window",
             options=[252, 126],
@@ -132,82 +134,85 @@ with tab1:
 
     macro_z_eff = 0.0
     macro_bundle = None
+    result_df = None
 
-    if uploaded_macro:
+    if fred_api_key and fred_api_key.strip():
         try:
-            with st.spinner("Calculating macro z-score (MacroArimax method)..."):
-                result_df, macro_z_eff = calculate_macro_zscore_from_fred_csv(
-                    uploaded_macro,
+            with st.spinner("🔄 Fetching FRED data and calculating macro z-score..."):
+                # Auto-fetch FRED and calculate z-score
+                result_df, macro_z_eff = calculate_macro_zscore_auto_fred(
+                    fred_api_key=fred_api_key.strip(),
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
                     window=window_days,
                     weights=get_macroarimax_default_weights(),
                     clip_z=3.5
                 )
 
-            reg = z_to_regime(macro_z_eff)
+            if result_df.empty:
+                st.warning("⚠️ No FRED data fetched. Using default macro_z = 0.0 (NEUTRAL)")
+                macro_z_eff = 0.0
+            else:
+                reg = z_to_regime(macro_z_eff)
 
-            col_m1, col_m2, col_m3 = st.columns(3)
-            col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
-            col_m2.metric("Regime", reg.label)
-            col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
+                col_m1, col_m2, col_m3 = st.columns(3)
+                col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
+                col_m2.metric("Regime", reg.label)
+                col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
 
-            st.success(f"✓ Macro z-score calculated: **{macro_z_eff:.2f}** (Regime: {reg.label})")
+                st.success(f"✓ FRED data fetched & z-score calculated: **{macro_z_eff:.2f}** (Regime: {reg.label})")
 
-            # Charts & details
-            with st.expander("📈 View composite z-score timeline & breakdown"):
-                if HAVE_PLOTLY:
-                    fig = px.line(
-                        result_df['composite_z'].rename_axis('Date').reset_index(),
-                        x='Date',
-                        y='composite_z',
-                        title="Composite Z-Score (MacroArimax Method)"
-                    )
-                    fig.add_hline(y=0.5, line_dash="dash", line_color="green", annotation_text="ON threshold")
-                    fig.add_hline(y=-0.5, line_dash="dash", line_color="red", annotation_text="OFF threshold")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.line_chart(result_df['composite_z'])
+                # Charts & details
+                with st.expander("📈 View composite z-score timeline & breakdown"):
+                    if HAVE_PLOTLY:
+                        fig = px.line(
+                            result_df['composite_z'].rename_axis('Date').reset_index(),
+                            x='Date',
+                            y='composite_z',
+                            title="Composite Z-Score (MacroArimax Method)"
+                        )
+                        fig.add_hline(y=0.5, line_dash="dash", line_color="green", annotation_text="ON threshold")
+                        fig.add_hline(y=-0.5, line_dash="dash", line_color="red", annotation_text="OFF threshold")
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.line_chart(result_df['composite_z'])
 
-                # Show individual z-scores
-                st.markdown("**Individual z-scores (last 10 days):**")
-                display_cols = [col for col in result_df.columns if col.endswith('_z')]
-                if display_cols:
-                    st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
+                    # Show individual z-scores
+                    st.markdown("**Individual z-scores (last 10 days):**")
+                    display_cols = [col for col in result_df.columns if col.endswith('_z')]
+                    if display_cols:
+                        st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
 
         except Exception as e:
-            st.error(f"Error calculating macro z-score: {e}")
+            st.error(f"❌ Error fetching FRED data or calculating z-score: {e}")
+            st.exception(e)
             st.warning("Using default macro_z = 0.0 (NEUTRAL)")
             macro_z_eff = 0.0
     else:
         st.info("""
-        **Macro z-score calculation (MacroArimax compatible)**
+        **Macro z-score calculation (Auto-fetch from FRED)**
 
-        **Required FRED indicators in CSV:**
+        **Required:** FRED API Key (free)
+        👉 Get yours at: https://fred.stlouisfed.org/docs/api/api_key.html
 
-        **Core ($bn family):**
-        - `RRPONTSYD` - ON RRP (Reverse Repo)
-        - `WTREGEN` - TGA (Treasury General Account)
-        - `WRESBAL` - Bank Reserves
-        - `WALCL` - Fed Balance (optional)
+        **What this does:**
+        1. Automatically fetches indicators from FRED:
+           - **$ family:** RRPONTSYD (RRP), WTREGEN (TGA), WRESBAL (Reserves), WALCL (Fed Balance)
+           - **bp family:** SOFR, EFFR, OBFR, TGCRRATE (Repo), BAMLH0A0HYM2 (HY OAS), T10Y2Y (Curve)
 
-        **Rates (bp family):**
-        - `SOFR`, `EFFR`, `OBFR` - For spreads (SOFR-EFFR, OBFR-SOFR)
-        - `TGCRRATE` - Repo GC tri-party (optional)
-        - `BAMLH0A0HYM2` - High Yield OAS
-        - `T10Y2Y` - 10y-2y yield curve
+        2. Calculates Net Liquidity: `NL = WRESBAL - WTREGEN - RRPONTSYD`
 
-        **How to get data:**
-        1. Run your **MacroArimax** script (with FRED API) → exports CSV
-        2. Or download from FRED manually
-        3. Upload CSV here (must have `Date` column + indicators)
+        3. Computes z-score using **MacroArimax method:**
+           - Normalization by families ($ billions separate from bp)
+           - Economic signs (drain vs inject liquidity)
+           - Winsorization p1-p99 + clip |z| ≤ 3.5
+           - Rolling window: 252d (annual) or 126d (semi-annual)
 
-        **Calculation method:**
-        - Net Liquidity: `NL = WRESBAL - WTREGEN - RRPONTSYD`
-        - Normalization by families: $ (billions) vs bp (basis points)
-        - Economic signs: drenan (negative) vs inyectan (positive)
-        - Winsorization p1-p99 + clip |z| ≤ 3.5
-        - Rolling window: 252d (annual) or 126d (semi-annual)
+        4. Returns composite z-score → regime (ON/NEUTRAL/OFF) → M_macro multiplier
 
-        **Without CSV:** uses default macro_z = 0.0 (NEUTRAL regime)
+        **Without API key:** uses default macro_z = 0.0 (NEUTRAL regime)
+
+        **Note:** This is the same calculation as your MacroArimax/liquidity stress program!
         """)
 
     st.session_state['macro_z_eff'] = macro_z_eff
