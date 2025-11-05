@@ -109,26 +109,38 @@ with tab1:
     st.subheader("🌐 Macro Indicators (FRED Required)")
 
     # Option 1: Upload CSV with FRED indicators from MacroArimax
-    from portfolio_manager.macro_simple import calculate_macro_zscore_from_csv, get_fred_preset_weights, get_fred_preset_invert_signs
-
-    uploaded_macro = st.file_uploader(
-        "📊 Upload CSV with macro indicators (from MacroArimax or ma_streamlit)",
-        type=["csv"],
-        key="upload_macro",
-        help="CSV must have Date column + indicator columns (T10Y3M, BAA_AAA, USD_BROAD, etc.)"
+    from portfolio_manager.macro_fred_compatible import (
+        calculate_macro_zscore_from_fred_csv,
+        get_macroarimax_default_weights
     )
+
+    col_up1, col_up2 = st.columns([2, 1])
+    with col_up1:
+        uploaded_macro = st.file_uploader(
+            "📊 Upload CSV with FRED indicators (from MacroArimax)",
+            type=["csv"],
+            key="upload_macro",
+            help="CSV with FRED data: RRPONTSYD, WTREGEN, WRESBAL, SOFR, EFFR, OBFR, BAMLH0A0HYM2, T10Y2Y"
+        )
+    with col_up2:
+        window_days = st.selectbox(
+            "Rolling window",
+            options=[252, 126],
+            index=0,
+            help="252d = annual, 126d = semi-annual"
+        )
 
     macro_z_eff = 0.0
     macro_bundle = None
 
     if uploaded_macro:
         try:
-            with st.spinner("Calculating macro z-score from indicators..."):
-                result_df, macro_z_eff = calculate_macro_zscore_from_csv(
+            with st.spinner("Calculating macro z-score (MacroArimax method)..."):
+                result_df, macro_z_eff = calculate_macro_zscore_from_fred_csv(
                     uploaded_macro,
-                    window=36,
-                    weights=get_fred_preset_weights(),
-                    invert_signs=get_fred_preset_invert_signs()
+                    window=window_days,
+                    weights=get_macroarimax_default_weights(),
+                    clip_z=3.5
                 )
 
             reg = z_to_regime(macro_z_eff)
@@ -140,18 +152,26 @@ with tab1:
 
             st.success(f"✓ Macro z-score calculated: **{macro_z_eff:.2f}** (Regime: {reg.label})")
 
-            # Optional: show chart
-            with st.expander("📈 View composite z-score timeline"):
+            # Charts & details
+            with st.expander("📈 View composite z-score timeline & breakdown"):
                 if HAVE_PLOTLY:
                     fig = px.line(
                         result_df['composite_z'].rename_axis('Date').reset_index(),
                         x='Date',
                         y='composite_z',
-                        title="Composite Z-Score"
+                        title="Composite Z-Score (MacroArimax Method)"
                     )
+                    fig.add_hline(y=0.5, line_dash="dash", line_color="green", annotation_text="ON threshold")
+                    fig.add_hline(y=-0.5, line_dash="dash", line_color="red", annotation_text="OFF threshold")
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.line_chart(result_df['composite_z'])
+
+                # Show individual z-scores
+                st.markdown("**Individual z-scores (last 10 days):**")
+                display_cols = [col for col in result_df.columns if col.endswith('_z')]
+                if display_cols:
+                    st.dataframe(result_df[display_cols].tail(10), use_container_width=True)
 
         except Exception as e:
             st.error(f"Error calculating macro z-score: {e}")
@@ -159,14 +179,35 @@ with tab1:
             macro_z_eff = 0.0
     else:
         st.info("""
-        **Macro z-score is required for portfolio optimization.**
+        **Macro z-score calculation (MacroArimax compatible)**
 
-        **How to get macro indicators:**
-        1. Run your **MacroArimax** script (with FRED API) → generates CSV
-        2. Or run **ma_streamlit.py** → download macro_monitor_bundle.csv
-        3. Upload the CSV here
+        **Required FRED indicators in CSV:**
 
-        **Without macro indicators:** portfolio will use default z=0 (NEUTRAL regime)
+        **Core ($bn family):**
+        - `RRPONTSYD` - ON RRP (Reverse Repo)
+        - `WTREGEN` - TGA (Treasury General Account)
+        - `WRESBAL` - Bank Reserves
+        - `WALCL` - Fed Balance (optional)
+
+        **Rates (bp family):**
+        - `SOFR`, `EFFR`, `OBFR` - For spreads (SOFR-EFFR, OBFR-SOFR)
+        - `TGCRRATE` - Repo GC tri-party (optional)
+        - `BAMLH0A0HYM2` - High Yield OAS
+        - `T10Y2Y` - 10y-2y yield curve
+
+        **How to get data:**
+        1. Run your **MacroArimax** script (with FRED API) → exports CSV
+        2. Or download from FRED manually
+        3. Upload CSV here (must have `Date` column + indicators)
+
+        **Calculation method:**
+        - Net Liquidity: `NL = WRESBAL - WTREGEN - RRPONTSYD`
+        - Normalization by families: $ (billions) vs bp (basis points)
+        - Economic signs: drenan (negative) vs inyectan (positive)
+        - Winsorization p1-p99 + clip |z| ≤ 3.5
+        - Rolling window: 252d (annual) or 126d (semi-annual)
+
+        **Without CSV:** uses default macro_z = 0.0 (NEUTRAL regime)
         """)
 
     st.session_state['macro_z_eff'] = macro_z_eff
