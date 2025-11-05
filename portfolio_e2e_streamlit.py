@@ -1695,16 +1695,16 @@ with tab4:
             st.markdown("### Backtest Performance Metrics")
 
             col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-            col_m1.metric("Sharpe Ratio (Strategy)", f"{result.metrics['sharpe_strategy']:.3f}")
-            col_m2.metric("Sharpe Ratio (Benchmark)", f"{result.metrics['sharpe_benchmark']:.3f}")
-            col_m3.metric("Information Ratio", f"{result.metrics['information_ratio']:.3f}")
-            col_m4.metric("Calmar Ratio", f"{result.metrics['calmar_ratio']:.3f}")
+            col_m1.metric("Sharpe Ratio (Strategy)", f"{result.metrics['Sharpe Ratio']:.3f}")
+            col_m2.metric("Sharpe Ratio (Benchmark)", f"{result.metrics['Benchmark Sharpe']:.3f}")
+            col_m3.metric("Information Ratio", f"{result.metrics['Information Ratio']:.3f}")
+            col_m4.metric("Calmar Ratio", f"{result.metrics['Calmar Ratio']:.3f}")
 
             col_m5, col_m6, col_m7, col_m8 = st.columns(4)
-            col_m5.metric("Sortino Ratio", f"{result.metrics['sortino_ratio']:.3f}")
-            col_m6.metric("Win Rate", f"{result.metrics['win_rate']:.1%}")
-            col_m7.metric("Max Drawdown", f"{result.metrics['max_drawdown']:.2%}")
-            col_m8.metric("Total Return", f"{result.metrics['total_return_strategy']:.2%}")
+            col_m5.metric("Sortino Ratio", f"{result.metrics['Sortino Ratio']:.3f}")
+            col_m6.metric("Win Rate", f"{result.metrics['Win Rate (%)']:.1f}%")
+            col_m7.metric("Max Drawdown", f"{result.metrics['Max Drawdown (%)']:.2f}%")
+            col_m8.metric("Total Return", f"{result.metrics['Total Return (%)']:.2f}%")
 
             st.caption("""
             **Metrics Interpretation:**
