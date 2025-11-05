@@ -18,7 +18,7 @@ def monthly_rets(ret_daily: pd.Series) -> pd.Series:
     r = pd.to_numeric(ret_daily, errors="coerce").dropna()
     if r.empty:
         return pd.Series(dtype=float)
-    r_m = (1.0 + r).resample("M").apply(lambda x: float(np.prod(1.0 + x) - 1.0))
+    r_m = (1.0 + r).resample("ME").apply(lambda x: float(np.prod(1.0 + x) - 1.0))
     return r_m.dropna()
 
 

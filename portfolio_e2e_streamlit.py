@@ -104,35 +104,73 @@ with tab1:
         st.warning("Please enter symbols in the sidebar")
         st.stop()
 
-    # Cargar macro bundle si existe
-    macro_bundle = None
-    auto_paths = ["./macro_monitor_bundle.csv", "./data/macro_monitor_bundle.csv", "./snapshots/macro_monitor_bundle.csv"]
-    for p in auto_paths:
-        if os.path.exists(p):
-            try:
-                macro_bundle = pd.read_csv(p, index_col=0, parse_dates=True).sort_index()
-                st.success(f"✓ Macro bundle loaded: `{p}`")
-                break
-            except Exception:
-                pass
+    # ========== MACRO Z-SCORE (FRED) ==========
+    st.markdown("---")
+    st.subheader("🌐 Macro Indicators (FRED Required)")
 
-    uploaded_macro = st.file_uploader("Or upload macro_monitor_bundle.csv", type=["csv"], key="upload_macro")
-    if uploaded_macro:
-        macro_bundle = pd.read_csv(uploaded_macro, index_col=0, parse_dates=True).sort_index()
-        st.success("✓ Macro bundle uploaded")
+    # Option 1: Upload CSV with FRED indicators from MacroArimax
+    from portfolio_manager.macro_simple import calculate_macro_zscore_from_csv, get_fred_preset_weights, get_fred_preset_invert_signs
 
-    # Extrae macro_z
+    uploaded_macro = st.file_uploader(
+        "📊 Upload CSV with macro indicators (from MacroArimax or ma_streamlit)",
+        type=["csv"],
+        key="upload_macro",
+        help="CSV must have Date column + indicator columns (T10Y3M, BAA_AAA, USD_BROAD, etc.)"
+    )
+
     macro_z_eff = 0.0
-    if macro_bundle is not None:
+    macro_bundle = None
+
+    if uploaded_macro:
         try:
-            if "macro_z" in macro_bundle.columns and pd.notna(macro_bundle["macro_z"]).any():
-                macro_z_eff = float(macro_bundle["macro_z"].dropna().iloc[-1])
-            elif "COMPOSITE_Z" in macro_bundle.columns:
-                macro_z_eff = float(macro_z_from_series(macro_bundle["COMPOSITE_Z"]))
+            with st.spinner("Calculating macro z-score from indicators..."):
+                result_df, macro_z_eff = calculate_macro_zscore_from_csv(
+                    uploaded_macro,
+                    window=36,
+                    weights=get_fred_preset_weights(),
+                    invert_signs=get_fred_preset_invert_signs()
+                )
+
+            reg = z_to_regime(macro_z_eff)
+
+            col_m1, col_m2, col_m3 = st.columns(3)
+            col_m1.metric("Macro Z-Score", f"{macro_z_eff:.2f}")
+            col_m2.metric("Regime", reg.label)
+            col_m3.metric("M_macro", f"{reg.m_multiplier:.2f}")
+
+            st.success(f"✓ Macro z-score calculated: **{macro_z_eff:.2f}** (Regime: {reg.label})")
+
+            # Optional: show chart
+            with st.expander("📈 View composite z-score timeline"):
+                if HAVE_PLOTLY:
+                    fig = px.line(
+                        result_df['composite_z'].rename_axis('Date').reset_index(),
+                        x='Date',
+                        y='composite_z',
+                        title="Composite Z-Score"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.line_chart(result_df['composite_z'])
+
         except Exception as e:
-            st.warning(f"Could not extract macro_z from bundle: {e}")
+            st.error(f"Error calculating macro z-score: {e}")
+            st.warning("Using default macro_z = 0.0 (NEUTRAL)")
+            macro_z_eff = 0.0
+    else:
+        st.info("""
+        **Macro z-score is required for portfolio optimization.**
+
+        **How to get macro indicators:**
+        1. Run your **MacroArimax** script (with FRED API) → generates CSV
+        2. Or run **ma_streamlit.py** → download macro_monitor_bundle.csv
+        3. Upload the CSV here
+
+        **Without macro indicators:** portfolio will use default z=0 (NEUTRAL regime)
+        """)
 
     st.session_state['macro_z_eff'] = macro_z_eff
+    st.markdown("---")
 
     # Fetch fundamentals desde FMP (para quality score)
     fmp_key = st.secrets.get("FMP_API_KEY", "")
@@ -145,24 +183,40 @@ with tab1:
             st.warning(f"Could not fetch fundamentals: {e}")
 
     # Run portfolio optimization
-    with st.spinner("Building portfolio with Quality 3D caps..."):
-        portfolio_df, quality_df = build_portfolio_with_quality_caps(
-            symbols=symbols,
-            bench=bench,
-            start=start_date.isoformat(),
-            end=end_date.isoformat(),
-            base_kelly=base_kelly,
-            winsor_p=winsor_p,
-            costs_per_period=costs_per_period,
-            lambda_corr=lambda_corr,
-            macro_z=macro_z_eff,
-            beta_cap_user=beta_cap_user,
-            use_quality_caps=use_quality_caps,
-            fundamentals_df=fundamentals_df
-        )
+    try:
+        with st.spinner("Building portfolio with Quality 3D caps..."):
+            portfolio_df, quality_df = build_portfolio_with_quality_caps(
+                symbols=symbols,
+                bench=bench,
+                start=start_date.isoformat(),
+                end=end_date.isoformat(),
+                base_kelly=base_kelly,
+                winsor_p=winsor_p,
+                costs_per_period=costs_per_period,
+                lambda_corr=lambda_corr,
+                macro_z=macro_z_eff,
+                beta_cap_user=beta_cap_user,
+                use_quality_caps=use_quality_caps,
+                fundamentals_df=fundamentals_df
+            )
+    except Exception as e:
+        st.error(f"❌ Error building portfolio: {e}")
+        st.exception(e)
+        st.stop()
 
     if portfolio_df.empty:
-        st.error("Could not build portfolio. Check data availability.")
+        st.error("❌ Could not build portfolio. Possible causes:")
+        st.markdown("""
+        - **Insufficient data:** Need at least 36 months of price history
+        - **Invalid symbols:** Check that symbols exist (e.g., AAPL, GOOGL, MSFT)
+        - **Date range too short:** Start date should be >= 3 years before end date
+        - **Benchmark issues:** SPY data not available for date range
+
+        **Debug tips:**
+        - Try fewer symbols (5-6 large caps: AAPL, GOOGL, MSFT, NVDA, JPM)
+        - Extend start date to 2020-01-01 or earlier
+        - Check symbols are valid US tickers
+        """)
         st.stop()
 
     # Store in session
