@@ -125,6 +125,40 @@ with st.sidebar:
         cov_method = "sample"
 
     st.markdown("---")
+    st.subheader("📐 Allocation Method")
+    with st.expander("📚 About Allocation Methods"):
+        st.markdown("""
+        **Kelly Criterion (Single-Asset):**
+        - Calculates optimal fraction per asset individually
+        - Robust, conservative, proven track record
+        - Accounts for: p(win), payoff, μ, σ², correlation penalty
+        - **Recommended** for most users
+
+        **HRP (Hierarchical Risk Parity):**
+        - López de Prado (2016) - "Building Diversified Portfolios"
+        - Uses hierarchical clustering + recursive bisection
+        - **No matrix inversion** (numerically stable)
+        - Superior out-of-sample performance vs Markowitz
+        - Good for: diversification, avoiding concentration risk
+        - Does NOT account for expected returns (equal risk allocation)
+
+        **Comparison:**
+        - **Kelly:** Optimizes for growth (log utility), return-focused
+        - **HRP:** Optimizes for diversification, risk-focused
+
+        **Academic References:**
+        - Kelly (1956): A New Interpretation of Information Rate
+        - López de Prado (2016): Building Diversified Portfolios that Outperform Out-of-Sample
+        """)
+
+    allocation_method = st.radio(
+        "Method",
+        options=["Kelly (Single-Asset)", "HRP (Risk Parity)"],
+        index=0,
+        help="Kelly = return-optimized | HRP = risk-diversified"
+    )
+
+    st.markdown("---")
     st.subheader("Caps & Constraints")
     beta_cap_user = st.number_input("Beta Cap (Σβ·w)", 0.25, 2.0, 1.2, 0.05)
     use_quality_caps = st.checkbox("Use Quality 3D Caps", value=True)
@@ -287,23 +321,143 @@ with tab1:
         except Exception as e:
             st.warning(f"Could not fetch fundamentals: {e}")
 
-    # Run portfolio optimization
+    # Run portfolio optimization based on selected method
     try:
-        with st.spinner("Building portfolio with Quality 3D caps..."):
-            portfolio_df, quality_df = build_portfolio_with_quality_caps(
-                symbols=symbols,
-                bench=bench,
-                start=start_date.isoformat(),
-                end=end_date.isoformat(),
-                base_kelly=base_kelly,
-                winsor_p=winsor_p,
-                costs_per_period=costs_per_period,
-                lambda_corr=lambda_corr,
-                macro_z=macro_z_eff,
-                beta_cap_user=beta_cap_user,
-                use_quality_caps=use_quality_caps,
-                fundamentals_df=fundamentals_df
-            )
+        if allocation_method == "Kelly (Single-Asset)":
+            # Kelly optimizer (existing)
+            with st.spinner("Building portfolio with Kelly + Quality 3D caps..."):
+                portfolio_df, quality_df = build_portfolio_with_quality_caps(
+                    symbols=symbols,
+                    bench=bench,
+                    start=start_date.isoformat(),
+                    end=end_date.isoformat(),
+                    base_kelly=base_kelly,
+                    winsor_p=winsor_p,
+                    costs_per_period=costs_per_period,
+                    lambda_corr=lambda_corr,
+                    macro_z=macro_z_eff,
+                    beta_cap_user=beta_cap_user,
+                    use_quality_caps=use_quality_caps,
+                    fundamentals_df=fundamentals_df
+                )
+
+        else:  # HRP (Risk Parity)
+            with st.spinner("Building portfolio with HRP + Quality 3D caps..."):
+                from portfolio_manager.allocation.hrp import compute_hrp_with_constraints
+                from portfolio_manager.quality.composite import compute_quality_batch
+
+                # Get prices and returns
+                price_panel = load_prices_panel(symbols + [bench], start_date.isoformat(), end_date.isoformat(), cache_key="pm_hrp_panel")
+                benchmark_df = price_panel.get(bench)
+
+                returns_df = pd.DataFrame({
+                    sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                    for sym in symbols if sym in price_panel
+                }).dropna(how='all')
+
+                if returns_df.empty or len(returns_df) < 252:
+                    raise ValueError("Insufficient data for HRP (need at least 252 days)")
+
+                # Calculate quality scores (for caps)
+                if use_quality_caps:
+                    quality_df = compute_quality_batch(
+                        symbols=symbols,
+                        price_panel=price_panel,
+                        fundamentals_df=fundamentals_df,
+                        benchmark_df=benchmark_df,
+                        weights=(0.4, 0.3, 0.3)  # liq, fund, tech
+                    )
+                else:
+                    quality_df = pd.DataFrame()
+
+                # Compute HRP weights (with or without quality caps)
+                if use_quality_caps and not quality_df.empty:
+                    # Extract position caps from quality_df
+                    quality_map = dict(zip(
+                        quality_df['symbol'].str.upper(),
+                        quality_df['position_cap']
+                    ))
+                    min_weights = {sym: 0.0 for sym in returns_df.columns}
+                    max_weights = {sym: quality_map.get(sym.upper(), 0.05) for sym in returns_df.columns}
+
+                    hrp_weights = compute_hrp_with_constraints(
+                        returns=returns_df,
+                        min_weights=min_weights,
+                        max_weights=max_weights,
+                        linkage_method='single'
+                    )
+                else:
+                    # HRP without constraints
+                    from portfolio_manager.allocation.hrp import compute_hrp_weights
+                    hrp_weights = compute_hrp_weights(
+                        returns=returns_df,
+                        linkage_method='single'
+                    )
+
+                # Apply macro multiplier
+                reg = z_to_regime(macro_z_eff)
+                M_macro = float(reg.m_multiplier)
+                hrp_weights_scaled = hrp_weights * M_macro
+
+                # Build portfolio DataFrame (compatible with Kelly format)
+                portfolio_df = pd.DataFrame({
+                    'symbol': hrp_weights_scaled.index,
+                    'weight': hrp_weights_scaled.values,
+                    'beta': np.nan,  # Calculate beta separately
+                    'beta_w': np.nan
+                })
+
+                # Calculate betas
+                if benchmark_df is not None and 'close' in benchmark_df.columns:
+                    bench_ret = pd.to_numeric(benchmark_df['close'], errors='coerce').pct_change().dropna()
+
+                    betas = []
+                    for sym in portfolio_df['symbol']:
+                        if sym in price_panel and 'close' in price_panel[sym].columns:
+                            asset_ret = pd.to_numeric(price_panel[sym]['close'], errors='coerce').pct_change().dropna()
+                            common_idx = asset_ret.index.intersection(bench_ret.index)
+
+                            if len(common_idx) > 60:
+                                asset_common = asset_ret.loc[common_idx]
+                                bench_common = bench_ret.loc[common_idx]
+                                cov = np.cov(asset_common, bench_common)[0, 1]
+                                var_bench = np.var(bench_common)
+                                beta = cov / var_bench if var_bench > 0 else 1.0
+                            else:
+                                beta = 1.0
+                        else:
+                            beta = 1.0
+                        betas.append(beta)
+
+                    portfolio_df['beta'] = betas
+
+                # Apply beta cap
+                portfolio_df['beta'] = portfolio_df['beta'].fillna(1.0)
+                portfolio_df['beta_w'] = portfolio_df['beta'] * portfolio_df['weight']
+
+                beta_cap_eff = min(beta_cap_user, reg.beta_cap)
+                beta_total = portfolio_df['beta_w'].sum()
+
+                if beta_total > beta_cap_eff and beta_total > 0:
+                    scale_factor = beta_cap_eff / beta_total
+                    portfolio_df['weight'] = portfolio_df['weight'] * scale_factor
+                    portfolio_df['beta_w'] = portfolio_df['beta'] * portfolio_df['weight']
+
+                # Add quality scores to portfolio_df
+                if not quality_df.empty:
+                    quality_score_map = dict(zip(quality_df['symbol'].str.upper(), quality_df['quality_score']))
+                    quality_cap_map = dict(zip(quality_df['symbol'].str.upper(), quality_df['position_cap']))
+                    portfolio_df['quality_score'] = portfolio_df['symbol'].str.upper().map(quality_score_map).fillna(50.0)
+                    portfolio_df['quality_cap'] = portfolio_df['symbol'].str.upper().map(quality_cap_map).fillna(0.05)
+                else:
+                    portfolio_df['quality_score'] = np.nan
+                    portfolio_df['quality_cap'] = np.nan
+
+                portfolio_df['lambda_quality'] = 1.0  # HRP doesn't use quality penalty
+
+                # Sort by weight
+                portfolio_df = portfolio_df.sort_values('weight', ascending=False).reset_index(drop=True)
+
     except Exception as e:
         st.error(f"❌ Error building portfolio: {e}")
         st.exception(e)
@@ -328,6 +482,11 @@ with tab1:
     st.session_state['portfolio_df'] = portfolio_df
     st.session_state['quality_df'] = quality_df
 
+    # Show allocation method badge
+    method_label = "Kelly (Single-Asset)" if allocation_method == "Kelly (Single-Asset)" else "HRP (Risk Parity)"
+    method_color = "blue" if allocation_method == "Kelly (Single-Asset)" else "green"
+    st.markdown(f"<p style='background-color: {method_color}; color: white; padding: 8px; border-radius: 5px; text-align: center; font-weight: bold;'>📐 Method: {method_label}</p>", unsafe_allow_html=True)
+
     # Metrics
     reg = z_to_regime(macro_z_eff)
     weights = portfolio_df['weight'].values
@@ -338,11 +497,12 @@ with tab1:
     beta_total = float(np.sum(betas * weights))
     beta_util = beta_total / max(reg.beta_cap, 1e-12)
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("N Effective", f"{N_eff:.2f}")
     col2.metric("# Assets", f"{n_actives}")
     col3.metric("Σ(β·w)", f"{beta_total:.2f}")
     col4.metric("β-Cap Utilization", f"{beta_util:.1%}")
+    col5.metric("Method", method_label[:4])
 
     # Portfolio table
     st.markdown("### Portfolio Weights")
