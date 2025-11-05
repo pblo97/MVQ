@@ -1,16 +1,26 @@
-tqdm
-matplotlib
-scipy
-pyarrow
-seaborn
-PyGithub
-streamlit>=1.37
-pandas>=2.0
-numpy>=1.24
-requests>=2.31
-urllib3>=2.2
-scikit-learn>=1.4
+# Core (install first - order matters)
+numpy>=1.24,<2.0
+pandas>=2.0,<3.0
+streamlit>=1.37,<2.0
+
+# Data & API
+requests>=2.31,<3.0
+urllib3>=2.2,<3.0
+fredapi>=0.5.0
+
+# Math & Stats (require numpy/pandas first)
+scipy>=1.11
+scikit-learn>=1.3
 statsmodels>=0.14
-plotly>=5.22
+
+# Visualization
 matplotlib>=3.8
-arch>=6.4 ; extra == "macro"  
+plotly>=5.18
+seaborn>=0.12
+
+# Utils
+tqdm
+pyarrow
+
+# Optional (commented - may need compilation, only for GARCH in ma_streamlit.py)
+# arch>=6.4  
