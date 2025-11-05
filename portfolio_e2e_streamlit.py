@@ -741,12 +741,253 @@ with tab4:
 
 # ==================== TAB 5: BACKTEST & REPORTS ====================
 with tab5:
-    st.subheader("📈 Backtest & Historical Reports")
+    st.subheader("📈 Walk-Forward Backtest & Historical Reports")
 
-    st.info("**Coming soon:** Walk-forward backtest engine with stress scenarios")
+    # Walk-Forward Backtest Section
+    st.markdown("### Walk-Forward Backtest")
+    st.markdown("""
+    **Rigorous out-of-sample validation** to avoid overfitting (Bailey et al. 2014):
+    - Train on rolling window → Test on next period → Step forward
+    - No look-ahead bias, simulates real trading conditions
+    - Comprehensive metrics: Sharpe, Sortino, Information Ratio, Calmar, Max Drawdown
+    """)
+
+    # Backtest Configuration
+    col_bt1, col_bt2, col_bt3 = st.columns(3)
+    with col_bt1:
+        train_window_months = st.selectbox("Training Window", [12, 24, 36], index=2, help="Months for training")
+        train_window = train_window_months * 21  # Trading days
+    with col_bt2:
+        test_window_months = st.selectbox("Test Window", [1, 3, 6], index=1, help="Months for testing")
+        test_window = test_window_months * 21
+    with col_bt3:
+        step_size_months = st.selectbox("Step Size", [1, 3], index=0, help="Months to step forward")
+        step_size = step_size_months * 21
+
+    col_bt4, col_bt5 = st.columns(2)
+    with col_bt4:
+        backtest_method = st.radio(
+            "Backtest Method",
+            ["Rolling Window", "Expanding Window"],
+            help="Rolling = fixed training window, Expanding = cumulative training"
+        )
+    with col_bt5:
+        benchmark_method = st.selectbox(
+            "Benchmark Weights",
+            ["Equal Weight", "Market Cap", "Custom"],
+            help="Benchmark allocation for comparison"
+        )
+
+    if st.button("🚀 Run Backtest", type="primary"):
+        try:
+            from portfolio_manager.backtest.walk_forward import (
+                walk_forward_backtest,
+                expanding_window_backtest,
+                calculate_backtest_metrics
+            )
+
+            with st.spinner("🔄 Running walk-forward backtest... (this may take 1-2 minutes)"):
+                # Get returns data
+                price_panel = load_prices_panel(
+                    symbols + [bench],
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    cache_key="e2e_backtest"
+                )
+
+                returns_df = pd.DataFrame({
+                    sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                    for sym in symbols if sym in price_panel
+                }).dropna(how='all')
+
+                if returns_df.empty or len(returns_df) < train_window + test_window:
+                    st.error(f"❌ Insufficient data for backtest. Need at least {train_window + test_window} days ({(train_window + test_window)/21:.0f} months)")
+                    st.stop()
+
+                # Benchmark weights
+                n_assets = len(returns_df.columns)
+                if benchmark_method == "Equal Weight":
+                    benchmark_weights = np.ones(n_assets) / n_assets
+                elif benchmark_method == "Market Cap":
+                    # Approximate with inverse volatility (proxy for market cap)
+                    vols = returns_df.std()
+                    inv_vol = 1 / vols
+                    benchmark_weights = (inv_vol / inv_vol.sum()).values
+                else:
+                    benchmark_weights = np.ones(n_assets) / n_assets
+
+                # Strategy function (simplified Kelly)
+                def simple_kelly_strategy(train_returns, base_kelly=0.25, winsor_p=0.01):
+                    """Simplified Kelly strategy for backtest"""
+                    # Winsorize
+                    train_w = train_returns.clip(
+                        lower=train_returns.quantile(winsor_p),
+                        upper=train_returns.quantile(1 - winsor_p)
+                    )
+
+                    # Kelly weights: w = Σ^-1 μ / κ
+                    mu = train_w.mean()
+                    cov = train_w.cov()
+
+                    try:
+                        cov_inv = np.linalg.inv(cov.values + np.eye(len(cov)) * 1e-8)
+                        weights_raw = base_kelly * (cov_inv @ mu.values)
+                        weights_raw = np.clip(weights_raw, 0, None)  # Long-only
+
+                        if weights_raw.sum() > 0:
+                            weights = weights_raw / weights_raw.sum()
+                        else:
+                            weights = np.ones(len(mu)) / len(mu)
+                    except np.linalg.LinAlgError:
+                        # Fallback to equal weight
+                        weights = np.ones(len(mu)) / len(mu)
+
+                    return weights
+
+                # Run backtest
+                if backtest_method == "Rolling Window":
+                    result = walk_forward_backtest(
+                        returns_df=returns_df,
+                        strategy_func=simple_kelly_strategy,
+                        train_window=train_window,
+                        test_window=test_window,
+                        step_size=step_size,
+                        min_train_obs=252,
+                        benchmark_weights=benchmark_weights,
+                        base_kelly=base_kelly,
+                        winsor_p=winsor_p
+                    )
+                else:  # Expanding Window
+                    result = expanding_window_backtest(
+                        returns_df=returns_df,
+                        strategy_func=simple_kelly_strategy,
+                        initial_train_window=train_window,
+                        test_window=test_window,
+                        step_size=step_size,
+                        min_train_obs=252,
+                        benchmark_weights=benchmark_weights,
+                        base_kelly=base_kelly,
+                        winsor_p=winsor_p
+                    )
+
+                st.success("✓ Backtest completed!")
+
+                # Store in session
+                st.session_state['backtest_result'] = result
+
+                # Display metrics
+                st.markdown("### Backtest Performance Metrics")
+
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                col_m1.metric("Sharpe Ratio (Strategy)", f"{result.metrics['sharpe_strategy']:.3f}")
+                col_m2.metric("Sharpe Ratio (Benchmark)", f"{result.metrics['sharpe_benchmark']:.3f}")
+                col_m3.metric("Information Ratio", f"{result.metrics['information_ratio']:.3f}")
+                col_m4.metric("Calmar Ratio", f"{result.metrics['calmar_ratio']:.3f}")
+
+                col_m5, col_m6, col_m7, col_m8 = st.columns(4)
+                col_m5.metric("Sortino Ratio", f"{result.metrics['sortino_ratio']:.3f}")
+                col_m6.metric("Win Rate", f"{result.metrics['win_rate']:.1%}")
+                col_m7.metric("Max Drawdown", f"{result.metrics['max_drawdown']:.2%}")
+                col_m8.metric("Total Return", f"{result.metrics['total_return_strategy']:.2%}")
+
+                st.caption("""
+                **Metrics Interpretation:**
+                - **Sharpe Ratio:** Risk-adjusted returns (>1.0 = good, >2.0 = excellent)
+                - **Information Ratio:** Excess return vs benchmark per unit of tracking error
+                - **Sortino Ratio:** Like Sharpe, but only penalizes downside volatility
+                - **Calmar Ratio:** Total return / Max Drawdown (risk-adjusted)
+                - **Win Rate:** % of profitable periods
+                """)
+
+                # Cumulative returns chart
+                st.markdown("---")
+                st.markdown("### Cumulative Returns (Strategy vs Benchmark)")
+
+                cum_strategy = (1 + pd.Series(result.strategy_returns)).cumprod()
+                cum_benchmark = (1 + pd.Series(result.benchmark_returns)).cumprod()
+                cum_dates = pd.date_range(end=end_date, periods=len(cum_strategy), freq='D')
+
+                cum_df = pd.DataFrame({
+                    'Date': cum_dates,
+                    'Strategy': cum_strategy.values,
+                    'Benchmark': cum_benchmark.values
+                })
+
+                if HAVE_PLOTLY:
+                    fig_cum = px.line(
+                        cum_df,
+                        x='Date',
+                        y=['Strategy', 'Benchmark'],
+                        title=f"Cumulative Returns ({backtest_method})",
+                        labels={'value': 'Cumulative Return', 'variable': 'Portfolio'}
+                    )
+                    fig_cum.update_traces(line=dict(width=2))
+                    st.plotly_chart(fig_cum, use_container_width=True)
+                else:
+                    st.line_chart(cum_df.set_index('Date'))
+
+                # Drawdown chart
+                st.markdown("---")
+                st.markdown("### Drawdown Analysis")
+
+                running_max_strategy = cum_strategy.cummax()
+                drawdown_strategy = (cum_strategy - running_max_strategy) / running_max_strategy
+
+                running_max_benchmark = cum_benchmark.cummax()
+                drawdown_benchmark = (cum_benchmark - running_max_benchmark) / running_max_benchmark
+
+                dd_df = pd.DataFrame({
+                    'Date': cum_dates,
+                    'Strategy DD': drawdown_strategy.values,
+                    'Benchmark DD': drawdown_benchmark.values
+                })
+
+                if HAVE_PLOTLY:
+                    fig_dd = px.line(
+                        dd_df,
+                        x='Date',
+                        y=['Strategy DD', 'Benchmark DD'],
+                        title="Drawdown Over Time",
+                        labels={'value': 'Drawdown', 'variable': 'Portfolio'}
+                    )
+                    fig_dd.update_traces(line=dict(width=2))
+                    st.plotly_chart(fig_dd, use_container_width=True)
+                else:
+                    st.line_chart(dd_df.set_index('Date'))
+
+                # Download results
+                st.markdown("---")
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    metrics_df = pd.DataFrame([result.metrics])
+                    st.download_button(
+                        "📥 Download Metrics",
+                        metrics_df.to_csv(index=False).encode(),
+                        file_name=f"backtest_metrics_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                with col_dl2:
+                    returns_export = pd.DataFrame({
+                        'date': cum_dates,
+                        'strategy_return': result.strategy_returns,
+                        'benchmark_return': result.benchmark_returns
+                    })
+                    st.download_button(
+                        "📥 Download Returns",
+                        returns_export.to_csv(index=False).encode(),
+                        file_name=f"backtest_returns_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+        except Exception as e:
+            st.error(f"❌ Backtest error: {e}")
+            st.exception(e)
 
     # Available snapshots
-    st.markdown("### Available Portfolio Snapshots")
+    st.markdown("---")
+    st.markdown("### Historical Portfolio Snapshots")
     try:
         dates_avail = persist.list_available_dates()
         if dates_avail:
