@@ -84,6 +84,47 @@ with st.sidebar:
     lambda_corr = st.slider("Correlation Penalty λ", 0.0, 1.0, 0.25, 0.05)
 
     st.markdown("---")
+    st.subheader("🔬 Robust Covariance (Advanced)")
+    with st.expander("📚 About Robust Covariance"):
+        st.markdown("""
+        **Why Robust Covariance?**
+
+        Sample covariance suffers from **estimation error** when n ~ p (observations ~ assets):
+        - Unstable inverse (ill-conditioned matrix)
+        - Extreme weights (over-concentration)
+        - Poor out-of-sample performance
+
+        **Ledoit-Wolf Shrinkage (2004):**
+        - Shrinks Σ̂ towards structured target (constant correlation or identity)
+        - Optimal shrinkage intensity δ computed analytically
+        - Reduces condition number → more stable weights
+
+        **Recommended:** Ledoit-Wolf for portfolios with 5+ assets
+
+        **Academic Reference:** Ledoit & Wolf (2004) - "Honey, I Shrunk the Sample Covariance Matrix"
+        """)
+
+    use_robust_cov = st.checkbox(
+        "Use Robust Covariance Estimation",
+        value=False,
+        help="Applies Ledoit-Wolf shrinkage to reduce estimation error (Ledoit & Wolf 2004)"
+    )
+
+    if use_robust_cov:
+        cov_method = st.selectbox(
+            "Covariance Method",
+            options=["ledoit_wolf", "oas", "ewm", "sample"],
+            index=0,
+            help="Method for covariance estimation:\n"
+                 "- ledoit_wolf: Optimal shrinkage (recommended)\n"
+                 "- oas: Oracle Approximating Shrinkage\n"
+                 "- ewm: Exponentially weighted (RiskMetrics)\n"
+                 "- sample: Standard covariance (no shrinkage)"
+        )
+    else:
+        cov_method = "sample"
+
+    st.markdown("---")
     st.subheader("Caps & Constraints")
     beta_cap_user = st.number_input("Beta Cap (Σβ·w)", 0.25, 2.0, 1.2, 0.05)
     use_quality_caps = st.checkbox("Use Quality 3D Caps", value=True)
@@ -327,6 +368,69 @@ with tab1:
     with c2:
         st.bar_chart(portfolio_df.set_index('symbol')['beta_w'])
         st.caption("Beta Contribution (β·w)")
+
+    # Covariance diagnostics (if robust covariance enabled)
+    if use_robust_cov and cov_method != 'sample':
+        st.markdown("---")
+        st.markdown("### 🔬 Covariance Matrix Diagnostics")
+
+        try:
+            from portfolio_manager.allocation.kelly_vectorial import diagnose_covariance_quality
+
+            # Get returns data for diagnostics
+            price_panel = load_prices_panel(symbols, start_date.isoformat(), end_date.isoformat(), cache_key="e2e_cov_diag")
+            returns_df = pd.DataFrame({
+                sym: pd.to_numeric(price_panel.get(sym, {}).get('close', pd.Series()), errors='coerce').pct_change()
+                for sym in symbols if sym in price_panel
+            }).dropna(how='all')
+
+            if not returns_df.empty:
+                # Diagnose sample vs robust
+                diag_sample = diagnose_covariance_quality(returns_df, method='sample')
+                diag_robust = diagnose_covariance_quality(returns_df, method=cov_method)
+
+                # Display comparison
+                col_d1, col_d2 = st.columns(2)
+
+                with col_d1:
+                    st.markdown("**Sample Covariance**")
+                    st.metric("Condition Number", f"{diag_sample['condition_number']:.1f}")
+                    st.metric("Min Eigenvalue", f"{diag_sample['min_eigenvalue']:.6f}")
+                    st.metric("Rank", f"{diag_sample['rank']}/{diag_sample['dimension']}")
+                    if diag_sample['is_positive_definite']:
+                        st.success("✅ Positive Definite")
+                    else:
+                        st.error("❌ Not Positive Definite")
+
+                with col_d2:
+                    st.markdown(f"**{cov_method.upper()} (Robust)**")
+                    st.metric("Condition Number", f"{diag_robust['condition_number']:.1f}")
+                    st.metric("Min Eigenvalue", f"{diag_robust['min_eigenvalue']:.6f}")
+                    if diag_robust['shrinkage_intensity'] is not None:
+                        st.metric("Shrinkage δ", f"{diag_robust['shrinkage_intensity']:.3f}")
+                    if diag_robust['is_positive_definite']:
+                        st.success("✅ Positive Definite")
+                    else:
+                        st.error("❌ Not Positive Definite")
+
+                # Recommendations
+                st.info(f"**Sample:** {diag_sample['recommendation']}")
+                st.info(f"**Robust:** {diag_robust['recommendation']}")
+
+                st.caption("""
+                **Interpretation:**
+                - **Condition Number (κ):** Ratio of largest to smallest eigenvalue. High κ → unstable inverse
+                  - κ < 100: Well-conditioned ✅
+                  - 100 < κ < 1000: Moderate condition ⚠️
+                  - κ > 1000: Ill-conditioned ❌
+                - **Shrinkage δ:** Intensity of shrinkage (0 = no shrinkage, 1 = full shrinkage to target)
+                - **Rank:** Full rank = dimension (no redundant assets)
+
+                **Academic Reference:** Ledoit & Wolf (2004) - reduces condition number → more stable weights
+                """)
+
+        except Exception as e:
+            st.warning(f"Could not compute covariance diagnostics: {e}")
 
     # Sizing section
     st.markdown("---")
