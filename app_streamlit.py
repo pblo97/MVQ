@@ -1266,7 +1266,7 @@ with tab7:
         return {}
 
     def _month_ends_index(df: pd.DataFrame) -> pd.DatetimeIndex:
-        return df.resample("M").last().index
+        return df.resample("ME").last().index
 
     def _daily_returns_from_prices(df: pd.DataFrame) -> pd.Series:
         # espera index datetime y columna 'close'
@@ -1316,7 +1316,7 @@ with tab7:
             return pd.Series(dtype=float), pd.DataFrame()
 
         # Rebalances mensuales
-        month_ends = all_rets.resample("M").last().index
+        month_ends = all_rets.resample("ME").last().index
         weights_hist = []
         port_rets = []
 

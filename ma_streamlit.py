@@ -221,7 +221,7 @@ def build_pillars_and_composite(dfd: pd.DataFrame, freq_key: str, roll_z_w: int,
     if freq_key == "W":
         df = dfd.resample("W").last().ffill(); win = roll_z_w
     else:
-        df = dfd.resample("M").last().ffill(); win = roll_z_m
+        df = dfd.resample("ME").last().ffill(); win = roll_z_m
 
     # Pilares (ligeramente ortogonales)
     TERM   = _pillar(df, ["T10Y3M", "T10Y2Y"],          [+1, +1], win)
@@ -238,7 +238,7 @@ def composite_pca(dfd: pd.DataFrame, freq_key: str, roll_z_w: int, roll_z_m: int
         df = dfd.resample("W").last().ffill()
         window = roll_z_w
     else:
-        df = dfd.resample("M").last().ffill()
+        df = dfd.resample("ME").last().ffill()
         window = roll_z_m
 
     FACTORES = [
@@ -271,9 +271,9 @@ def equity_premium(dfd: pd.DataFrame, freq_key: str) -> pd.Series:
     if "SP500" not in dfd.columns:
         return pd.Series(dtype=float, name="Excess_Ret")
     if freq_key == "M":
-        sp = dfd["SP500"].resample("M").last().dropna()
+        sp = dfd["SP500"].resample("ME").last().dropna()
         ret = np.log(sp).diff()
-        rf = (dfd["TB3MS"] / 100.0 / 12.0).resample("M").last().reindex(sp.index).ffill()
+        rf = (dfd["TB3MS"] / 100.0 / 12.0).resample("ME").last().reindex(sp.index).ffill()
     else:
         sp = dfd["SP500"].resample("W").last().dropna()
         ret = np.log(sp).diff()

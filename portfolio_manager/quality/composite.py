@@ -76,7 +76,7 @@ def _liquidity_score(
     # ADV (últimos 60 días)
     if not volume.empty:
         vol_60d = volume.tail(60)
-        price_60d = close.reindex(vol_60d.index).fillna(method='ffill')
+        price_60d = close.reindex(vol_60d.index).ffill()
         adv_usd = (vol_60d * price_60d).mean()
 
         # Volume stability (CV = std/mean, menor es mejor)
