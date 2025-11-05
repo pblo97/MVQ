@@ -350,104 +350,131 @@ with tab1:
     detection_method = "Z-Score"
     reg = z_to_regime(0.0)  # Default regime
 
+    # Cache FRED data in session state to avoid re-fetching on every interaction
+    cache_key = f"fred_data_{start_date}_{end_date}_{window_days}"
+
     if fred_api_key and fred_api_key.strip():
-        try:
-            with st.spinner("🔄 Fetching FRED data and calculating macro z-score..."):
-                # Auto-fetch FRED and calculate z-score
-                result_df, macro_z_eff, messages = calculate_macro_zscore_auto_fred(
-                    fred_api_key=fred_api_key.strip(),
-                    start_date=start_date.isoformat(),
-                    end_date=end_date.isoformat(),
-                    window=window_days,
-                    weights=get_macroarimax_default_weights(),
-                    clip_z=3.5,
-                    verbose=False
-                )
+        # Check if we already have FRED data cached
+        if cache_key in st.session_state and st.session_state.get('fred_api_key_hash') == hash(fred_api_key.strip()):
+            # Use cached data
+            result_df = st.session_state[cache_key]
+            macro_z_eff = st.session_state.get(f"{cache_key}_zscore", 0.0)
+            if not result_df.empty:
+                st.success(f"✓ Using cached FRED data ({len(result_df)} days)")
+        else:
+            # Fetch fresh data
+            try:
+                with st.spinner("🔄 Fetching FRED data and calculating macro z-score..."):
+                    # Auto-fetch FRED and calculate z-score
+                    result_df, macro_z_eff, messages = calculate_macro_zscore_auto_fred(
+                        fred_api_key=fred_api_key.strip(),
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat(),
+                        window=window_days,
+                        weights=get_macroarimax_default_weights(),
+                        clip_z=3.5,
+                        verbose=False
+                    )
 
-            # Show messages
-            if result_df.empty:
-                # FRED failed - show error prominently
-                st.error("❌ FRED Data Fetch FAILED - Cannot proceed with regime detection")
+                # Show messages
+                if result_df.empty:
+                    # FRED failed - show error prominently
+                    st.error("❌ FRED Data Fetch FAILED - Cannot proceed with regime detection")
 
-                # Show all error messages in a single error box
-                error_messages = [msg for msg in messages if msg and not msg.startswith("📊")]
-                if error_messages:
-                    st.markdown("---")
-                    for msg in error_messages:
-                        if msg.strip():  # Only show non-empty messages
-                            if msg.startswith("🔧") or msg.startswith("⚠️"):
-                                st.warning(msg)
-                            elif msg.strip().isdigit() or msg.strip() == "":
-                                continue  # Skip empty or number-only lines
-                            else:
-                                st.info(msg)
-                    st.markdown("---")
+                    # Show all error messages in a single error box
+                    error_messages = [msg for msg in messages if msg and not msg.startswith("📊")]
+                    if error_messages:
+                        st.markdown("---")
+                        for msg in error_messages:
+                            if msg.strip():  # Only show non-empty messages
+                                if msg.startswith("🔧") or msg.startswith("⚠️"):
+                                    st.warning(msg)
+                                elif msg.strip().isdigit() or msg.strip() == "":
+                                    continue  # Skip empty or number-only lines
+                                else:
+                                    st.info(msg)
+                        st.markdown("---")
 
-                st.stop()  # Stop execution - FRED is required
-            else:
-                # Regime detection: Z-Score, HMM, or Random Forest
-                detection_method = "Z-Score"
+                    st.stop()  # Stop execution - FRED is required
+                else:
+                    # Cache the successful fetch
+                    st.session_state[cache_key] = result_df
+                    st.session_state[f"{cache_key}_zscore"] = macro_z_eff
+                    st.session_state['fred_api_key_hash'] = hash(fred_api_key.strip())
+                    st.success(f"✓ FRED data fetched successfully ({len(result_df)} days)")
 
-                if "Random Forest" in regime_method and not result_df.empty:
-                    try:
-                        from portfolio_manager.regime.random_forest_regime import RandomForestRegime
+            except Exception as e:
+                st.error(f"❌ Error fetching FRED data: {e}")
+                st.warning("Using default regime: NEUTRAL (M=1.0)")
+                macro_z_eff = 0.0
+                reg = z_to_regime(macro_z_eff)
+                result_df = pd.DataFrame()  # Empty dataframe
 
-                        with st.spinner("🌳 Training Random Forest on labeled historical regimes..."):
-                            # Prepare features
-                            rf_model = RandomForestRegime(n_estimators=100, max_depth=10, random_state=42)
-                            features_df = rf_model.prepare_features(result_df)
+        # Now apply regime detection method to the cached data
+        if not result_df.empty:
+            # Regime detection: Z-Score, HMM, or Random Forest
+            detection_method = "Z-Score"
 
-                            if len(features_df) >= 252:  # At least 1 year of data
-                                # Create labeled regimes from known historical periods
-                                labels = rf_model.create_labeled_regimes(features_df.index)
+            if "Random Forest" in regime_method and not result_df.empty:
+                try:
+                    from portfolio_manager.regime.random_forest_regime import RandomForestRegime
 
-                                # Train model
-                                rf_model.train(features_df, labels, cv_folds=5)
+                    with st.spinner("🌳 Training Random Forest on labeled historical regimes..."):
+                        # Prepare features
+                        rf_model = RandomForestRegime(n_estimators=100, max_depth=10, random_state=42)
+                        features_df = rf_model.prepare_features(result_df)
 
-                                # Get current regime
-                                reg = rf_model.predict_regime(features_df)
-                                detection_method = "Random Forest"
+                        if len(features_df) >= 252:  # At least 1 year of data
+                            # Create labeled regimes from known historical periods
+                            labels = rf_model.create_labeled_regimes(features_df.index)
 
-                                st.success(f"✓ Random Forest trained. Current regime: **{reg.label}** (confidence={reg.probability:.1%}, M={reg.m_multiplier:.2f})")
-                                st.info(f"📊 Model accuracy (5-fold CV): **{rf_model.cv_score:.1%}**")
-                            else:
-                                st.warning("⚠️ Insufficient data for Random Forest (need ≥252 days / 1 year). Falling back to z-score.")
-                                reg = z_to_regime(macro_z_eff)
-                    except Exception as e_rf:
-                        st.warning(f"⚠️ Random Forest failed: {e_rf}. Falling back to z-score.")
-                        st.exception(e_rf)
-                        reg = z_to_regime(macro_z_eff)
+                            # Train model
+                            rf_model.train(features_df, labels, cv_folds=5)
 
-                elif "HMM" in regime_method and not result_df.empty:
-                    try:
-                        from portfolio_manager.regime.hmm_regime import HiddenMarkovRegime
+                            # Get current regime
+                            reg = rf_model.predict_regime(features_df)
+                            detection_method = "Random Forest"
 
-                        with st.spinner("🔄 Training HMM on macro features..."):
-                            # Prepare features for HMM
-                            feature_cols = [col for col in result_df.columns if col.endswith('_z') or col == 'composite_z']
-                            features_df = result_df[feature_cols].dropna()
+                            st.success(f"✓ Random Forest trained. Current regime: **{reg.label}** (confidence={reg.probability:.1%}, M={reg.m_multiplier:.2f})")
+                            st.info(f"📊 Model accuracy (5-fold CV): **{rf_model.cv_score:.1%}**")
+                        else:
+                            st.warning("⚠️ Insufficient data for Random Forest (need ≥252 days / 1 year). Falling back to z-score.")
+                            reg = z_to_regime(macro_z_eff)
+                except Exception as e_rf:
+                    st.warning(f"⚠️ Random Forest failed: {e_rf}. Falling back to z-score.")
+                    st.exception(e_rf)
+                    reg = z_to_regime(macro_z_eff)
 
-                            if len(features_df) >= 126:  # At least 6 months of data
-                                # Train HMM
-                                hmm_model = HiddenMarkovRegime(
-                                    n_states=n_hmm_states,
-                                    covariance_type='full',
-                                    n_iter=100,
-                                    random_state=42
-                                )
-                                hmm_model.fit(features_df)
+            elif "HMM" in regime_method and not result_df.empty:
+                try:
+                    from portfolio_manager.regime.hmm_regime import HiddenMarkovRegime
 
-                                # Get current regime
-                                reg = hmm_model.predict_regime(features_df)
-                                detection_method = "HMM"
+                    with st.spinner("🔄 Training HMM on macro features..."):
+                        # Prepare features for HMM
+                        feature_cols = [col for col in result_df.columns if col.endswith('_z') or col == 'composite_z']
+                        features_df = result_df[feature_cols].dropna()
 
-                                st.success(f"✓ HMM trained with {n_hmm_states} states. Current regime: **{reg.label}** (M={reg.m_multiplier:.2f})")
-                            else:
-                                st.warning("⚠️ Insufficient data for HMM (need ≥126 days). Falling back to z-score.")
-                                reg = z_to_regime(macro_z_eff)
-                    except Exception as e_hmm:
-                        st.warning(f"⚠️ HMM failed: {e_hmm}. Falling back to z-score.")
-                        reg = z_to_regime(macro_z_eff)
+                        if len(features_df) >= 126:  # At least 6 months of data
+                            # Train HMM
+                            hmm_model = HiddenMarkovRegime(
+                                n_states=n_hmm_states,
+                                covariance_type='full',
+                                n_iter=100,
+                                random_state=42
+                            )
+                            hmm_model.fit(features_df)
+
+                            # Get current regime
+                            reg = hmm_model.predict_regime(features_df)
+                            detection_method = "HMM"
+
+                            st.success(f"✓ HMM trained with {n_hmm_states} states. Current regime: **{reg.label}** (M={reg.m_multiplier:.2f})")
+                        else:
+                            st.warning("⚠️ Insufficient data for HMM (need ≥126 days). Falling back to z-score.")
+                            reg = z_to_regime(macro_z_eff)
+                except Exception as e_hmm:
+                    st.warning(f"⚠️ HMM failed: {e_hmm}. Falling back to z-score.")
+                    reg = z_to_regime(macro_z_eff)
                 else:
                     # Default: Z-Score regime detection
                     reg = z_to_regime(macro_z_eff)
@@ -612,11 +639,6 @@ with tab1:
                         except Exception as e_diag:
                             st.warning(f"Could not display HMM diagnostics: {e_diag}")
 
-        except Exception as e:
-            st.error(f"❌ Error fetching FRED data: {e}")
-            st.warning("Using default regime: NEUTRAL (M=1.0)")
-            macro_z_eff = 0.0
-            reg = z_to_regime(macro_z_eff)
     else:
         # No FRED API key provided
         st.warning("⚠️ FRED API Key REQUIRED for regime detection")
