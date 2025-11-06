@@ -37,6 +37,7 @@ class ParameterSearchResult:
     scoring_metric: str
     n_folds: int
     total_evaluations: int
+    errors: List[str] = None  # Captured error messages for debugging
 
 
 def walk_forward_cross_validation(
@@ -87,6 +88,7 @@ def walk_forward_cross_validation(
 
     # Evaluate each parameter combination
     results = []
+    errors = []  # Capture unique errors for debugging
 
     for param_values_tuple in param_combinations:
         params = dict(zip(param_names, param_values_tuple))
@@ -110,8 +112,14 @@ def walk_forward_cross_validation(
                 fold_scores.append(score)
 
             except Exception as e:
+                error_msg = f"Fold {fold_idx}, params {params}: {type(e).__name__}: {str(e)}"
                 if verbose:
-                    print(f"Warning: Fold {fold_idx} failed for params {params}: {e}")
+                    print(f"Warning: {error_msg}")
+                # Store first 20 unique error types
+                if len(errors) < 20:
+                    error_type = f"{type(e).__name__}: {str(e)[:100]}"
+                    if error_type not in errors:
+                        errors.append(error_msg)
                 fold_scores.append(np.nan)
 
         # Aggregate scores across folds
@@ -144,7 +152,8 @@ def walk_forward_cross_validation(
         cv_results=cv_results,
         scoring_metric=scoring,
         n_folds=n_splits,
-        total_evaluations=len(param_combinations) * n_splits
+        total_evaluations=len(param_combinations) * n_splits,
+        errors=errors if errors else None
     )
 
 

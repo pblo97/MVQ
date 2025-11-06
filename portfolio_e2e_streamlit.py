@@ -1970,6 +1970,16 @@ with tab4:
                     st.error("❌ All scores are NaN - all parameter combinations failed!")
                     st.info("This usually means: (1) insufficient data in test windows, (2) strategy returns all zeros, or (3) numerical instability")
 
+                # Debug: Show captured errors
+                if search_result.errors and len(search_result.errors) > 0:
+                    with st.expander(f"🔍 View Error Messages ({len(search_result.errors)} samples)"):
+                        for i, error in enumerate(search_result.errors, 1):
+                            st.text(f"{i}. {error}")
+                        if len(search_result.errors) >= 20:
+                            st.caption("(Showing first 20 unique errors)")
+                elif total_valid == 0:
+                    st.warning("⚠️ No errors were captured. This may indicate a silent failure in the strategy function.")
+
                 # Best parameters
                 st.success(f"✓ Grid search completed! Evaluated {search_result.total_evaluations} parameter combinations across {search_result.n_folds} folds")
 
