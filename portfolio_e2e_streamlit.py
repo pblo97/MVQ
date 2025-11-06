@@ -1926,12 +1926,29 @@ with tab4:
             st.info("⏳ This may take 2-5 minutes depending on data size...")
 
             try:
+                # Capture verbose output
+                import io
+                import sys
+
+                # Redirect stdout to capture verbose messages
+                old_stdout = sys.stdout
+                sys.stdout = captured_output = io.StringIO()
+
                 search_result = optimize_kelly_parameters(
                     returns_df=returns_df,
                     scoring=scoring_metric,
                     n_splits=5,
-                    verbose=False
+                    verbose=True  # Enable to see what's failing
                 )
+
+                # Restore stdout
+                sys.stdout = old_stdout
+                verbose_output = captured_output.getvalue()
+
+                # Show verbose output if there were issues
+                if verbose_output:
+                    with st.expander("📋 Grid Search Verbose Output"):
+                        st.text(verbose_output)
 
                 progress_bar_ps.progress(75)
 
