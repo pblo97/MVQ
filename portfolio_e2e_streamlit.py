@@ -51,11 +51,12 @@ st.caption("Kelly Fraccional + Macro Régimen + Quality Score 3D + Exit Monitori
 persist = PortfolioStatePersistence(snapshots_dir="snapshots/")
 
 # ==================== TABS ====================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Portfolio Overview",
     "⚠️ Risk Analytics",
     "🚪 Asset Quality & Exits",
-    "📈 Backtest & Reports"
+    "📈 Backtest & Reports",
+    "🔧 Calibration Dashboard"
 ])
 
 # ==================== SIDEBAR: INPUTS ====================
@@ -1980,6 +1981,9 @@ with tab4:
                 elif total_valid == 0:
                     st.warning("⚠️ No errors were captured. This may indicate a silent failure in the strategy function.")
 
+                # Store in session state for calibration dashboard
+                st.session_state['grid_search_result'] = search_result
+
                 # Best parameters
                 st.success(f"✓ Grid search completed! Evaluated {search_result.total_evaluations} parameter combinations across {search_result.n_folds} folds")
 
@@ -2132,6 +2136,249 @@ with tab4:
             st.info("💡 No snapshots saved yet. To save portfolio states, go to Tab 1 and click 'Save Portfolio State'.")
     except Exception as e:
         st.warning(f"Could not list snapshots: {e}")
+
+# ==================== TAB 5: CALIBRATION DASHBOARD ====================
+with tab5:
+    st.title("🔧 Calibration Dashboard")
+    st.caption("Consolidated view of all system components, results, and calibration controls")
+
+    # Section 1: System Health Check
+    st.header("1️⃣ System Health Check")
+
+    col_health1, col_health2, col_health3 = st.columns(3)
+
+    with col_health1:
+        st.metric("Symbols Loaded", f"{len(symbols)}", help="Number of assets in universe")
+        st.metric("Date Range", f"{(pd.to_datetime(end_date) - pd.to_datetime(start_date)).days} days")
+
+    with col_health2:
+        if 'fred_api_key' in st.session_state:
+            st.metric("FRED API", "✅ Connected")
+        else:
+            st.metric("FRED API", "❌ Not configured")
+
+        if 'backtest_result' in st.session_state:
+            st.metric("Backtest Data", "✅ Available")
+        else:
+            st.metric("Backtest Data", "⚠️ Not run yet")
+
+    with col_health3:
+        st.metric("Regime Method", regime_method)
+        st.metric("Risk Tolerance", risk_tolerance)
+
+    # Section 2: Current Configuration Summary
+    st.header("2️⃣ Current Configuration")
+
+    config_data = {
+        "Parameter": [
+            "Kelly Fraction",
+            "Lambda Corr",
+            "Winsor p",
+            "Min Quality Score",
+            "Max Correlation",
+            "Max Beta",
+            "Max Volatility",
+            "Min Price"
+        ],
+        "Value": [
+            base_kelly,
+            lambda_corr,
+            winsor_p,
+            f"{min_quality_score:.0f}",
+            f"{max_corr:.2f}",
+            f"{max_beta:.2f}",
+            f"{max_vol:.2%}",
+            f"${min_price:.2f}"
+        ],
+        "Description": [
+            "Portfolio leverage/aggressiveness",
+            "Correlation penalty weight",
+            "Winsorization percentile",
+            "Minimum composite score for inclusion",
+            "Max correlation with benchmark",
+            "Max beta exposure",
+            "Max annualized volatility",
+            "Minimum stock price filter"
+        ]
+    }
+
+    st.dataframe(pd.DataFrame(config_data), use_container_width=True, hide_index=True)
+
+    # Section 3: Portfolio Metrics (if available)
+    st.header("3️⃣ Current Portfolio Metrics")
+
+    if 'portfolio_df' in st.session_state and st.session_state['portfolio_df'] is not None:
+        portfolio_df = st.session_state['portfolio_df']
+
+        met_col1, met_col2, met_col3, met_col4 = st.columns(4)
+
+        with met_col1:
+            n_positions = len(portfolio_df)
+            st.metric("Active Positions", n_positions)
+
+        with met_col2:
+            if 'weight' in portfolio_df.columns:
+                concentration = (portfolio_df['weight'].max() * 100)
+                st.metric("Max Position", f"{concentration:.1f}%")
+
+        with met_col3:
+            if 'composite_score' in portfolio_df.columns:
+                avg_score = portfolio_df['composite_score'].mean()
+                st.metric("Avg Composite Score", f"{avg_score:.1f}")
+
+        with met_col4:
+            if 'sector' in portfolio_df.columns:
+                n_sectors = portfolio_df['sector'].nunique()
+                st.metric("Sectors", n_sectors)
+
+        # Show top holdings
+        st.markdown("**Top 5 Holdings:**")
+        if 'weight' in portfolio_df.columns:
+            top_5 = portfolio_df.nlargest(5, 'weight')[['symbol', 'name', 'weight', 'composite_score']]
+            top_5['weight'] = top_5['weight'] * 100
+            st.dataframe(
+                top_5.style.format({
+                    'weight': '{:.2f}%',
+                    'composite_score': '{:.1f}'
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+    else:
+        st.info("ℹ️ No portfolio data available. Run the portfolio generation in Tab 1.")
+
+    # Section 4: Regime Detection Summary
+    st.header("4️⃣ Regime Detection Status")
+
+    if regime_method == "Z-Score Only":
+        st.info(f"📊 Current Method: Z-Score | Macro Z-Score: {st.session_state.get('macro_z_eff', 'N/A')}")
+    elif "Random Forest" in regime_method:
+        if 'rf_model' in st.session_state and st.session_state['rf_model'] is not None:
+            st.success(f"🌳 Random Forest Active | Regime: {st.session_state.get('rf_regime', 'UNKNOWN')}")
+        else:
+            st.warning("⚠️ Random Forest model not trained yet")
+    elif "HMM" in regime_method:
+        if 'hmm_model' in st.session_state and st.session_state['hmm_model'] is not None:
+            st.success(f"🔄 HMM Active | Regime: {st.session_state.get('hmm_regime', 'UNKNOWN')}")
+        else:
+            st.warning("⚠️ HMM model not trained yet")
+
+    # Section 5: Backtest Results Summary
+    st.header("5️⃣ Backtest Results")
+
+    if 'backtest_result' in st.session_state:
+        result = st.session_state['backtest_result']
+
+        st.success("✅ Backtest data available")
+
+        # Key metrics in columns
+        bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
+
+        with bt_col1:
+            st.metric("Sharpe Ratio", f"{result.metrics['Sharpe Ratio']:.2f}")
+            st.metric("Sortino Ratio", f"{result.metrics['Sortino Ratio']:.2f}")
+
+        with bt_col2:
+            st.metric("Total Return", f"{result.metrics['Total Return (%)']:.1f}%")
+            st.metric("Annual Return", f"{result.metrics['Annual Return (%)']:.1f}%")
+
+        with bt_col3:
+            st.metric("Max Drawdown", f"{result.metrics['Max Drawdown (%)']:.1f}%")
+            st.metric("Calmar Ratio", f"{result.metrics['Calmar Ratio']:.2f}")
+
+        with bt_col4:
+            st.metric("Win Rate", f"{result.metrics['Win Rate (%)']:.1f}%")
+            st.metric("Information Ratio", f"{result.metrics['Information Ratio']:.2f}")
+
+        # Quick interpretation
+        sharpe = result.metrics['Sharpe Ratio']
+        if sharpe > 2.0:
+            st.success("🎯 **Excellent risk-adjusted performance** (Sharpe > 2.0)")
+        elif sharpe > 1.0:
+            st.info("✅ **Good risk-adjusted performance** (Sharpe > 1.0)")
+        else:
+            st.warning("⚠️ **Below-average risk-adjusted performance** (Sharpe < 1.0)")
+    else:
+        st.info("ℹ️ No backtest results available. Run a backtest in Tab 4.")
+
+    # Section 6: Grid Search Results Summary
+    st.header("6️⃣ Parameter Optimization Results")
+
+    if 'grid_search_result' in st.session_state:
+        gs_result = st.session_state['grid_search_result']
+
+        st.success("✅ Grid search data available")
+
+        gs_col1, gs_col2, gs_col3 = st.columns(3)
+
+        with gs_col1:
+            st.metric("Best Base Kelly", f"{gs_result.best_params['base_kelly']:.2f}")
+            st.caption("Optimal leverage parameter")
+
+        with gs_col2:
+            st.metric("Best Lambda Corr", f"{gs_result.best_params['lambda_corr']:.2f}")
+            st.caption("Optimal correlation penalty")
+
+        with gs_col3:
+            st.metric("Best Winsor p", f"{gs_result.best_params['winsor_p']:.3f}")
+            st.caption("Optimal outlier threshold")
+
+        st.info(f"📊 Best Score ({gs_result.scoring_metric}): {gs_result.best_score:.3f} | Evaluated {gs_result.total_evaluations} combinations")
+
+        # Recommendation
+        current_params = {
+            'base_kelly': base_kelly,
+            'lambda_corr': lambda_corr,
+            'winsor_p': winsor_p
+        }
+
+        if current_params != gs_result.best_params:
+            st.warning("⚠️ **Current parameters differ from optimized values**")
+            st.markdown("**Recommended Action:** Update sidebar parameters to match best values above")
+        else:
+            st.success("✅ **Using optimized parameters**")
+    else:
+        st.info("ℹ️ No optimization results available. Run parameter search in Tab 4.")
+
+    # Section 7: Calibration Controls
+    st.header("7️⃣ Quick Calibration Controls")
+    st.caption("Adjust key thresholds and see impact (experimental)")
+
+    calib_col1, calib_col2 = st.columns(2)
+
+    with calib_col1:
+        st.markdown("**Scoring Thresholds:**")
+
+        new_min_quality = st.slider(
+            "Minimum Quality Score",
+            min_value=0,
+            max_value=100,
+            value=int(min_quality_score),
+            step=5,
+            help="Assets below this score are excluded"
+        )
+
+        if new_min_quality != int(min_quality_score):
+            st.info(f"ℹ️ Would change from {min_quality_score} to {new_min_quality}")
+
+    with calib_col2:
+        st.markdown("**Risk Constraints:**")
+
+        new_max_vol = st.slider(
+            "Max Volatility",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(max_vol),
+            step=0.05,
+            format="%.2f",
+            help="Maximum annualized volatility allowed"
+        )
+
+        if abs(new_max_vol - max_vol) > 0.01:
+            st.info(f"ℹ️ Would change from {max_vol:.2f} to {new_max_vol:.2f}")
+
+    st.markdown("---")
+    st.markdown("**💡 Tip:** Changes here are for visualization only. To apply changes, update values in the sidebar and regenerate portfolio in Tab 1.")
 
 # ==================== FOOTER ====================
 st.markdown("---")
