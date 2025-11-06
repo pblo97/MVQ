@@ -2228,16 +2228,28 @@ with tab5:
         # Show top holdings
         st.markdown("**Top 5 Holdings:**")
         if 'weight' in portfolio_df.columns:
-            top_5 = portfolio_df.nlargest(5, 'weight')[['symbol', 'name', 'weight', 'composite_score']]
-            top_5['weight'] = top_5['weight'] * 100
-            st.dataframe(
-                top_5.style.format({
-                    'weight': '{:.2f}%',
-                    'composite_score': '{:.1f}'
-                }),
-                use_container_width=True,
-                hide_index=True
-            )
+            # Determine which columns are available
+            desired_cols = ['symbol', 'name', 'weight', 'composite_score']
+            available_cols = [col for col in desired_cols if col in portfolio_df.columns]
+
+            if len(available_cols) > 1:  # At least weight + one other column
+                top_5 = portfolio_df.nlargest(5, 'weight')[available_cols].copy()
+                top_5['weight'] = top_5['weight'] * 100
+
+                # Format only columns that exist
+                format_dict = {'weight': '{:.2f}%'}
+                if 'composite_score' in available_cols:
+                    format_dict['composite_score'] = '{:.1f}'
+
+                st.dataframe(
+                    top_5.style.format(format_dict),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("ℹ️ Portfolio columns not complete. Available: " + ", ".join(portfolio_df.columns.tolist()))
+        else:
+            st.info("ℹ️ Portfolio doesn't have weight information.")
     else:
         st.info("ℹ️ No portfolio data available. Run the portfolio generation in Tab 1.")
 
