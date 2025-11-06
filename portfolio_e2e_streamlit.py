@@ -1569,8 +1569,18 @@ with tab4:
     if st.session_state.get('run_backtest_flag', False):
         st.session_state['run_backtest_flag'] = False  # Clear flag immediately
 
+        # Store execution timestamp and parameters for debugging
+        from datetime import datetime
+        st.session_state['backtest_timestamp'] = datetime.now()
+        st.session_state['backtest_params'] = {
+            'base_kelly': base_kelly,
+            'lambda_corr': lambda_corr,
+            'winsor_p': winsor_p
+        }
+
         try:
             st.info("📋 Starting backtest setup...")
+            st.info(f"🔍 **DEBUG**: Using parameters - Kelly={base_kelly:.2f}, Lambda={lambda_corr:.2f}, Winsor={winsor_p:.3f}")
 
             from portfolio_manager.backtest.walk_forward import (
                 walk_forward_backtest,
@@ -1627,13 +1637,14 @@ with tab4:
             else:
                 benchmark_weights = np.ones(n_assets) / n_assets
 
-            # Strategy function (simplified Kelly)
-            def simple_kelly_strategy(train_returns, base_kelly=0.25, winsor_p=0.01):
-                """Simplified Kelly strategy for backtest"""
+            # Strategy function (Kelly with correlation penalty)
+            def simple_kelly_strategy(train_returns, base_kelly=0.25, winsor_p=0.01, lambda_corr=0.25):
+                """Kelly strategy with correlation penalty for backtest"""
                 # Winsorize
                 train_w = train_returns.clip(
-                    lower=train_returns.quantile(winsor_p),
-                    upper=train_returns.quantile(1 - winsor_p)
+                    lower=train_returns.quantile(winsor_p, axis=0),
+                    upper=train_returns.quantile(1 - winsor_p, axis=0),
+                    axis=1
                 )
 
                 # Kelly weights: w = Σ^-1 μ / κ
@@ -1644,6 +1655,23 @@ with tab4:
                     cov_inv = np.linalg.inv(cov.values + np.eye(len(cov)) * 1e-8)
                     weights_raw = base_kelly * (cov_inv @ mu.values)
                     weights_raw = np.clip(weights_raw, 0, None)  # Long-only
+
+                    # Apply correlation penalty (if lambda_corr > 0)
+                    if lambda_corr > 0 and weights_raw.sum() > 0:
+                        # Build proto-portfolio from positive weights
+                        proto_weights = weights_raw / weights_raw.sum()
+                        proto_returns = (train_w * proto_weights).sum(axis=1)
+
+                        # Penalize each asset by correlation with proto-portfolio
+                        penalties = []
+                        for asset in train_w.columns:
+                            asset_returns = train_w[asset]
+                            corr = asset_returns.corr(proto_returns)
+                            penalty = 1.0 / (1.0 + lambda_corr * max(0.0, corr))
+                            penalties.append(penalty)
+
+                        # Apply penalties
+                        weights_raw = weights_raw * np.array(penalties)
 
                     if weights_raw.sum() > 0:
                         weights = weights_raw / weights_raw.sum()
@@ -1674,7 +1702,8 @@ with tab4:
                         min_train_obs=252,
                         benchmark_weights=benchmark_weights,
                         base_kelly=base_kelly,
-                        winsor_p=winsor_p
+                        winsor_p=winsor_p,
+                        lambda_corr=lambda_corr
                     )
                 else:  # Expanding Window
                     result = expanding_window_backtest(
@@ -1686,7 +1715,8 @@ with tab4:
                         min_train_obs=252,
                         benchmark_weights=benchmark_weights,
                         base_kelly=base_kelly,
-                        winsor_p=winsor_p
+                        winsor_p=winsor_p,
+                        lambda_corr=lambda_corr
                     )
 
                 progress_bar.progress(100)
@@ -2300,6 +2330,15 @@ with tab5:
         result = st.session_state['backtest_result']
 
         st.success("✅ Backtest data available")
+
+        # DEBUG INFO - Show timestamp and parameters used
+        if 'backtest_timestamp' in st.session_state:
+            timestamp = st.session_state['backtest_timestamp']
+            st.caption(f"⏰ **Last run**: {timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        if 'backtest_params' in st.session_state:
+            params = st.session_state['backtest_params']
+            st.caption(f"📊 **Parameters used**: Kelly={params['base_kelly']:.2f}, Lambda={params['lambda_corr']:.2f}, Winsor={params['winsor_p']:.3f}")
 
         # Key metrics in columns
         bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
