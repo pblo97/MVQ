@@ -1866,6 +1866,14 @@ with tab4:
         )
 
     if st.button("🔍 Run Parameter Search", type="secondary"):
+        # Set flag to run parameter search
+        st.session_state['run_param_search_flag'] = True
+        st.rerun()
+
+    # Check if we should run parameter search (from flag)
+    if st.session_state.get('run_param_search_flag', False):
+        st.session_state['run_param_search_flag'] = False  # Clear flag immediately
+
         try:
             st.info("📋 Starting parameter search...")
 
@@ -1998,6 +2006,7 @@ with tab4:
 
                 # Store in session state for calibration dashboard
                 st.session_state['grid_search_result'] = search_result
+                st.session_state['param_search_complete'] = True
 
                 # Best parameters
                 st.success(f"✓ Grid search completed! Evaluated {search_result.total_evaluations} parameter combinations across {search_result.n_folds} folds")
