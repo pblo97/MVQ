@@ -2174,31 +2174,25 @@ with tab5:
             "Kelly Fraction",
             "Lambda Corr",
             "Winsor p",
-            "Min Quality Score",
-            "Max Correlation",
-            "Max Beta",
-            "Max Volatility",
-            "Min Price"
+            "Costs per Period",
+            "Allocation Method",
+            "Covariance Method"
         ],
         "Value": [
-            base_kelly,
-            lambda_corr,
-            winsor_p,
-            f"{min_quality_score:.0f}",
-            f"{max_corr:.2f}",
-            f"{max_beta:.2f}",
-            f"{max_vol:.2%}",
-            f"${min_price:.2f}"
+            f"{base_kelly:.2f}",
+            f"{lambda_corr:.2f}",
+            f"{winsor_p:.3f}",
+            f"{costs_per_period:.4f} ({costs_bps} bps)",
+            allocation_method,
+            cov_method
         ],
         "Description": [
             "Portfolio leverage/aggressiveness",
             "Correlation penalty weight",
             "Winsorization percentile",
-            "Minimum composite score for inclusion",
-            "Max correlation with benchmark",
-            "Max beta exposure",
-            "Max annualized volatility",
-            "Minimum stock price filter"
+            "Monthly transaction costs",
+            "Weight allocation strategy",
+            "Covariance estimation method"
         ]
     }
 
@@ -2342,40 +2336,41 @@ with tab5:
 
     # Section 7: Calibration Controls
     st.header("7️⃣ Quick Calibration Controls")
-    st.caption("Adjust key thresholds and see impact (experimental)")
+    st.caption("Adjust key parameters and see impact (experimental)")
 
     calib_col1, calib_col2 = st.columns(2)
 
     with calib_col1:
-        st.markdown("**Scoring Thresholds:**")
+        st.markdown("**Kelly Parameters:**")
 
-        new_min_quality = st.slider(
-            "Minimum Quality Score",
-            min_value=0,
-            max_value=100,
-            value=int(min_quality_score),
-            step=5,
-            help="Assets below this score are excluded"
+        new_base_kelly = st.slider(
+            "Base Kelly Fraction",
+            min_value=0.05,
+            max_value=0.50,
+            value=float(base_kelly),
+            step=0.01,
+            help="Portfolio leverage/aggressiveness"
         )
 
-        if new_min_quality != int(min_quality_score):
-            st.info(f"ℹ️ Would change from {min_quality_score} to {new_min_quality}")
+        if abs(new_base_kelly - base_kelly) > 0.001:
+            st.info(f"ℹ️ Would change from {base_kelly:.2f} to {new_base_kelly:.2f}")
+            st.caption(f"Impact: {'More aggressive' if new_base_kelly > base_kelly else 'More conservative'} portfolio")
 
     with calib_col2:
-        st.markdown("**Risk Constraints:**")
+        st.markdown("**Correlation Penalty:**")
 
-        new_max_vol = st.slider(
-            "Max Volatility",
+        new_lambda_corr = st.slider(
+            "Lambda Corr",
             min_value=0.0,
-            max_value=2.0,
-            value=float(max_vol),
+            max_value=1.0,
+            value=float(lambda_corr),
             step=0.05,
-            format="%.2f",
-            help="Maximum annualized volatility allowed"
+            help="Penalty for correlation with benchmark"
         )
 
-        if abs(new_max_vol - max_vol) > 0.01:
-            st.info(f"ℹ️ Would change from {max_vol:.2f} to {new_max_vol:.2f}")
+        if abs(new_lambda_corr - lambda_corr) > 0.01:
+            st.info(f"ℹ️ Would change from {lambda_corr:.2f} to {new_lambda_corr:.2f}")
+            st.caption(f"Impact: {'More' if new_lambda_corr > lambda_corr else 'Less'} correlation penalty")
 
     st.markdown("---")
     st.markdown("**💡 Tip:** Changes here are for visualization only. To apply changes, update values in the sidebar and regenerate portfolio in Tab 1.")
