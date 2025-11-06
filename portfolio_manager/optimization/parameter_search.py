@@ -277,10 +277,11 @@ def optimize_kelly_parameters(
 
     # Simple Kelly strategy
     def kelly_strategy(train_returns, base_kelly=0.25, lambda_corr=0.25, winsor_p=0.01):
-        # Winsorize
+        # Winsorize (specify axis to avoid pandas warning/error)
         train_w = train_returns.clip(
-            lower=train_returns.quantile(winsor_p),
-            upper=train_returns.quantile(1 - winsor_p)
+            lower=train_returns.quantile(winsor_p, axis=0),
+            upper=train_returns.quantile(1 - winsor_p, axis=0),
+            axis=1
         )
 
         # Kelly weights
